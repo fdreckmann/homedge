@@ -128,10 +128,12 @@ run_remote_bash() {
 
 select_remote_interface() {
   local default_if="$1"
-  echo
-  echo "Netzwerkadapter werden vom VPS ausgelesen..."
-  echo "Falls du Passwort-Login nutzt, fragt SSH jetzt ggf. nach dem Passwort."
-  echo
+  # Wichtig: Wird via $(...) aufgerufen. Alle Anzeige-Ausgaben nach stderr (>&2),
+  # damit nur der gewaehlte Interface-Name auf stdout zurueckkommt.
+  echo >&2
+  echo "Netzwerkadapter werden vom VPS ausgelesen..." >&2
+  echo "Falls du Passwort-Login nutzt, fragt SSH jetzt ggf. nach dem Passwort." >&2
+  echo >&2
 
   local remote_script
   remote_script=$(cat <<'EOS'
@@ -151,7 +153,7 @@ EOS
 
   local out
   if ! out="$(run_remote_bash "$remote_script")"; then
-    echo "Adapter konnten nicht automatisch ausgelesen werden."
+    echo "Adapter konnten nicht automatisch ausgelesen werden." >&2
     ask "Externes Interface auf dem VPS" "$default_if"
     return
   fi
@@ -173,14 +175,14 @@ EOS
   done <<< "$out"
 
   if [[ ${#names[@]} -eq 0 ]]; then
-    echo "Keine Adapterdaten erhalten. Roh-Ausgabe:"
-    echo "$out"
+    echo "Keine Adapterdaten erhalten. Roh-Ausgabe:" >&2
+    echo "$out" >&2
     ask "Externes Interface auf dem VPS" "$default_if"
     return
   fi
 
-  echo "Gefundene Netzwerkadapter:"
-  echo
+  echo "Gefundene Netzwerkadapter:" >&2
+  echo >&2
   local default_idx=""
   for i in "${!names[@]}"; do
     local num=$((i+1))
@@ -192,19 +194,19 @@ EOS
     if [[ "${names[$i]}" == "$default_if" && "$default_if" != "$default_name" ]]; then
       hint="$hint <= Config-Vorschlag"
     fi
-    printf "%2d) %-14s Status: %-8s IPv4: %-24s IPv6: %s%s\n" "$num" "${names[$i]}" "${states[$i]}" "${ipv4s[$i]}" "${ipv6s[$i]}" "$hint"
+    printf "%2d) %-14s Status: %-8s IPv4: %-24s IPv6: %s%s\n" "$num" "${names[$i]}" "${states[$i]}" "${ipv4s[$i]}" "${ipv6s[$i]}" "$hint" >&2
   done
-  echo
+  echo >&2
   if [[ -n "$default_name" ]]; then
-    echo "Empfehlung: $default_name"
-    [[ -n "$default_src" ]] && echo "Source-IP Richtung Internet: $default_src"
+    echo "Empfehlung: $default_name" >&2
+    [[ -n "$default_src" ]] && echo "Source-IP Richtung Internet: $default_src" >&2
   fi
-  echo
+  echo >&2
 
   local def_answer="${default_idx:-$default_if}"
   [[ -z "$def_answer" ]] && def_answer="1"
   local choice
-  choice="$(ask "Netzwerkadapter waehlen: Nummer oder Interface-Name" "$def_answer")"
+  choice="$(ask "Netzwerkadapter auswaehlen (Nummer oder Interface-Name)" "$def_answer")"
   if [[ "$choice" =~ ^[0-9]+$ ]]; then
     local idx=$((choice-1))
     if (( idx >= 0 && idx < ${#names[@]} )); then
@@ -271,7 +273,11 @@ if yesno "WireGuard PresharedKey verwenden?" "$( [[ "$(cfg_get UsePsk "1")" == "
 else
   UsePsk="0"
 fi
-if yesno "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" "$( [[ "$(cfg_get EnableCaddyFail2ban "0")" == "1" ]] && echo y || echo n )"; then
+echo
+echo "Empfohlen: Ja."
+echo "Schuetzt gegen viele fehlerhafte Login-/Auth-Versuche (401/403)."
+echo "Gebannte IPs koennen spaeter im HomeEdge-Menue wieder entbannt werden."
+if yesno "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" "$( [[ "$(cfg_get EnableCaddyFail2ban "1")" == "0" ]] && echo n || echo y )"; then
   EnableCaddyFail2ban="1"
 else
   EnableCaddyFail2ban="0"
@@ -297,6 +303,7 @@ if [[ -z "$ServicesTsv" ]]; then
   echo
   echo "Externe Dienste erfassen. Beispiel: jellyfin.example.de | http | 192.168.10.99 | 8096"
   ServiceCount="$(ask "Anzahl externe Dienste" "2")"
+  [[ "$ServiceCount" =~ ^[0-9]+$ ]] || { echo "Ungueltige Anzahl, nutze 1."; ServiceCount=1; }
   ServicesTsv=""
   for ((i=1; i<=ServiceCount; i++)); do
     echo
@@ -325,20 +332,43 @@ else
   AdminPubKey=""
 fi
 
-echo
-echo "============================================================"
-echo " Zusammenfassung"
-echo "============================================================"
-echo "SSH Ziel:               ${SshUser}@${SshHost}:${SshPortConnect}"
-echo "VPS Public Host:        ${VpsPublicHost}"
-echo "Externes Interface:     ${ExtIf}"
-echo "WireGuard:              ${WgIf} / UDP ${WgPort}"
-echo "VPS WG Adresse:         ${VpsWgAddr}"
-echo "Client WG Adresse:      ${ClientWgAddr}"
-echo "Home Subnet:            ${HomeSubnet}"
-echo "Dienste:                $(count_services "$ServicesTsv")"
-echo "SSH Hardening:          ${CreateAdmin}"
-echo "============================================================"
+SvcPretty="$(printf '%s' "$ServicesTsv" | awk -F'\t' 'NF>=4{printf "  %d) %-22s -> %s://%s:%s\n", ++n, $1, $2, $3, $4}')"
+[[ -z "$SvcPretty" ]] && SvcPretty="  (keine Dienste erfasst)"
+F2bCaddyState="$([[ "$EnableCaddyFail2ban" == "1" ]] && echo aktiv || echo inaktiv)"
+TokenState="$([[ -n "${CfToken:-}" ]] && echo gesetzt || echo "nicht gesetzt")"
+HardeningState="$([[ "$CreateAdmin" == "1" ]] && echo "ja (neuer User: ${AdminUser})" || echo nein)"
+
+cat <<EOF
+
+============================================================
+HomeEdge Installationszusammenfassung
+============================================================
+
+SSH-Ziel:         ${SshUser}@${SshHost}:${SshPortConnect}
+
+VPS:
+  Host/IP:        ${VpsPublicHost}
+  Interface:      ${ExtIf}
+  SSH-Port:       ${SshPortFinal}
+
+WireGuard:
+  Interface:      ${WgIf}
+  UDP-Port:       ${WgPort}
+  VPS WG-IP:      ${VpsWgAddr}
+  Client WG-IP:   ${ClientWgAddr}
+  Backend-Netze:  ${HomeSubnet}
+
+Dienste:
+${SvcPretty}
+
+Security:
+  UFW:              wird aktiviert
+  Fail2ban SSH:     wird aktiviert
+  Fail2ban Caddy:   ${F2bCaddyState}
+  Cloudflare Token: ${TokenState}
+  SSH Hardening:    ${HardeningState}
+============================================================
+EOF
 echo
 
 if yesno "Eingaben als lokale Config speichern?" "y"; then
@@ -349,8 +379,13 @@ if yesno "Eingaben als lokale Config speichern?" "y"; then
   fi
 fi
 
-if ! yesno "Jetzt installieren?" "n"; then
-  echo "Abgebrochen."
+echo
+echo "Achtung:"
+echo "Auf dem VPS werden jetzt Pakete installiert und konfiguriert:"
+echo "Docker/Caddy, WireGuard, UFW, Fail2ban, automatische Updates, Swap, HomeEdge-Menue."
+echo
+if ! yesno "Konfiguration uebernehmen und Installation jetzt starten?" "n"; then
+  echo "Installation abgebrochen. Die Konfiguration kann beim naechsten Start wiederverwendet werden."
   exit 0
 fi
 
