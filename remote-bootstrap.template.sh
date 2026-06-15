@@ -13,6 +13,7 @@ VPS_PUBLIC_HOST="$(b64d "__VPS_PUBLIC_HOST_B64__")"
 SSH_PORT="$(b64d "__SSH_PORT_B64__")"
 WG_IF="$(b64d "__WG_IF_B64__")"
 WG_PORT="$(b64d "__WG_PORT_B64__")"
+WG_MTU="$(b64d "__WG_MTU_B64__")"; WG_MTU="${WG_MTU:-1280}"
 VPS_WG_ADDR="$(b64d "__VPS_WG_ADDR_B64__")"
 CLIENT_WG_ADDR="$(b64d "__CLIENT_WG_ADDR_B64__")"
 HOME_SUBNET="$(b64d "__HOME_SUBNET_B64__")"
@@ -118,6 +119,7 @@ VPS_PUBLIC_HOST=$(printf '%q' "${VPS_PUBLIC_HOST}")
 SSH_PORT=$(printf '%q' "${SSH_PORT}")
 WG_IF=$(printf '%q' "${WG_IF}")
 WG_PORT=$(printf '%q' "${WG_PORT}")
+WG_MTU=$(printf '%q' "${WG_MTU:-1280}")
 VPS_WG_ADDR=$(printf '%q' "${VPS_WG_ADDR}")
 VPS_WG_IP=$(printf '%q' "${VPS_WG_IP}")
 CLIENT_WG_ADDR=$(printf '%q' "${CLIENT_WG_ADDR}")
@@ -128,6 +130,7 @@ CLOUDFLARE_API_TOKEN=$(printf '%q' "${CLOUDFLARE_API_TOKEN}")
 USE_PSK=$(printf '%q' "${USE_PSK}")
 CADDY_FAIL2BAN=$(printf '%q' "${CADDY_FAIL2BAN}")
 CLIENT_PUBLIC_KEY=$(printf '%q' "${CLIENT_PUBLIC_KEY}")
+ENABLE_HTTP3=$(printf '%q' "${ENABLE_HTTP3:-0}")
 HOMEEDGE_REPO=$(printf '%q' "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(printf '%q' "${HOMEEDGE_BRANCH:-main}")
 EOF

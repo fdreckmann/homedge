@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.5-homeedge"
+APP_VERSION="0.9.6-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -71,16 +71,20 @@ load_env() {
   HOME_SUBNET="${HOME_SUBNET:-192.168.10.0/24}"; ACME_EMAIL="${ACME_EMAIL:-}"
   CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"; USE_PSK="${USE_PSK:-1}"
   CADDY_FAIL2BAN="${CADDY_FAIL2BAN:-0}"; CLIENT_PUBLIC_KEY="${CLIENT_PUBLIC_KEY:-}"
-  ENABLE_HTTP3="${ENABLE_HTTP3:-1}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
+  ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
   HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
+  WG_MTU="${WG_MTU:-1280}"
+  F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     # Neue Variablen, die in aelteren Env-Dateien fehlen koennen, absichern:
-    ENABLE_HTTP3="${ENABLE_HTTP3:-1}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
+    ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
     EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
+    WG_MTU="${WG_MTU:-1280}"
+    F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   fi
 }
 
@@ -104,12 +108,16 @@ CLOUDFLARE_API_TOKEN=$(q "${CLOUDFLARE_API_TOKEN}")
 USE_PSK=$(q "${USE_PSK}")
 CADDY_FAIL2BAN=$(q "${CADDY_FAIL2BAN}")
 CLIENT_PUBLIC_KEY=$(q "${CLIENT_PUBLIC_KEY:-}")
-ENABLE_HTTP3=$(q "${ENABLE_HTTP3:-1}")
+ENABLE_HTTP3=$(q "${ENABLE_HTTP3:-0}")
 HOMEEDGE_UPDATE_URL=$(q "${HOMEEDGE_UPDATE_URL:-}")
 HOMEEDGE_REPO=$(q "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(q "${HOMEEDGE_BRANCH:-main}")
 EXPERT_MODE=$(q "${EXPERT_MODE:-0}")
 BACKUP_BEHAVIOR=$(q "${BACKUP_BEHAVIOR:-ask}")
+WG_MTU=$(q "${WG_MTU:-1280}")
+F2B_CADDY_MAXRETRY=$(q "${F2B_CADDY_MAXRETRY:-20}")
+F2B_CADDY_FINDTIME=$(q "${F2B_CADDY_FINDTIME:-10m}")
+F2B_CADDY_BANTIME=$(q "${F2B_CADDY_BANTIME:-15m}")
 EOCFG
   chmod 600 "$ENV_FILE"
 }
@@ -154,6 +162,7 @@ write_wg_config() {
 PrivateKey = $(cat "${KEY_DIR}/server_private.key")
 Address = ${VPS_WG_ADDR}
 ListenPort = ${WG_PORT}
+MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${key}
@@ -301,6 +310,18 @@ edit_backend_networks() {
   ok "Backend-Netze aktualisiert."
 }
 
+edit_wg_mtu() {
+  need_root; load_env
+  section "WireGuard MTU anzeigen/aendern"
+  echo "Aktuelle MTU: ${WG_MTU}"
+  local mtu; mtu="$(ask "WireGuard MTU" "${WG_MTU}")"
+  if ! [[ "$mtu" =~ ^[0-9]+$ ]] || (( mtu < 1280 || mtu > 1500 )); then err "MTU muss zwischen 1280 und 1500 liegen."; return 1; fi
+  maybe_backup_before_change
+  WG_MTU="$mtu"; save_env; write_wg_config; restart_wg
+  ok "WireGuard MTU gesetzt: ${WG_MTU}"
+  warn "Hinweis: MTU ggf. auch auf UniFi-Seite setzen, falls UniFi ein MTU-Feld anbietet."
+}
+
 toggle_psk() {
   load_env
   if [[ "$USE_PSK" == "1" ]]; then
@@ -435,9 +456,12 @@ EOCADDY
 }
 EOCADDY
   # Hinweis: X-Forwarded-For/Proto/Host setzt Caddy automatisch -> nicht doppeln.
-  # Nur X-Real-IP bleibt (optional, fuer Backends die es erwarten).
-  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
+  # Nur X-Real-IP bleibt (optional). Profil "jellyfin" setzt flush_interval -1.
+  local domain scheme ip port profile extra
+  while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue
+    extra=""
+    [[ "${profile:-}" == "jellyfin" ]] && extra=$'\n        flush_interval -1'
     cat >> "$out" <<EOCADDY
 
 ${domain} {
@@ -447,14 +471,14 @@ EOCADDY
       cat >> "$out" <<EOCADDY
     reverse_proxy https://${ip}:${port} {
         transport http { tls_insecure_skip_verify }
-        header_up X-Real-IP {remote_host}
+        header_up X-Real-IP {remote_host}${extra}
     }
 }
 EOCADDY
     else
       cat >> "$out" <<EOCADDY
     reverse_proxy http://${ip}:${port} {
-        header_up X-Real-IP {remote_host}
+        header_up X-Real-IP {remote_host}${extra}
     }
 }
 EOCADDY
@@ -570,7 +594,15 @@ reload_caddy() {
 restart_caddy() { load_env; write_caddy_stack; generate_caddyfile; cd "$CADDY_DIR"; docker compose build; docker compose up -d; }
 
 install_fail2ban() {
-  load_env; mkdir -p /etc/fail2ban/jail.d
+  load_env; mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  # Caddy-Access-Log muss existieren, bevor Fail2ban startet (sonst Jail-Fehler).
+  mkdir -p "${CADDY_DIR}/logs"; touch "${CADDY_DIR}/logs/access.log"
+
+  # Vorherige caddy-Konfig sichern, um bei fehlerhaftem Test zurueckzurollen.
+  local bdir; bdir="$(mktemp -d)"
+  cp -a /etc/fail2ban/jail.d/caddy-auth.local "${bdir}/" 2>/dev/null || true
+  cp -a /etc/fail2ban/filter.d/caddy-auth.conf "${bdir}/" 2>/dev/null || true
+
   cat > /etc/fail2ban/jail.d/sshd-local.conf <<EOF2
 [sshd]
 enabled = true
@@ -592,15 +624,65 @@ EOF2
 enabled = true
 filter = caddy-auth
 logpath = ${CADDY_DIR}/logs/access.log
-maxretry = 10
-findtime = 10m
-bantime = 1h
+maxretry = ${F2B_CADDY_MAXRETRY}
+findtime = ${F2B_CADDY_FINDTIME}
+bantime = ${F2B_CADDY_BANTIME}
+backend = auto
 port = https
 EOF2
   else
     rm -f /etc/fail2ban/jail.d/caddy-auth.local
   fi
-  systemctl enable --now fail2ban; systemctl restart fail2ban
+
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  # Konfiguration testen, bevor neu gestartet wird.
+  if fail2ban-client -t >/dev/null 2>&1; then
+    systemctl restart fail2ban && ok "Fail2ban konfiguriert und neu gestartet."
+  else
+    err "Fail2ban-Konfigtest fehlgeschlagen - stelle vorherige caddy-auth-Konfig wieder her."
+    rm -f /etc/fail2ban/jail.d/caddy-auth.local /etc/fail2ban/filter.d/caddy-auth.conf
+    cp -a "${bdir}/caddy-auth.local" /etc/fail2ban/jail.d/ 2>/dev/null || true
+    cp -a "${bdir}/caddy-auth.conf" /etc/fail2ban/filter.d/ 2>/dev/null || true
+    systemctl restart fail2ban 2>/dev/null || true
+    rm -rf "$bdir"
+    return 1
+  fi
+  rm -rf "$bdir"
+}
+
+# Fail2ban-Konfiguration testen (fail2ban-client -t).
+f2b_test_config() {
+  section "Fail2ban Config testen"
+  if fail2ban-client -t; then ok "Konfiguration ist gueltig."; else err "Konfiguration fehlerhaft (siehe oben)."; fi
+}
+
+# caddy-auth Jail temporaer deaktivieren bzw. wieder aktivieren.
+f2b_caddy_disable() {
+  need_root; load_env
+  section "caddy-auth deaktivieren"
+  CADDY_FAIL2BAN="0"; save_env; install_fail2ban
+  ok "caddy-auth deaktiviert."
+}
+f2b_caddy_enable() {
+  need_root; load_env
+  section "caddy-auth aktivieren"
+  CADDY_FAIL2BAN="1"; save_env; install_fail2ban
+}
+
+# Schwellenwerte fuer caddy-auth anzeigen/aendern.
+f2b_thresholds() {
+  need_root; load_env
+  section "caddy-auth Schwellenwerte"
+  echo "Aktuell: maxretry=${F2B_CADDY_MAXRETRY}  findtime=${F2B_CADDY_FINDTIME}  bantime=${F2B_CADDY_BANTIME}"
+  if ! yesno "Werte aendern?" "n"; then return; fi
+  local mr ft bt
+  mr="$(ask "maxretry" "${F2B_CADDY_MAXRETRY}")"
+  ft="$(ask "findtime (z.B. 10m)" "${F2B_CADDY_FINDTIME}")"
+  bt="$(ask "bantime (z.B. 15m)" "${F2B_CADDY_BANTIME}")"
+  [[ "$mr" =~ ^[0-9]+$ ]] || { err "maxretry muss eine Zahl sein."; return 1; }
+  F2B_CADDY_MAXRETRY="$mr"; F2B_CADDY_FINDTIME="$ft"; F2B_CADDY_BANTIME="$bt"
+  save_env; install_fail2ban
+  ok "Schwellenwerte gespeichert: maxretry=${mr} findtime=${ft} bantime=${bt}"
 }
 
 # ------------------------------------------------------------
@@ -807,6 +889,7 @@ apply_firewall() {
   section "Firewall neu anwenden"
   local cur_ssh_port; cur_ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
   echo "UFW wird gesetzt: SSH ${SSH_PORT}/tcp, HTTPS 443/tcp, WireGuard ${WG_PORT}/udp"
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then echo "HTTP/3 aktiv -> zusaetzlich 443/udp"; else echo "HTTP/3 aus -> 443/udp bleibt geschlossen"; fi
   if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]]; then
     info "Aktive SSH-Sitzung laeuft auf Port ${cur_ssh_port}/tcp - dieser bleibt zusaetzlich offen (Schutz vor Aussperren)."
   fi
@@ -816,7 +899,23 @@ apply_firewall() {
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
   ufw allow "${SSH_PORT}/tcp"; ufw allow "443/tcp"; ufw allow "${WG_PORT}/udp"
   [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]] && ufw allow "${cur_ssh_port}/tcp"
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow "443/udp"; else ufw delete allow "443/udp" 2>/dev/null || true; fi
   ufw --force enable
+  echo
+  ok "443/tcp erlaubt"
+  ok "WireGuard ${WG_PORT}/udp erlaubt"
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ok "HTTP/3 aktiviert, 443/udp erlaubt"; else ok "HTTP/3 deaktiviert, 443/udp geschlossen"; fi
+}
+
+# Nicht-interaktive UFW-Synchronisierung passend zur Konfig (fuer Toggle/Migration).
+ufw_sync() {
+  load_env
+  command -v ufw >/dev/null 2>&1 || { warn "ufw nicht installiert."; return 0; }
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
+    ufw allow "443/udp" >/dev/null 2>&1 && ok "443/udp erlaubt (HTTP/3 aktiv)"
+  else
+    ufw delete allow "443/udp" >/dev/null 2>&1 && ok "443/udp entfernt (HTTP/3 aus)" || ok "443/udp war nicht offen"
+  fi
 }
 
 show_values() {
@@ -843,6 +942,15 @@ show_values() {
 
 list_services() { if [[ ! -f "$SERVICES_FILE" || ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return; fi; nl -w2 -s'. ' "$SERVICES_FILE" | sed $'s/\t/ | /g'; }
 
+# Fragt das Backend-Profil ab (Anzeige nach stderr, Rueckgabe nach stdout).
+ask_profile() {
+  local default="${1:-standard}" def c
+  case "$default" in jellyfin) def=2 ;; jellyseerr) def=3 ;; *) def=1 ;; esac
+  { echo "Backend-Profil:"; echo "  1) Standard"; echo "  2) Jellyfin (flush_interval -1 fuer Streaming)"; echo "  3) Jellyseerr"; } >&2
+  c="$(ask "Profil" "$def")"
+  case "$c" in 2|jellyfin) printf 'jellyfin' ;; 3|jellyseerr) printf 'jellyseerr' ;; *) printf 'standard' ;; esac
+}
+
 validate_service() {
   local domain="$1" scheme="$2" ip="$3" port="$4"
   if [[ -z "$domain" || "$domain" =~ [[:space:]] ]]; then err "Ungueltige Domain (leer oder enthaelt Leerzeichen)."; return 1; fi
@@ -855,11 +963,12 @@ validate_service() {
 add_service() {
   load_env; touch "$SERVICES_FILE"
   section "Neuen externen Dienst hinzufuegen"
-  local domain scheme ip port
+  local domain scheme ip port profile
   domain="$(ask "Domain, z.B. jellyfin.example.de")"; scheme="$(ask "Backend Scheme http/https" "http")"; ip="$(ask "Backend IP im Heimnetz")"; port="$(ask "Backend Port")"
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
+  profile="$(ask_profile standard)"
   maybe_backup_before_change
-  printf "%s\t%s\t%s\t%s\n" "$domain" "$scheme" "$ip" "$port" >> "$SERVICES_FILE"
+  printf "%s\t%s\t%s\t%s\t%s\n" "$domain" "$scheme" "$ip" "$port" "$profile" >> "$SERVICES_FILE"
   write_unifi_values; reload_caddy
   ok "Dienst hinzugefuegt."
   warn "UniFi Firewall erlauben: ${VPS_WG_IP} -> ${ip}:${port}/tcp"
@@ -869,12 +978,13 @@ edit_service() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
   list_services; local num; num="$(ask "Nummer aendern")"; mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
-  local old_domain old_scheme old_ip old_port; IFS=$'\t' read -r old_domain old_scheme old_ip old_port <<< "${lines[$idx]}"
-  local domain scheme ip port
+  local old_domain old_scheme old_ip old_port old_profile; IFS=$'\t' read -r old_domain old_scheme old_ip old_port old_profile <<< "${lines[$idx]}"
+  local domain scheme ip port profile
   domain="$(ask "Domain" "$old_domain")"; scheme="$(ask "Backend Scheme http/https" "$old_scheme")"; ip="$(ask "Backend IP" "$old_ip")"; port="$(ask "Backend Port" "$old_port")"
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
+  profile="$(ask_profile "${old_profile:-standard}")"
   maybe_backup_before_change
-  lines[$idx]="${domain}"$'\t'"${scheme}"$'\t'"${ip}"$'\t'"${port}"; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
+  lines[$idx]="${domain}"$'\t'"${scheme}"$'\t'"${ip}"$'\t'"${port}"$'\t'"${profile}"; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
   write_unifi_values; reload_caddy; ok "Dienst aktualisiert."
 }
 
@@ -1606,20 +1716,26 @@ security_fail2ban() {
 
 security_http3_toggle() {
   load_env
-  section "Caddy HTTP/3 / UDP 443"
-  if [[ "${ENABLE_HTTP3:-1}" == "1" ]]; then
-    warn "HTTP/3 ist aktuell aktiv. Dadurch lauscht Caddy zusaetzlich auf UDP 443."
-    if yesno "HTTP/3 deaktivieren und Caddy neu laden?" "y"; then
-      ENABLE_HTTP3="0"; save_env; reload_caddy
-      ok "HTTP/3 deaktiviert. Pruefe danach: sudo ss -tulpn"
+  section "Caddy HTTP/3 / QUIC (UDP 443)"
+  maybe_backup_before_change
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
+    warn "HTTP/3 ist aktuell aktiv (Caddy lauscht zusaetzlich auf UDP 443)."
+    if yesno "HTTP/3 deaktivieren?" "y"; then
+      ENABLE_HTTP3="0"; save_env; reload_caddy; ufw_sync
+      ok "HTTP/3 deaktiviert, 443/udp geschlossen."
     fi
   else
-    info "HTTP/3 ist aktuell deaktiviert. Caddy nutzt nur HTTP/1.1 und HTTP/2."
-    if yesno "HTTP/3 wieder aktivieren?" "n"; then
-      ENABLE_HTTP3="1"; save_env; reload_caddy
-      ok "HTTP/3 aktiviert. UDP 443 kann danach wieder sichtbar sein."
+    info "HTTP/3 ist aktuell deaktiviert (nur HTTP/1.1 und HTTP/2)."
+    if yesno "HTTP/3 aktivieren?" "n"; then
+      ENABLE_HTTP3="1"; save_env; reload_caddy; ufw_sync
+      ok "HTTP/3 aktiviert, 443/udp erlaubt."
     fi
   fi
+  echo
+  section "UFW Status"
+  ufw status verbose 2>/dev/null | grep -E '443|Status' || true
+  echo
+  if ss -u -lnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)443$'; then info "UDP 443 ist offen."; else info "UDP 443 ist geschlossen."; fi
 }
 
 security_minimal_check() {
@@ -1797,6 +1913,36 @@ _install_homeedge_from_file() {
   ok "HomeEdge aktualisiert auf Version: ${new_ver:-unbekannt}"
   info "Vorherige Version gesichert: ${old}"
   /usr/local/bin/homeedge --version || true
+  # Migration mit der NEU installierten Version ausfuehren (Backup wurde vorher erstellt).
+  echo
+  info "Fuehre Migration/Reparatur mit der neuen Version aus..."
+  /usr/local/bin/homeedge migrate --no-backup || warn "Migration meldete Probleme - bitte 'sudo homeedge migrate' pruefen."
+}
+
+# Repariert/aktualisiert eine bestehende Installation (idempotent).
+homeedge_migrate() {
+  need_root
+  section "Migration / Reparatur bestehender Installation"
+  [[ "${1:-}" == "--no-backup" ]] || maybe_backup_before_change
+  load_env
+  # load_env hat Defaults gesetzt (ENABLE_HTTP3=0, WG_MTU=1280, CADDY_FAIL2BAN,
+  # F2B_*). save_env bereinigt zugleich den Token (sanitize) und schreibt alle
+  # Variablen einzeilig - repariert damit alte/mehrzeilige Token-Zeilen.
+  save_env
+  ok "Konfiguration repariert: Token bereinigt, fehlende Werte ergaenzt."
+  echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  caddy-auth=${F2B_CADDY_MAXRETRY}/${F2B_CADDY_FINDTIME}/${F2B_CADDY_BANTIME}"
+  # WireGuard-Konfig mit MTU neu schreiben (best effort, braucht wg).
+  if command -v wg >/dev/null 2>&1; then write_wg_config 2>/dev/null && ok "WireGuard-Konfig (inkl. MTU) neu geschrieben." || warn "WireGuard-Konfig nicht aktualisiert."; fi
+  # Caddyfile neu generieren + validieren (Services/Zertifikate bleiben erhalten).
+  if command -v docker >/dev/null 2>&1; then reload_caddy || warn "Caddy-Reload bitte spaeter pruefen."; fi
+  # Fail2ban mit Config-Test.
+  command -v fail2ban-client >/dev/null 2>&1 && install_fail2ban || true
+  # UFW an HTTP/3 angleichen (nicht-interaktiv, ohne Reset).
+  ufw_sync || true
+  echo
+  info "Healthcheck:"
+  health_check || true
+  ok "Migration abgeschlossen."
 }
 
 # Update direkt vom GitHub-Repo (raw.githubusercontent.com). Standardquelle.
@@ -2162,9 +2308,10 @@ sm_wg() {
     menu_item 3 "UniFi Public Key aendern"
     menu_item 4 "Preshared Key neu generieren"
     menu_item 5 "Backend-Netze hinter UniFi aendern"
-    menu_item 6 "WireGuard neu starten"
-    menu_item 7 "Route zum Backend testen"
-    menu_item 8 "Handshake pruefen"
+    menu_item 6 "MTU anzeigen/aendern"
+    menu_item 7 "WireGuard neu starten"
+    menu_item 8 "Route zum Backend testen"
+    menu_item 9 "Handshake pruefen"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2173,9 +2320,10 @@ sm_wg() {
       3) set_wg_key; pause ;;
       4) regenerate_psk; pause ;;
       5) edit_backend_networks; pause ;;
-      6) restart_wg; ok "WireGuard-Neustart angestossen."; pause ;;
-      7) route_test; pause ;;
-      8) handshake_check; pause ;;
+      6) edit_wg_mtu; pause ;;
+      7) restart_wg; ok "WireGuard-Neustart angestossen."; pause ;;
+      8) route_test; pause ;;
+      9) handshake_check; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2209,6 +2357,39 @@ sm_caddy() {
     esac
   done
 }
+sm_fail2ban() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Sicherheit > Fail2ban"
+    load_env
+    echo "   caddy-auth: $([[ "${CADDY_FAIL2BAN}" == "1" ]] && echo aktiv || echo inaktiv)  (maxretry=${F2B_CADDY_MAXRETRY} findtime=${F2B_CADDY_FINDTIME} bantime=${F2B_CADDY_BANTIME})"
+    line
+    menu_item 1 "Fail2ban Status"
+    menu_item 2 "Gebannte IPs anzeigen"
+    menu_item 3 "IP aus Liste entbannen"
+    menu_item 4 "IP manuell entbannen"
+    menu_item 5 "caddy-auth temporaer deaktivieren"
+    menu_item 6 "caddy-auth wieder aktivieren"
+    menu_item 7 "Schwellenwerte anzeigen/aendern"
+    menu_item 8 "Fail2ban Config testen"
+    menu_item 9 "Fail2ban neu starten"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) f2b_status_overview; pause ;;
+      2) f2b_show_banned_ips; pause ;;
+      3) f2b_unban_select; pause ;;
+      4) f2b_unban_manual; pause ;;
+      5) f2b_caddy_disable; pause ;;
+      6) f2b_caddy_enable; pause ;;
+      7) f2b_thresholds; pause ;;
+      8) f2b_test_config; pause ;;
+      9) f2b_just_restart; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
 sm_security() {
   need_root; set +e
   while true; do
@@ -2216,26 +2397,20 @@ sm_security() {
     menu_item 1 "Security Ampel"
     menu_item 2 "UFW Status"
     menu_item 3 "UFW Regeln anzeigen"
-    menu_item 4 "Fail2ban Status"
-    menu_item 5 "Gebannte IPs anzeigen"
-    menu_item 6 "IP aus Liste entbannen"
-    menu_item 7 "IP manuell entbannen"
-    menu_item 8 "SSH Hardening pruefen"
-    menu_item 9 "Jellyfin Sicherheitscheckliste"
-    menu_item 10 "Firewall neu anwenden"
+    menu_item 4 "Fail2ban verwalten"
+    menu_item 5 "SSH Hardening pruefen"
+    menu_item 6 "Jellyfin Sicherheitscheckliste"
+    menu_item 7 "Firewall neu anwenden"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
       1) security_minimal_check; pause ;;
       2) security_firewall; pause ;;
       3) ufw_rules; pause ;;
-      4) f2b_status_overview; pause ;;
-      5) f2b_show_banned_ips; pause ;;
-      6) f2b_unban_select; pause ;;
-      7) f2b_unban_manual; pause ;;
-      8) security_ssh_status; pause ;;
-      9) security_jellyfin_checklist; pause ;;
-      10) apply_firewall; pause ;;
+      4) sm_fail2ban ;;
+      5) security_ssh_status; pause ;;
+      6) security_jellyfin_checklist; pause ;;
+      7) apply_firewall; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2390,10 +2565,12 @@ case "${1:-menu}" in
   status) status_all ;;
   health|ampel) health_check ;;
   usage|auslastung) system_usage ;;
-  fail2ban|f2b) fail2ban_submenu ;;
+  fail2ban|f2b) sm_fail2ban ;;
   network|interfaces|net) network_submenu ;;
   backup|restore|backup-menu) backup_submenu ;;
   update|updates|wartung) updates_submenu ;;
+  migrate) need_root; homeedge_migrate "${2:-}" ;;
+  mtu) need_root; edit_wg_mtu ;;
   self-update|update-repo|repo-update) need_root; homeedge_repo_update ;;
   check-update|check-updates) check_for_update ;;
   rollback) need_root; homeedge_rollback ;;
