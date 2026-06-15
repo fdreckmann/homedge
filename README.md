@@ -37,6 +37,17 @@ sudo homeedge menu
 
 `edgectl` bleibt als Kompatibilitaets-Alias erhalten (`sudo edgectl menu`).
 
+Das Terminal-Menue ist in neun Gruppen mit Breadcrumb (z. B. `HomeEdge > Sicherheit`)
+und je `b) Zurueck` / `0) Beenden` organisiert:
+
+```text
+1) Status / Ampel            6) Backup & Restore
+2) Domains & Dienste         7) Updates & Wartung
+3) WireGuard Tunnel          8) Logs & Diagnose
+4) Caddy / HTTPS / Cloudflare 9) Einstellungen
+5) Sicherheit                0) Beenden
+```
+
 Weitere Direktbefehle:
 
 ```bash

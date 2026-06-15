@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.4-homeedge"
+APP_VERSION="0.9.5-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -73,12 +73,14 @@ load_env() {
   CADDY_FAIL2BAN="${CADDY_FAIL2BAN:-0}"; CLIENT_PUBLIC_KEY="${CLIENT_PUBLIC_KEY:-}"
   ENABLE_HTTP3="${ENABLE_HTTP3:-1}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
   HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
+  EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     # Neue Variablen, die in aelteren Env-Dateien fehlen koennen, absichern:
     ENABLE_HTTP3="${ENABLE_HTTP3:-1}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
+    EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
   fi
 }
 
@@ -106,6 +108,8 @@ ENABLE_HTTP3=$(q "${ENABLE_HTTP3:-1}")
 HOMEEDGE_UPDATE_URL=$(q "${HOMEEDGE_UPDATE_URL:-}")
 HOMEEDGE_REPO=$(q "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(q "${HOMEEDGE_BRANCH:-main}")
+EXPERT_MODE=$(q "${EXPERT_MODE:-0}")
+BACKUP_BEHAVIOR=$(q "${BACKUP_BEHAVIOR:-ask}")
 EOCFG
   chmod 600 "$ENV_FILE"
 }
@@ -198,7 +202,7 @@ UniFi Firewall-Regeln:
 Erlaube von ${VPS_WG_IP} zu deinen Backend-Diensten:
 EOVAL
   if [[ -f "$SERVICES_FILE" ]]; then
-    while IFS=$'\t' read -r domain scheme ip port; do [[ -z "${domain:-}" ]] && continue; echo "  ${VPS_WG_IP} -> ${ip}:${port}/tcp  (${domain})" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"; done < "$SERVICES_FILE"
+    while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do [[ -z "${domain:-}" ]] && continue; echo "  ${VPS_WG_IP} -> ${ip}:${port}/tcp  (${domain})" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"; done < "$SERVICES_FILE"
   fi
   cat >> "${EDGE_DIR}/unifi-wireguard-werte.txt" <<EOVAL
 
@@ -432,7 +436,7 @@ EOCADDY
 EOCADDY
   # Hinweis: X-Forwarded-For/Proto/Host setzt Caddy automatisch -> nicht doppeln.
   # Nur X-Real-IP bleibt (optional, fuer Backends die es erwarten).
-  while IFS=$'\t' read -r domain scheme ip port; do
+  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue
     cat >> "$out" <<EOCADDY
 
@@ -489,7 +493,7 @@ wait_for_certs() {
   info "Pruefe Zertifikate lokal per SNI (bis zu 120s, DNS-01 kann dauern)..."
   while :; do
     pending=0
-    while IFS=$'\t' read -r domain _s _i _p; do
+    while IFS=$'\t' read -r domain _s _i _p || [[ -n "$domain" ]]; do
       [[ -z "$domain" ]] && continue
       cert_ready "$domain" || pending=$((pending+1))
     done < "$SERVICES_FILE"
@@ -497,7 +501,7 @@ wait_for_certs() {
     (( SECONDS >= deadline )) && break
     sleep 5
   done
-  while IFS=$'\t' read -r domain _s _i _p; do
+  while IFS=$'\t' read -r domain _s _i _p || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     if cert_ready "$domain"; then
       ok "Zertifikat aktiv (SNI ok): ${domain}"
@@ -520,7 +524,7 @@ reload_caddy() {
   # Sync-Check: jede Domain aus der Service-Liste muss enthalten sein.
   local missing=0 d _s _i _p
   if [[ -s "$SERVICES_FILE" ]]; then
-    while IFS=$'\t' read -r d _s _i _p; do
+    while IFS=$'\t' read -r d _s _i _p || [[ -n "$d" ]]; do
       [[ -z "$d" ]] && continue
       grep -q "^${d//./\\.} {" "$tmp" || { err "Domain fehlt im generierten Caddyfile: $d"; missing=1; }
     done < "$SERVICES_FILE"
@@ -907,7 +911,7 @@ edit_settings() {
 test_backends() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
   section "Backend-Test"
-  while IFS=$'\t' read -r domain scheme ip port; do
+  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue; printf '%b\n' "${C_BOLD}${domain}${C_RESET} -> ${scheme}://${ip}:${port}"
     if [[ "$scheme" == "https" ]]; then curl -k -I --connect-timeout 5 "https://${ip}:${port}" || true; else curl -I --connect-timeout 5 "http://${ip}:${port}" || true; fi; echo
   done < "$SERVICES_FILE"
@@ -932,7 +936,7 @@ domains_status() {
   local expect="${VPS_PUBLIC_HOST:-}"
   echo "Erwartete VPS-IP/Host: ${expect:-unbekannt}"
   local domain scheme ip port a aaaa
-  while IFS=$'\t' read -r domain scheme ip port; do
+  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
     aaaa="$(dig +short AAAA "$domain" 2>/dev/null | tail -n1 || true)"
@@ -1430,7 +1434,7 @@ check_certs() {
     return 1
   fi
 
-  while IFS=$'\t' read -r domain scheme ip port; do
+  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue
     _tls_check_one "$domain"
   done < "$SERVICES_FILE"
@@ -1495,7 +1499,7 @@ health_check() {
 
   if [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]]; then
     local domain scheme ip port route code rc url tmp msg dns
-    while IFS=$'\t' read -r domain scheme ip port; do
+    while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
       [[ -z "${domain:-}" ]] && continue
 
       route="$(ip route get "$ip" 2>/dev/null || true)"
@@ -1911,11 +1915,15 @@ homeedge_rollback() {
   /usr/local/bin/homeedge --version || true
 }
 
-# Bietet vor kritischen Aenderungen ein Backup an (Default Ja).
+# Bietet vor kritischen Aenderungen ein Backup an. Verhalten via BACKUP_BEHAVIOR:
+# ask (Default, fragt), auto (immer Backup), never (nie).
 maybe_backup_before_change() {
-  if yesno "Vor dieser Aenderung Backup erstellen?" "y"; then
-    backup_create || warn "Backup fehlgeschlagen - fahre fort."
-  fi
+  load_env
+  case "${BACKUP_BEHAVIOR:-ask}" in
+    never) return 0 ;;
+    auto) backup_create || warn "Backup fehlgeschlagen - fahre fort." ;;
+    *) if yesno "Vor dieser Aenderung Backup erstellen?" "y"; then backup_create || warn "Backup fehlgeschlagen - fahre fort."; fi ;;
+  esac
 }
 
 updates_submenu() {
@@ -1951,66 +1959,424 @@ updates_submenu() {
   done
 }
 
+# ------------------------------------------------------------
+# Strukturiertes Menue (Breadcrumb, ASCII-only)
+# ------------------------------------------------------------
+hmenu_head() {
+  clear
+  printf '%b\n' "${C_BOLD}${C_BLUE}============================================================${C_RESET}"
+  printf '%b\n' "${C_DIM}HomeEdge > ${1}${C_RESET}"
+  printf '%b\n' "${C_BOLD}${C_BLUE}============================================================${C_RESET}"
+}
+menu_back() { echo "   b) Zurueck"; echo "   0) Beenden"; line; }
+
+# --- kleine Status-/Helfer-Funktionen fuer die Gruppen ---
+caddy_status() {
+  load_env
+  section "Caddy / Docker Status"
+  if systemctl is-active --quiet docker 2>/dev/null; then ok "Docker aktiv"; else err "Docker nicht aktiv"; fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; fi
+  docker ps --filter name=caddy-edge --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
+}
+show_caddyfile() {
+  section "Caddyfile"
+  if [[ -f "${CADDY_DIR}/Caddyfile" ]]; then mask_secrets < "${CADDY_DIR}/Caddyfile"; else warn "Keine Caddyfile vorhanden. Erst Dienst anlegen / reload."; fi
+}
+ufw_rules() { section "UFW Regeln"; ufw status numbered 2>/dev/null || warn "UFW nicht verfuegbar/aktiv."; }
+route_test() {
+  load_env
+  section "Route zum Backend testen"
+  local ip; ip="$(awk -F'\t' 'NF>=3{print $3; exit}' "$SERVICES_FILE" 2>/dev/null || true)"
+  ip="$(ask "Backend-IP fuer Routen-Test" "${ip:-}")"
+  [[ -z "$ip" ]] && { warn "Keine IP angegeben."; return; }
+  ip route get "$ip" 2>&1 || true
+}
+handshake_check() {
+  load_env
+  section "WireGuard Handshake"
+  local hs now age
+  hs="$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')"
+  now="$(date +%s)"
+  if [[ -z "${hs:-}" || "$hs" == "0" ]]; then err "Kein Handshake. Tunnel evtl. nicht aktiv oder UniFi-Key fehlt."; return; fi
+  age=$((now-hs))
+  if (( age < 600 )); then ok "Letzter Handshake vor ${age}s"; elif (( age < 3600 )); then warn "Letzter Handshake vor ${age}s"; else err "Handshake zu alt: ${age}s"; fi
+}
+verify_current_token() {
+  load_env
+  section "Cloudflare Token testen"
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || { err "Kein Token gesetzt."; return 1; }
+  if verify_cloudflare_token "$CLOUDFLARE_API_TOKEN"; then
+    ok "Token ist gueltig (Cloudflare bestaetigt)."
+  else
+    local rc=$?
+    if [[ "$rc" -eq 2 ]]; then warn "curl fehlt - kann nicht pruefen."; else err "Token ungueltig oder nicht bestaetigt."; fi
+  fi
+}
+dns_challenge_test() {
+  load_env
+  section "Cloudflare DNS-Challenge pruefen"
+  echo "Caddy nutzt DNS-01 ueber das caddy-dns/cloudflare Modul."
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+    if docker exec caddy-edge caddy list-modules 2>/dev/null | grep -q 'cloudflare'; then ok "Cloudflare DNS-Modul im Caddy-Build vorhanden."; else err "Cloudflare DNS-Modul fehlt - Caddy neu bauen (Wartung -> Docker/Caddy neu bauen)."; fi
+  else
+    warn "Caddy laeuft nicht - Modulpruefung uebersprungen."
+  fi
+  verify_current_token
+}
+restart_services() {
+  need_root; load_env
+  section "Dienste neu starten"
+  if ! yesno "Caddy, WireGuard und Fail2ban neu starten?" "n"; then warn "Abgebrochen."; return; fi
+  if [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then (cd "$CADDY_DIR" && docker compose restart >/dev/null 2>&1) && ok "Caddy neu gestartet." || warn "Caddy-Neustart fehlgeschlagen."; fi
+  restart_wg
+  systemctl restart fail2ban 2>/dev/null && ok "Fail2ban neu gestartet." || warn "Fail2ban nicht neu gestartet."
+}
+do_reboot() {
+  need_root
+  section "System rebooten"
+  warn "Der VPS wird neu gestartet. Die SSH-Verbindung bricht ab."
+  if yesno "Jetzt rebooten?" "n"; then reboot; else warn "Abgebrochen."; fi
+}
+ufw_logs() {
+  section "UFW Logs"
+  if [[ -f /var/log/ufw.log ]]; then tail -n 100 /var/log/ufw.log; else journalctl -k 2>/dev/null | grep -i 'UFW' | tail -n 100 || warn "Keine UFW-Logs gefunden."; fi
+}
+diag_report() {
+  need_root; load_env
+  section "Diagnosebericht erstellen"
+  local f="${EDGE_DIR}/diagnose-$(date +%Y%m%d-%H%M%S).txt"
+  {
+    echo "HomeEdge Diagnose $(date -Is)"; echo "Version: ${APP_VERSION}"; echo
+    echo "## Werte"; show_values
+    echo; echo "## Domains/DNS"; domains_status
+    echo; echo "## Docker"; docker ps 2>/dev/null
+    echo; echo "## WireGuard"; wg show 2>/dev/null
+    echo; echo "## UFW"; ufw status verbose 2>/dev/null
+    echo; echo "## Fail2ban"; fail2ban-client status 2>/dev/null
+    echo; echo "## Caddy Logs (tail)"; docker logs --tail 50 caddy-edge 2>/dev/null
+  } 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | mask_secrets > "$f"
+  chmod 600 "$f"
+  ok "Diagnosebericht gespeichert: $f (Secrets maskiert)."
+}
+show_last_error() {
+  section "Letzte Fehler"
+  echo "## systemd (Prioritaet error, letzte 30):"
+  journalctl -p err -n 30 --no-pager 2>/dev/null | mask_secrets || warn "journalctl nicht verfuegbar."
+  echo
+  echo "## Caddy (Fehlerzeilen, letzte 20):"
+  docker logs --tail 200 caddy-edge 2>&1 | grep -iE 'error|fail' | tail -n 20 | mask_secrets || true
+}
+edit_acme_email() {
+  need_root; load_env
+  section "ACME E-Mail aendern"
+  maybe_backup_before_change
+  ACME_EMAIL="$(ask "ACME E-Mail (Let's Encrypt)" "$ACME_EMAIL")"
+  save_env; write_caddy_stack; reload_caddy
+  ok "ACME E-Mail gespeichert."
+}
+backup_behavior_toggle() {
+  need_root; load_env
+  section "Standard Backup-Verhalten"
+  echo "Aktuell: ${BACKUP_BEHAVIOR}"
+  echo "  1) ask   - vor kritischen Aenderungen fragen (Standard)"
+  echo "  2) auto  - immer automatisch ein Backup"
+  echo "  3) never - nie automatisch"
+  local c; c="$(ask "Auswahl" "1")"
+  case "$c" in 1) BACKUP_BEHAVIOR=ask ;; 2) BACKUP_BEHAVIOR=auto ;; 3) BACKUP_BEHAVIOR=never ;; *) warn "Unveraendert."; return ;; esac
+  save_env; ok "Backup-Verhalten: ${BACKUP_BEHAVIOR}"
+}
+expert_mode_toggle() {
+  need_root; load_env
+  section "Expertenmodus"
+  if [[ "${EXPERT_MODE:-0}" == "1" ]]; then
+    if yesno "Expertenmodus deaktivieren?" "y"; then EXPERT_MODE=0; save_env; ok "Expertenmodus aus."; fi
+  else
+    warn "Expertenmodus ist fuer erfahrene Nutzer gedacht."
+    if yesno "Expertenmodus aktivieren?" "n"; then EXPERT_MODE=1; save_env; ok "Expertenmodus an."; fi
+  fi
+}
+
+# --- Gruppen-Untermenues ---
+sm_status() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Status / Ampel"
+    menu_item 1 "Gesamtstatus anzeigen"
+    menu_item 2 "Ampel-Check komplett"
+    menu_item 3 "Offene Ports anzeigen"
+    menu_item 4 "Docker / Caddy Status"
+    menu_item 5 "WireGuard Status"
+    menu_item 6 "Zertifikatsstatus"
+    menu_item 7 "DNS Status pro Domain"
+    menu_item 8 "Server Auslastung"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) status_all; pause ;;
+      2) health_check; pause ;;
+      3) security_ports; pause ;;
+      4) caddy_status; pause ;;
+      5) load_env; wg_status; pause ;;
+      6) check_certs; pause ;;
+      7) domains_status; pause ;;
+      8) system_usage; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_services() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Domains & Dienste"
+    menu_item 1 "Dienste anzeigen"
+    menu_item 2 "Dienst hinzufuegen"
+    menu_item 3 "Dienst bearbeiten"
+    menu_item 4 "Dienst loeschen"
+    menu_item 5 "Domain lokal per SNI testen"
+    menu_item 6 "Backend direkt testen"
+    menu_item 7 "Caddyfile aus Diensten neu generieren"
+    menu_item 8 "Caddyfile anzeigen"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) list_services; pause ;;
+      2) add_service; pause ;;
+      3) edit_service; pause ;;
+      4) delete_service; pause ;;
+      5) test_domain; pause ;;
+      6) test_backends; pause ;;
+      7) reload_caddy; pause ;;
+      8) show_caddyfile; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_wg() {
+  need_root; set +e
+  while true; do
+    hmenu_head "WireGuard Tunnel"
+    menu_item 1 "Tunnel Status anzeigen"
+    menu_item 2 "WireGuard Werte fuer UniFi anzeigen"
+    menu_item 3 "UniFi Public Key aendern"
+    menu_item 4 "Preshared Key neu generieren"
+    menu_item 5 "Backend-Netze hinter UniFi aendern"
+    menu_item 6 "WireGuard neu starten"
+    menu_item 7 "Route zum Backend testen"
+    menu_item 8 "Handshake pruefen"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) load_env; wg_status; pause ;;
+      2) wg_values; pause ;;
+      3) set_wg_key; pause ;;
+      4) regenerate_psk; pause ;;
+      5) edit_backend_networks; pause ;;
+      6) restart_wg; ok "WireGuard-Neustart angestossen."; pause ;;
+      7) route_test; pause ;;
+      8) handshake_check; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_caddy() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Caddy / HTTPS / Cloudflare"
+    menu_item 1 "Caddy Status"
+    menu_item 2 "Caddy reload (Caddyfile neu erzeugen)"
+    menu_item 3 "Caddy restart / neu bauen"
+    menu_item 4 "Zertifikate anzeigen"
+    menu_item 5 "Cloudflare API Token aendern"
+    menu_item 6 "Cloudflare Token testen"
+    menu_item 7 "DNS Challenge pruefen"
+    menu_item 8 "HTTP/3 aktivieren/deaktivieren"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) caddy_status; pause ;;
+      2) reload_caddy; pause ;;
+      3) restart_caddy; pause ;;
+      4) check_certs; pause ;;
+      5) change_cloudflare_token; pause ;;
+      6) verify_current_token; pause ;;
+      7) dns_challenge_test; pause ;;
+      8) security_http3_toggle; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_security() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Sicherheit"
+    menu_item 1 "Security Ampel"
+    menu_item 2 "UFW Status"
+    menu_item 3 "UFW Regeln anzeigen"
+    menu_item 4 "Fail2ban Status"
+    menu_item 5 "Gebannte IPs anzeigen"
+    menu_item 6 "IP aus Liste entbannen"
+    menu_item 7 "IP manuell entbannen"
+    menu_item 8 "SSH Hardening pruefen"
+    menu_item 9 "Jellyfin Sicherheitscheckliste"
+    menu_item 10 "Firewall neu anwenden"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) security_minimal_check; pause ;;
+      2) security_firewall; pause ;;
+      3) ufw_rules; pause ;;
+      4) f2b_status_overview; pause ;;
+      5) f2b_show_banned_ips; pause ;;
+      6) f2b_unban_select; pause ;;
+      7) f2b_unban_manual; pause ;;
+      8) security_ssh_status; pause ;;
+      9) security_jellyfin_checklist; pause ;;
+      10) apply_firewall; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_backup() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Backup & Restore"
+    warn "Backups enthalten Secrets (WireGuard Keys, PSK, Cloudflare Token). Nicht unverschluesselt teilen."
+    menu_item 1 "Backup erstellen"
+    menu_item 2 "Backups anzeigen"
+    menu_item 3 "Backup wiederherstellen"
+    menu_item 4 "Backup exportieren"
+    menu_item 5 "Backup loeschen"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) backup_create; pause ;;
+      2) backup_list; pause ;;
+      3) backup_restore; pause ;;
+      4) backup_export_to_path; pause ;;
+      5) backup_delete; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_updates() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Updates & Wartung"
+    menu_item 1 "HomeEdge Version anzeigen"
+    menu_item 2 "Nach Update suchen"
+    menu_item 3 "HomeEdge aktualisieren"
+    menu_item 4 "Systemupdates installieren"
+    menu_item 5 "Docker / Caddy neu bauen"
+    menu_item 6 "Server Auslastung anzeigen"
+    menu_item 7 "Dienste neu starten"
+    menu_item 8 "Rollback auf letztes Backup"
+    menu_item 9 "System rebooten"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) show_version; pause ;;
+      2) check_for_update; pause ;;
+      3) homeedge_repo_update; pause ;;
+      4) system_update; pause ;;
+      5) caddy_update; pause ;;
+      6) system_usage; pause ;;
+      7) restart_services; pause ;;
+      8) homeedge_rollback; pause ;;
+      9) do_reboot; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_logs() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Logs & Diagnose"
+    menu_item 1 "Caddy Logs anzeigen"
+    menu_item 2 "WireGuard Diagnose"
+    menu_item 3 "Fail2ban Logs"
+    menu_item 4 "UFW Logs"
+    menu_item 5 "Docker Status / Logs"
+    menu_item 6 "Diagnosebericht erstellen"
+    menu_item 7 "Letzten Fehler anzeigen"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) section "Caddy Logs"; docker logs --tail 100 caddy-edge 2>&1 | mask_secrets || true; pause ;;
+      2) section "WireGuard Diagnose"; wg show 2>/dev/null || true; echo; ip -br addr show 2>/dev/null || true; pause ;;
+      3) f2b_show_log ;;
+      4) ufw_logs; pause ;;
+      5) section "Docker"; docker ps -a 2>/dev/null || true; echo; docker logs --tail 50 caddy-edge 2>&1 | mask_secrets || true; pause ;;
+      6) diag_report; pause ;;
+      7) show_last_error; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+sm_settings() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Einstellungen"
+    menu_item 1 "Globale Konfiguration anzeigen"
+    menu_item 2 "ACME E-Mail aendern"
+    menu_item 3 "Cloudflare API Token aendern"
+    menu_item 4 "VPS IP / Interface pruefen"
+    menu_item 5 "Standard Backup-Verhalten"
+    menu_item 6 "Expertenmodus aktivieren/deaktivieren"
+    menu_item 7 "Alle globalen Einstellungen (Assistent)"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) show_values; pause ;;
+      2) edit_acme_email; pause ;;
+      3) change_cloudflare_token; pause ;;
+      4) show_network_interfaces; pause ;;
+      5) backup_behavior_toggle; pause ;;
+      6) expert_mode_toggle; pause ;;
+      7) edit_settings; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+
 menu() {
   need_root
   set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     load_env
-    menu_head "HomeEdge - Secure VPS Gateway for Home Services"
-    printf '  %bVPS%b %s  %bWG%b %s:%s  %bCaddy%b %s\n' "$C_CYAN" "$C_RESET" "${VPS_PUBLIC_HOST:-?}" "$C_CYAN" "$C_RESET" "$WG_IF" "$WG_PORT" "$C_CYAN" "$C_RESET" "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$' && echo laeuft || echo unbekannt)"
+    hmenu_head "Hauptmenue"
+    printf '  %bVPS%b %s   %bWG%b %s:%s   %bCaddy%b %s\n' "$C_CYAN" "$C_RESET" "${VPS_PUBLIC_HOST:-?}" "$C_CYAN" "$C_RESET" "$WG_IF" "$WG_PORT" "$C_CYAN" "$C_RESET" "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$' && echo laeuft || echo "nicht aktiv")"
     line
-    menu_item 1 "Uebersicht / aktuelle Werte"
-    menu_item 2 "Ampel-Check: Sicherheit / Aktiv / Zertifikate"
-    menu_item 3 "Status anzeigen"
-    menu_item 4 "Externe Dienste anzeigen"
-    menu_item 5 "Externen Dienst hinzufuegen"
-    menu_item 6 "Externen Dienst aendern"
-    menu_item 7 "Externen Dienst loeschen"
-    menu_item 8 "Globale Einstellungen aendern (VPS, SSH, Cloudflare, Fail2ban)"
-    menu_item 9 "WireGuard konfigurieren"
-    menu_item 10 "Backends testen"
-    menu_item 11 "Zertifikate pruefen"
-    menu_item 12 "Caddyfile neu erzeugen + reload"
-    menu_item 13 "Caddy neu starten / neu bauen"
-    menu_item 14 "Logs anzeigen"
-    menu_item 15 "Fail2ban verwalten"
-    menu_item 16 "Firewall neu anwenden"
-    menu_item 17 "Sicherheitsmenue"
-    menu_item 18 "Server-Auslastung anzeigen"
-    menu_item 19 "Netzwerk / Interfaces"
-    menu_item 20 "Backup / Restore"
-    menu_item 21 "Wartung / Updates"
-    menu_item 22 "Domains / DNS-Status"
-    menu_item 23 "Domain testen (lokal per SNI)"
-    menu_item 24 "Cloudflare API Token aendern"
-    menu_item 0 "Ende"
+    menu_item 1 "Status / Ampel"
+    menu_item 2 "Domains & Dienste"
+    menu_item 3 "WireGuard Tunnel"
+    menu_item 4 "Caddy / HTTPS / Cloudflare"
+    menu_item 5 "Sicherheit"
+    menu_item 6 "Backup & Restore"
+    menu_item 7 "Updates & Wartung"
+    menu_item 8 "Logs & Diagnose"
+    menu_item 9 "Einstellungen"
+    menu_item 0 "Beenden"
     line
     read -rp "Auswahl: " choice
     case "$choice" in
-      1) show_values; pause ;;
-      2) health_check; pause ;;
-      3) status_all; pause ;;
-      4) list_services; pause ;;
-      5) add_service; pause ;;
-      6) edit_service; pause ;;
-      7) delete_service; pause ;;
-      8) edit_settings; pause ;;
-      9) wg_submenu ;;
-      10) test_backends; pause ;;
-      11) check_certs; pause ;;
-      12) generate_caddyfile; reload_caddy; pause ;;
-      13) restart_caddy; pause ;;
-      14) show_logs ;;
-      15) fail2ban_submenu ;;
-      16) apply_firewall; pause ;;
-      17) security_submenu ;;
-      18) system_usage; pause ;;
-      19) network_submenu ;;
-      20) backup_submenu ;;
-      21) updates_submenu ;;
-      22) domains_status; pause ;;
-      23) test_domain; pause ;;
-      24) change_cloudflare_token; pause ;;
+      1) sm_status ;;
+      2) sm_services ;;
+      3) sm_wg ;;
+      4) sm_caddy ;;
+      5) sm_security ;;
+      6) sm_backup ;;
+      7) sm_updates ;;
+      8) sm_logs ;;
+      9) sm_settings ;;
       0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2054,7 +2420,7 @@ case "${1:-menu}" in
   edit-service) edit_service ;;
   delete-service) delete_service ;;
   list-services) list_services ;;
-  reload) generate_caddyfile; reload_caddy ;;
+  reload) reload_caddy ;;
   restart) restart_caddy ;;
   test-backends) test_backends ;;
   logs) show_logs ;;
