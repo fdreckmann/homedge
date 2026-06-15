@@ -1,0 +1,19 @@
+# Lokale Installer-Configs koennen Secrets enthalten (z. B. Cloudflare API Token)
+# und duerfen NIEMALS eingecheckt werden.
+Install-EdgeVps.config.env
+Install-EdgeVps.config.json
+Install-Direct-OnVps.config.env
+*.config.env
+*.config.json
+
+# Logs / temporaere Dateien
+*.log
+edge-install.log
+/tmp/edge-bootstrap*.sh
+
+# Backups (enthalten Secrets)
+edge-backup-*.tar.gz
+
+# OS-/Editor-Kram
+.DS_Store
+*.swp
