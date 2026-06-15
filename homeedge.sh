@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.1-homeedge"
+APP_VERSION="0.9.2-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -55,14 +55,24 @@ q() { printf '%q' "$1"; }
 pause() { echo; read -rp "Enter druecken zum Fortfahren..."; }
 
 load_env() {
+  # Defaults immer zuerst setzen (set -u-sicher via :-), danach ggf. aus der
+  # Env-Datei ueberschreiben. So fuehrt eine unvollstaendige Datei nie zu
+  # "unbound variable" in save_env o. ae.
+  EXT_IF="${EXT_IF:-eth0}"; VPS_PUBLIC_HOST="${VPS_PUBLIC_HOST:-}"; SSH_PORT="${SSH_PORT:-22}"
+  WG_IF="${WG_IF:-unifi}"; WG_PORT="${WG_PORT:-51821}"
+  VPS_WG_ADDR="${VPS_WG_ADDR:-10.0.1.1/24}"; VPS_WG_IP="${VPS_WG_IP:-10.0.1.1}"
+  CLIENT_WG_ADDR="${CLIENT_WG_ADDR:-10.0.1.2/32}"; CLIENT_WG_IP="${CLIENT_WG_IP:-10.0.1.2}"
+  HOME_SUBNET="${HOME_SUBNET:-192.168.10.0/24}"; ACME_EMAIL="${ACME_EMAIL:-}"
+  CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"; USE_PSK="${USE_PSK:-1}"
+  CADDY_FAIL2BAN="${CADDY_FAIL2BAN:-0}"; CLIENT_PUBLIC_KEY="${CLIENT_PUBLIC_KEY:-}"
+  ENABLE_HTTP3="${ENABLE_HTTP3:-1}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
+  HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
+    # Neue Variablen, die in aelteren Env-Dateien fehlen koennen, absichern:
     ENABLE_HTTP3="${ENABLE_HTTP3:-1}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
-  else
-    EXT_IF="eth0"; VPS_PUBLIC_HOST=""; SSH_PORT="22"; WG_IF="unifi"; WG_PORT="51821"
-    VPS_WG_ADDR="10.0.1.1/24"; VPS_WG_IP="10.0.1.1"; CLIENT_WG_ADDR="10.0.1.2/32"; CLIENT_WG_IP="10.0.1.2"
-    HOME_SUBNET="192.168.10.0/24"; ACME_EMAIL=""; CLOUDFLARE_API_TOKEN=""; USE_PSK="1"; CADDY_FAIL2BAN="0"; CLIENT_PUBLIC_KEY=""; ENABLE_HTTP3="1"; HOMEEDGE_UPDATE_URL=""
+    HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   fi
 }
 
@@ -86,6 +96,8 @@ CADDY_FAIL2BAN=$(q "${CADDY_FAIL2BAN}")
 CLIENT_PUBLIC_KEY=$(q "${CLIENT_PUBLIC_KEY:-}")
 ENABLE_HTTP3=$(q "${ENABLE_HTTP3:-1}")
 HOMEEDGE_UPDATE_URL=$(q "${HOMEEDGE_UPDATE_URL:-}")
+HOMEEDGE_REPO=$(q "${HOMEEDGE_REPO:-fdreckmann/homedge}")
+HOMEEDGE_BRANCH=$(q "${HOMEEDGE_BRANCH:-main}")
 EOCFG
   chmod 600 "$ENV_FILE"
 }
@@ -1477,11 +1489,15 @@ security_submenu() {
 # Wartung / Updates
 # ------------------------------------------------------------
 show_version() {
+  load_env
   section "HomeEdge Version"
   echo "Installierte Version: ${APP_VERSION}"
   echo "Befehl: homeedge"
   echo "Kompatibilitaets-Alias: edgectl"
   echo "Config: ${ENV_FILE}"
+  echo "Update-Repo: ${HOMEEDGE_REPO}@${HOMEEDGE_BRANCH}"
+  echo "Raw-Quelle:  $(_repo_raw_url)"
+  [[ -n "${HOMEEDGE_UPDATE_URL:-}" ]] && echo "Update-URL:  ${HOMEEDGE_UPDATE_URL}"
 }
 
 system_update() {
@@ -1500,24 +1516,85 @@ caddy_update() {
   ok "Caddy wurde neu gebaut/gestartet."
 }
 
+_repo_raw_url() {
+  printf 'https://raw.githubusercontent.com/%s/%s/homeedge.sh' "${HOMEEDGE_REPO}" "${HOMEEDGE_BRANCH}"
+}
+
 configure_update_source() {
   load_env
-  section "Update-Quelle konfigurieren"
-  echo "Empfohlen: GitHub Release Asset als Raw-URL auf die homeedge.sh Datei."
+  section "Update-URL konfigurieren"
+  echo "Optional: direkte Raw-URL auf eine homeedge.sh, z. B. ein GitHub Release Asset."
   echo "Beispiel: https://github.com/USER/REPO/releases/latest/download/homeedge.sh"
+  echo "Fuer normales Repo-Update brauchst du das nicht (siehe Repo-Quelle)."
   echo
-  HOMEEDGE_UPDATE_URL="$(ask "Update-URL" "${HOMEEDGE_UPDATE_URL:-}")"
+  HOMEEDGE_UPDATE_URL="$(ask "Update-URL (leer lassen = keine)" "${HOMEEDGE_UPDATE_URL:-}")"
   save_env
   ok "Update-URL gespeichert."
 }
 
-save_env_with_update_url() {
-  :
+configure_repo_source() {
+  load_env
+  section "GitHub-Repo als Update-Quelle konfigurieren"
+  echo "Aktuelles Repo:   ${HOMEEDGE_REPO}"
+  echo "Aktueller Branch: ${HOMEEDGE_BRANCH}"
+  echo
+  HOMEEDGE_REPO="$(ask "GitHub Repo (owner/repo)" "${HOMEEDGE_REPO}")"
+  HOMEEDGE_BRANCH="$(ask "Branch oder Tag" "${HOMEEDGE_BRANCH}")"
+  save_env
+  ok "Repo-Quelle gespeichert: ${HOMEEDGE_REPO}@${HOMEEDGE_BRANCH}"
+  echo "Raw-URL: $(_repo_raw_url)"
 }
 
+# Validiert eine heruntergeladene homeedge.sh und installiert sie atomar.
+# Bei jedem Fehler bleibt die aktuelle Installation unveraendert.
+# $1 = Pfad zur heruntergeladenen Datei
+_install_homeedge_from_file() {
+  local tmp="$1" old new_ver
+  sed -i 's/\r$//' "$tmp" 2>/dev/null || true
+  if [[ ! -s "$tmp" ]]; then err "Download ist leer. Abbruch, nichts geaendert."; return 1; fi
+  if ! grep -q 'APP_NAME="HomeEdge"' "$tmp"; then
+    err "Datei sieht nicht nach HomeEdge aus (evtl. 404/Fehlerseite). Abbruch, nichts geaendert."
+    return 1
+  fi
+  if ! bash -n "$tmp"; then err "Syntaxpruefung fehlgeschlagen. Abbruch, nichts geaendert."; return 1; fi
+  new_ver="$(grep -m1 '^APP_VERSION=' "$tmp" | cut -d'"' -f2 || true)"
+  old="/usr/local/bin/homeedge.backup.$(date +%Y%m%d-%H%M%S)"
+  cp -a /usr/local/bin/homeedge "$old" 2>/dev/null || true
+  install -m 0755 "$tmp" /usr/local/bin/homeedge
+  ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl
+  ok "HomeEdge aktualisiert auf Version: ${new_ver:-unbekannt}"
+  info "Vorherige Version gesichert: ${old}"
+  /usr/local/bin/homeedge --version || true
+}
+
+# Update direkt vom GitHub-Repo (raw.githubusercontent.com). Standardquelle.
+homeedge_repo_update() {
+  load_env
+  section "HomeEdge aus GitHub-Repo aktualisieren"
+  if ! command -v curl >/dev/null 2>&1; then err "curl ist nicht installiert."; return 1; fi
+  local url; url="$(_repo_raw_url)"
+  echo "Repo:                ${HOMEEDGE_REPO}"
+  echo "Branch/Tag:          ${HOMEEDGE_BRANCH}"
+  echo "Quelle:              ${url}"
+  echo "Aktuell installiert: ${APP_VERSION}"
+  echo
+  if ! yesno "Neueste homeedge.sh aus diesem Repo laden und installieren?" "n"; then return; fi
+
+  backup_create || true
+  local tmp; tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    err "Download fehlgeschlagen. Pruefe Repo/Branch und ob homeedge.sh dort existiert."
+    err "Versuchte URL: ${url}"
+    return 1
+  fi
+  _install_homeedge_from_file "$tmp" || return 1
+}
+
+# Update von einer frei konfigurierten Raw-URL (z. B. Release-Asset).
 homeedge_self_update() {
   load_env
-  section "HomeEdge aktualisieren"
+  section "HomeEdge aus Update-URL aktualisieren"
   if [[ -z "${HOMEEDGE_UPDATE_URL:-}" ]]; then
     warn "Keine Update-URL konfiguriert."
     configure_update_source
@@ -1529,18 +1606,10 @@ homeedge_self_update() {
   if ! yesno "Update von dieser Quelle herunterladen und installieren?" "n"; then return; fi
 
   backup_create || true
-  local tmp old
-  tmp="$(mktemp)"
-  old="/usr/local/bin/homeedge.backup.$(date +%Y%m%d-%H%M%S)"
-  curl -fsSL "$HOMEEDGE_UPDATE_URL" -o "$tmp"
-  sed -i 's/\r$//' "$tmp" 2>/dev/null || true
-  bash -n "$tmp"
-  cp -a /usr/local/bin/homeedge "$old" 2>/dev/null || true
-  install -m 0755 "$tmp" /usr/local/bin/homeedge
-  ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl
-  rm -f "$tmp"
-  ok "HomeEdge aktualisiert. Backup: ${old}"
-  /usr/local/bin/homeedge --version || true
+  local tmp; tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  if ! curl -fsSL "$HOMEEDGE_UPDATE_URL" -o "$tmp"; then err "Download fehlgeschlagen."; return 1; fi
+  _install_homeedge_from_file "$tmp" || return 1
 }
 
 updates_submenu() {
@@ -1548,21 +1617,25 @@ updates_submenu() {
   while true; do
     menu_head "HomeEdge - Wartung / Updates"
     menu_item 1 "Version anzeigen"
-    menu_item 2 "Update-Quelle anzeigen/aendern"
-    menu_item 3 "HomeEdge aus Update-Quelle aktualisieren"
-    menu_item 4 "Caddy/Docker neu bauen/aktualisieren"
-    menu_item 5 "Systemupdates ausfuehren"
-    menu_item 6 "Backup vor Update erstellen"
+    menu_item 2 "HomeEdge aus GitHub-Repo aktualisieren (empfohlen)"
+    menu_item 3 "GitHub-Repo/Branch konfigurieren"
+    menu_item 4 "HomeEdge aus Update-URL aktualisieren"
+    menu_item 5 "Update-URL anzeigen/aendern"
+    menu_item 6 "Caddy/Docker neu bauen/aktualisieren"
+    menu_item 7 "Systemupdates ausfuehren"
+    menu_item 8 "Backup vor Update erstellen"
     menu_item 0 "Zurueck"
     line
     read -rp "Auswahl: " choice
     case "$choice" in
       1) show_version; pause ;;
-      2) configure_update_source; pause ;;
-      3) homeedge_self_update; pause ;;
-      4) caddy_update; pause ;;
-      5) system_update; pause ;;
-      6) backup_create; pause ;;
+      2) homeedge_repo_update; pause ;;
+      3) configure_repo_source; pause ;;
+      4) homeedge_self_update; pause ;;
+      5) configure_update_source; pause ;;
+      6) caddy_update; pause ;;
+      7) system_update; pause ;;
+      8) backup_create; pause ;;
       0) return ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -1639,6 +1712,9 @@ case "${1:-menu}" in
   network|interfaces|net) network_submenu ;;
   backup|restore|backup-menu) backup_submenu ;;
   update|updates|wartung) updates_submenu ;;
+  self-update|update-repo|repo-update) need_root; homeedge_repo_update ;;
+  update-url) need_root; homeedge_self_update ;;
+  set-repo) need_root; configure_repo_source ;;
   backup-create) backup_create ;;
   backup-list) backup_list ;;
   show-interfaces) show_network_interfaces ;;
@@ -1664,5 +1740,5 @@ case "${1:-menu}" in
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload|self-update|set-repo"; exit 1 ;;
 esac
