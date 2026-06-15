@@ -30,6 +30,7 @@ sudo homeedge wg-values
 sudo homeedge fail2ban
 sudo homeedge backup
 sudo homeedge update
+sudo homeedge self-update
 ```
 
 `edgectl` bleibt als Kompatibilitaets-Alias erhalten:
@@ -95,32 +96,54 @@ chmod +x Update-HomeEdgeOnly.sh
 ./Update-HomeEdgeOnly.sh
 ```
 
-## Update-Funktion im Programm
+## Direkt auf dem VPS aktualisieren (aus dem Repo)
 
-Im Menü:
+HomeEdge kann sich auf dem VPS selbst direkt aus dem GitHub-Repo aktualisieren.
+Es lädt dabei nur die `homeedge.sh` per Raw-URL, prüft sie (HomeEdge-Marker +
+`bash -n`) und installiert sie erst danach. Vorher wird automatisch ein Backup
+erstellt und die alte Version unter `/usr/local/bin/homeedge.backup.*` gesichert.
 
-```text
-Wartung / Updates
+```bash
+# Update direkt aus dem konfigurierten Repo (Standard: fdreckmann/homedge @ main)
+sudo homeedge self-update
+
+# Repo/Branch einmalig anpassen (z. B. anderer Branch oder Fork)
+sudo homeedge set-repo
 ```
 
-Dort kannst du:
+Die Standardquelle ist:
+
+```text
+https://raw.githubusercontent.com/fdreckmann/homedge/main/homeedge.sh
+```
+
+Repo und Branch werden in `/etc/homeedge/homeedge.env` gespeichert
+(`HOMEEDGE_REPO`, `HOMEEDGE_BRANCH`).
+
+## Update-Funktion im Programm
+
+Im Menü unter `Wartung / Updates`:
 
 ```text
 Version anzeigen
-Update-Quelle setzen, z. B. GitHub Release Download-URL
-HomeEdge aus der Update-Quelle aktualisieren
+HomeEdge aus GitHub-Repo aktualisieren (empfohlen)
+GitHub-Repo/Branch konfigurieren
+HomeEdge aus Update-URL aktualisieren
+Update-URL anzeigen/aendern
 Caddy/Docker aktualisieren
 Systemupdates ausführen
 Backup vor Update erstellen
 ```
 
-Empfohlene GitHub-Quelle später:
+Alternativ zum Repo-Update kann eine feste Raw-/Release-URL gesetzt werden
+(`sudo homeedge update-url`), z. B. ein GitHub Release Asset:
 
 ```text
 https://github.com/USER/REPO/releases/latest/download/homeedge.sh
 ```
 
-Nicht empfohlen: blind von `main` installieren.
+Hinweis: Updates direkt von `main` sind bequem, aber ungetestet. Für stabile
+Setups empfiehlt sich ein getaggter Branch/Release als `HOMEEDGE_BRANCH`.
 
 ## Wichtige Dateien auf dem VPS
 

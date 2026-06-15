@@ -128,6 +128,8 @@ CLOUDFLARE_API_TOKEN=$(printf '%q' "${CLOUDFLARE_API_TOKEN}")
 USE_PSK=$(printf '%q' "${USE_PSK}")
 CADDY_FAIL2BAN=$(printf '%q' "${CADDY_FAIL2BAN}")
 CLIENT_PUBLIC_KEY=$(printf '%q' "${CLIENT_PUBLIC_KEY}")
+HOMEEDGE_REPO=$(printf '%q' "${HOMEEDGE_REPO:-fdreckmann/homedge}")
+HOMEEDGE_BRANCH=$(printf '%q' "${HOMEEDGE_BRANCH:-main}")
 EOF
 chmod 600 "${ENV_FILE}"
 printf '%s' "${SERVICES_TSV}" > "${SERVICES_FILE}"
