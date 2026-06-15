@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.3-homeedge"
+APP_VERSION="0.9.4-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -49,7 +49,13 @@ menu_head() { clear; printf '%b\n' "${C_BOLD}${C_BLUE}==========================
 
 need_root() { if [[ "${EUID}" -ne 0 ]]; then err "Bitte als root ausfuehren: sudo homeedge ..."; exit 1; fi; }
 ask() { local p="$1" d="${2:-}" v; if [[ -n "$d" ]]; then read -rp "$p [$d]: " v; echo "${v:-$d}"; else read -rp "$p: " v; echo "$v"; fi; }
-ask_secret() { local p="$1" v; read -rsp "$p: " v; echo; echo "$v"; }
+# Newline nach der verdeckten Eingabe geht nach stderr; nur der Wert nach stdout.
+# Sonst landet ein fuehrender Zeilenumbruch im per $(...) gelesenen Wert (Token-Bug).
+ask_secret() { local p="$1" v; read -rsp "$p: " v; echo >&2; printf '%s' "$v"; }
+# Entfernt CR/LF und Whitespace aus Secrets (Tokens duerfen nie mehrzeilig sein).
+sanitize_token() { printf '%s' "${1:-}" | tr -d '\r\n[:space:]'; }
+# Maskiert Cloudflare-Tokens in beliebigen Ausgaben/Logs.
+mask_secrets() { sed -E 's/cfut_[A-Za-z0-9_]+/cfut_***MASKED***/g; s/(CLOUDFLARE_API_TOKEN[=:][[:space:]]*).*/\1***MASKED***/g'; }
 yesno() { local p="$1" d="${2:-n}" a; read -rp "$p [$d]: " a; a="${a:-$d}"; [[ "$a" =~ ^([YyJj]|yes|YES|Yes|ja|JA|Ja)$ ]]; }
 q() { printf '%q' "$1"; }
 pause() { echo; read -rp "Enter druecken zum Fortfahren..."; }
@@ -78,6 +84,8 @@ load_env() {
 
 save_env() {
   umask 077
+  # Secrets immer bereinigen, bevor sie geschrieben werden (nie mehrzeilig).
+  CLOUDFLARE_API_TOKEN="$(sanitize_token "${CLOUDFLARE_API_TOKEN:-}")"
   cat > "$ENV_FILE" <<EOCFG
 EXT_IF=$(q "${EXT_IF}")
 VPS_PUBLIC_HOST=$(q "${VPS_PUBLIC_HOST}")
@@ -214,7 +222,9 @@ EOVAL
 
 set_wg_key() {
   load_env
-  CLIENT_PUBLIC_KEY="$(ask "UniFi/Client PublicKey" "${CLIENT_PUBLIC_KEY:-}")"
+  local newkey; newkey="$(ask "UniFi/Client PublicKey" "${CLIENT_PUBLIC_KEY:-}")"
+  maybe_backup_before_change
+  CLIENT_PUBLIC_KEY="$newkey"
   save_env; write_wg_config; write_unifi_values; restart_wg
   wg show || true
 }
@@ -298,6 +308,7 @@ toggle_psk() {
 
 wg_submenu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     load_env
     menu_head "HomeEdge - WireGuard konfigurieren"
@@ -349,11 +360,17 @@ wg_submenu() {
 # ------------------------------------------------------------
 write_caddy_stack() {
   load_env; mkdir -p "${CADDY_DIR}/data" "${CADDY_DIR}/config" "${CADDY_DIR}/logs"
+  CLOUDFLARE_API_TOKEN="$(sanitize_token "${CLOUDFLARE_API_TOKEN:-}")"
   cat > "${CADDY_DIR}/.env" <<EOCADDY
 ACME_EMAIL=${ACME_EMAIL}
 CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
 EOCADDY
   chmod 600 "${CADDY_DIR}/.env"
+  # caddy:2-builder/xcaddy bauen die jeweils neueste caddy-dns/cloudflare-Version.
+  # Diese akzeptiert die neuen Cloudflare-Tokenformate (Prefix cfut_).
+  # Bei Token-Problemen Caddy neu bauen: Menue -> Wartung -> Caddy/Docker neu bauen
+  # (docker compose build --pull). Haupt-Ursache fuer "invalid" war bisher ein
+  # versehentlicher Zeilenumbruch im Token - das ist jetzt zentral bereinigt.
   cat > "${CADDY_DIR}/Dockerfile" <<'EOCADDY'
 FROM caddy:2-builder AS builder
 RUN xcaddy build --with github.com/caddy-dns/cloudflare
@@ -377,23 +394,25 @@ services:
 EOCADDY
 }
 
-generate_caddyfile() {
+# Erzeugt das Caddyfile komplett aus der Service-Liste in die Zieldatei $1.
+generate_caddyfile_to() {
+  local out="$1"
   load_env; mkdir -p "$CADDY_DIR"; touch "$SERVICES_FILE"
-  cat > "${CADDY_DIR}/Caddyfile" <<EOCADDY
+  cat > "$out" <<EOCADDY
 {
     email {\$ACME_EMAIL}
     auto_https disable_redirects
 EOCADDY
 
   if [[ "${ENABLE_HTTP3:-1}" != "1" ]]; then
-    cat >> "${CADDY_DIR}/Caddyfile" <<'EOCADDY'
+    cat >> "$out" <<'EOCADDY'
     servers {
         protocols h1 h2
     }
 EOCADDY
   fi
 
-  cat >> "${CADDY_DIR}/Caddyfile" <<'EOCADDY'
+  cat >> "$out" <<'EOCADDY'
 }
 
 (common) {
@@ -411,31 +430,27 @@ EOCADDY
     }
 }
 EOCADDY
+  # Hinweis: X-Forwarded-For/Proto/Host setzt Caddy automatisch -> nicht doppeln.
+  # Nur X-Real-IP bleibt (optional, fuer Backends die es erwarten).
   while IFS=$'\t' read -r domain scheme ip port; do
     [[ -z "${domain:-}" ]] && continue
-    cat >> "${CADDY_DIR}/Caddyfile" <<EOCADDY
+    cat >> "$out" <<EOCADDY
 
 ${domain} {
     import common
 EOCADDY
     if [[ "$scheme" == "https" ]]; then
-      cat >> "${CADDY_DIR}/Caddyfile" <<EOCADDY
+      cat >> "$out" <<EOCADDY
     reverse_proxy https://${ip}:${port} {
         transport http { tls_insecure_skip_verify }
         header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-Host {host}
     }
 }
 EOCADDY
     else
-      cat >> "${CADDY_DIR}/Caddyfile" <<EOCADDY
+      cat >> "$out" <<EOCADDY
     reverse_proxy http://${ip}:${port} {
         header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-Host {host}
     }
 }
 EOCADDY
@@ -443,15 +458,109 @@ EOCADDY
   done < "$SERVICES_FILE"
 }
 
-reload_caddy() {
-  load_env; write_caddy_stack; generate_caddyfile; cd "$CADDY_DIR"
+generate_caddyfile() { generate_caddyfile_to "${CADDY_DIR}/Caddyfile"; }
+
+# Validiert das aktuelle Caddyfile. Nutzt den laufenden Container oder baut
+# bei Bedarf das Image und validiert in einem Wegwerf-Container.
+validate_caddyfile() {
+  cd "$CADDY_DIR" || return 1
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
-    docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile || { err "Caddyfile ungueltig. Reload abgebrochen."; return 1; }
-    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile || docker compose up -d
+    docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
   else
-    docker compose build
-    docker compose up -d
+    docker compose build >/dev/null 2>&1 || return 1
+    docker compose run --rm --no-deps -T --entrypoint caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
   fi
+}
+
+# Prueft, ob fuer eine Domain lokal (per SNI auf 127.0.0.1) ein Zertifikat ausgeliefert wird.
+cert_ready() {
+  local domain="$1"
+  command -v openssl >/dev/null 2>&1 || return 0
+  echo | timeout 8 openssl s_client -servername "$domain" -connect 127.0.0.1:443 2>/dev/null \
+    | openssl x509 -noout -subject >/dev/null 2>&1
+}
+
+# Wartet nach einem Reload bis zu 120s, bis Zertifikate aktiv sind (DNS-01 dauert).
+wait_for_certs() {
+  load_env
+  [[ -s "$SERVICES_FILE" ]] || return 0
+  if ! command -v openssl >/dev/null 2>&1; then info "openssl fehlt - Zertifikatscheck uebersprungen."; return 0; fi
+  local deadline=$((SECONDS+120)) domain _s _i _p pending
+  info "Pruefe Zertifikate lokal per SNI (bis zu 120s, DNS-01 kann dauern)..."
+  while :; do
+    pending=0
+    while IFS=$'\t' read -r domain _s _i _p; do
+      [[ -z "$domain" ]] && continue
+      cert_ready "$domain" || pending=$((pending+1))
+    done < "$SERVICES_FILE"
+    (( pending == 0 )) && break
+    (( SECONDS >= deadline )) && break
+    sleep 5
+  done
+  while IFS=$'\t' read -r domain _s _i _p; do
+    [[ -z "$domain" ]] && continue
+    if cert_ready "$domain"; then
+      ok "Zertifikat aktiv (SNI ok): ${domain}"
+    else
+      warn "Zertifikat noch ausstehend: ${domain} - bitte in 1-2 Minuten erneut testen (homeedge test-domain ${domain})"
+    fi
+  done < "$SERVICES_FILE"
+}
+
+reload_caddy() {
+  load_env
+  section "Caddy neu laden"
+  write_caddy_stack
+  mkdir -p "$CADDY_DIR"
+  local cf="${CADDY_DIR}/Caddyfile" tmp="${CADDY_DIR}/.Caddyfile.new" bak="${CADDY_DIR}/.Caddyfile.bak"
+
+  # Caddyfile IMMER komplett aus der Service-Liste neu erzeugen.
+  generate_caddyfile_to "$tmp"
+
+  # Sync-Check: jede Domain aus der Service-Liste muss enthalten sein.
+  local missing=0 d _s _i _p
+  if [[ -s "$SERVICES_FILE" ]]; then
+    while IFS=$'\t' read -r d _s _i _p; do
+      [[ -z "$d" ]] && continue
+      grep -q "^${d//./\\.} {" "$tmp" || { err "Domain fehlt im generierten Caddyfile: $d"; missing=1; }
+    done < "$SERVICES_FILE"
+  fi
+  if (( missing )); then rm -f "$tmp"; err "Abbruch: Caddyfile unvollstaendig, nichts geaendert."; return 1; fi
+
+  # atomar einsetzen (vorherige Version sichern)
+  [[ -f "$cf" ]] && cp -a "$cf" "$bak" 2>/dev/null || true
+  mv "$tmp" "$cf"
+  ok "Caddyfile generiert (alle Dienste enthalten)"
+
+  # validieren
+  if validate_caddyfile; then
+    ok "Config validiert"
+  else
+    err "Caddyfile ungueltig - vorherige Version wird wiederhergestellt."
+    [[ -f "$bak" ]] && mv "$bak" "$cf"
+    return 1
+  fi
+
+  # anwenden
+  cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || docker compose up -d >/dev/null 2>&1
+  else
+    docker compose build >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1
+  fi
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+    ok "Container laeuft"
+  else
+    err "Container laeuft nicht"
+    rm -f "$bak"
+    return 1
+  fi
+  rm -f "$bak"
+
+  wait_for_certs
+  echo
+  info "Test einer Domain: sudo homeedge test-domain DEINE.DOMAIN"
 }
 
 restart_caddy() { load_env; write_caddy_stack; generate_caddyfile; cd "$CADDY_DIR"; docker compose build; docker compose up -d; }
@@ -660,6 +769,7 @@ f2b_just_restart() {
 
 fail2ban_submenu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     menu_head "HomeEdge - Fail2ban verwalten"
     menu_item 1 "Status anzeigen"
@@ -744,6 +854,7 @@ add_service() {
   local domain scheme ip port
   domain="$(ask "Domain, z.B. jellyfin.example.de")"; scheme="$(ask "Backend Scheme http/https" "http")"; ip="$(ask "Backend IP im Heimnetz")"; port="$(ask "Backend Port")"
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
+  maybe_backup_before_change
   printf "%s\t%s\t%s\t%s\n" "$domain" "$scheme" "$ip" "$port" >> "$SERVICES_FILE"
   write_unifi_values; reload_caddy
   ok "Dienst hinzugefuegt."
@@ -758,6 +869,7 @@ edit_service() {
   local domain scheme ip port
   domain="$(ask "Domain" "$old_domain")"; scheme="$(ask "Backend Scheme http/https" "$old_scheme")"; ip="$(ask "Backend IP" "$old_ip")"; port="$(ask "Backend Port" "$old_port")"
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
+  maybe_backup_before_change
   lines[$idx]="${domain}"$'\t'"${scheme}"$'\t'"${ip}"$'\t'"${port}"; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
   write_unifi_values; reload_caddy; ok "Dienst aktualisiert."
 }
@@ -766,6 +878,7 @@ delete_service() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
   list_services; local num; num="$(ask "Nummer loeschen")"; mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
+  maybe_backup_before_change
   unset 'lines[$idx]'; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"; write_unifi_values; reload_caddy; ok "Dienst geloescht."
 }
 
@@ -782,7 +895,10 @@ edit_settings() {
   fi
   VPS_PUBLIC_HOST="$(ask "VPS Public Host/IP" "$VPS_PUBLIC_HOST")"; SSH_PORT="$(ask "SSH Port" "$SSH_PORT")"
   ACME_EMAIL="$(ask "ACME E-Mail" "$ACME_EMAIL")"
-  if yesno "Cloudflare Token aendern?" "n"; then CLOUDFLARE_API_TOKEN="$(ask_secret "Neuer Cloudflare Token")"; fi
+  if yesno "Cloudflare API Token aendern?" "n"; then
+    local _nt; _nt="$(sanitize_token "$(ask_secret "Neuer Cloudflare API Token")")"
+    if [[ -z "$_nt" ]]; then warn "Leer eingegeben - Token bleibt unveraendert."; else CLOUDFLARE_API_TOKEN="$_nt"; fi
+  fi
   if yesno "Caddy/Jellyfin Fail2ban aktivieren?" "$([[ "$CADDY_FAIL2BAN" == "1" ]] && echo y || echo n)"; then CADDY_FAIL2BAN="1"; else CADDY_FAIL2BAN="0"; fi
   save_env; write_unifi_values; reload_caddy; install_fail2ban
   ok "Globale Einstellungen gespeichert. WireGuard aenderst du jetzt separat im WireGuard-Menue."
@@ -800,11 +916,110 @@ test_backends() {
 status_all() {
   section "Status"
   show_values || true
+  domains_status || true
   section "WireGuard"; wg show 2>/dev/null || true
   section "Docker"; docker ps 2>/dev/null || true
-  section "Caddy Logs"; docker logs --tail 30 caddy-edge 2>/dev/null || true
+  section "Caddy Logs"; docker logs --tail 30 caddy-edge 2>/dev/null | mask_secrets || true
   section "Fail2ban"; fail2ban-client status 2>/dev/null || true; fail2ban-client status sshd 2>/dev/null || true; fail2ban-client status caddy-auth 2>/dev/null || true
   section "UFW"; ufw status verbose 2>/dev/null || true
+}
+
+# Zeigt pro Domain Backend, erwartete VPS-IP, aktuelle DNS-Records und Bewertung (Bug 7).
+domains_status() {
+  load_env
+  section "Domains / DNS-Status"
+  if [[ ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return 0; fi
+  local expect="${VPS_PUBLIC_HOST:-}"
+  echo "Erwartete VPS-IP/Host: ${expect:-unbekannt}"
+  local domain scheme ip port a aaaa
+  while IFS=$'\t' read -r domain scheme ip port; do
+    [[ -z "$domain" ]] && continue
+    a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
+    aaaa="$(dig +short AAAA "$domain" 2>/dev/null | tail -n1 || true)"
+    echo
+    printf '%bDomain:%b   %s\n' "$C_BOLD" "$C_RESET" "$domain"
+    printf '  Backend:  %s://%s:%s\n' "$scheme" "$ip" "$port"
+    printf '  Erwartet: %s\n' "${expect:-unbekannt}"
+    printf '  A:        %s\n' "${a:-(keiner)}"
+    printf '  AAAA:     %s\n' "${aaaa:-(keiner)}"
+    if _is_ip "$expect"; then
+      if [[ -z "$a" ]]; then
+        warn "kein A-Record gefunden"
+      elif [[ "$a" == "$expect" ]]; then
+        ok "zeigt auf diesen VPS"
+      else
+        warn "zeigt nicht auf diesen VPS (moeglicherweise bewusst noch nicht migriert)"
+      fi
+    else
+      info "VPS als DNS-Name konfiguriert - A-Record-Vergleich uebersprungen"
+    fi
+  done < "$SERVICES_FILE"
+}
+
+# Lokaler HTTPS-Test mit korrektem SNI via --resolve (Bug 5).
+test_domain() {
+  load_env
+  local domain="${1:-}"
+  [[ -z "$domain" ]] && domain="$(ask "Domain")"
+  [[ -z "$domain" ]] && { err "Keine Domain angegeben."; return 1; }
+  section "Domain-Test (lokal per SNI): ${domain}"
+  echo "Kommando: curl -vk --resolve ${domain}:443:127.0.0.1 https://${domain}/"
+  echo
+  if ! command -v curl >/dev/null 2>&1; then err "curl nicht installiert."; return 1; fi
+  curl -sS -k -I --connect-timeout 10 --max-time 20 --resolve "${domain}:443:127.0.0.1" "https://${domain}/" 2>&1 \
+    | sed -n '1,20p' | mask_secrets || true
+  echo
+  if cert_ready "$domain"; then ok "TLS/Zertifikat lokal erreichbar (SNI ok)."; else warn "Noch kein Zertifikat - evtl. wird es gerade angefordert (1-2 Minuten)."; fi
+}
+
+# Prueft einen Cloudflare-Token gegen die Verify-API. 0=ok, 1=ungueltig, 2=kein curl.
+verify_cloudflare_token() {
+  local tok="$1" out
+  command -v curl >/dev/null 2>&1 || return 2
+  out="$(curl -fsS --max-time 15 -H "Authorization: Bearer ${tok}" -H "Content-Type: application/json" \
+    "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null)" || return 1
+  grep -q '"success":true' <<<"$out" && return 0 || return 1
+}
+
+# Prueft, dass der Token in env- und Caddy-.env genau einzeilig und nicht leer ist (Bug 1).
+validate_token_files() {
+  local rc=0 f val cnt
+  for f in "$ENV_FILE" "${CADDY_DIR}/.env"; do
+    [[ -f "$f" ]] || continue
+    cnt="$(grep -c '^CLOUDFLARE_API_TOKEN=' "$f" 2>/dev/null || echo 0)"
+    val="$(grep -m1 '^CLOUDFLARE_API_TOKEN=' "$f" 2>/dev/null | cut -d= -f2- | tr -d "'\"")"
+    if [[ "$cnt" -ne 1 || -z "$val" ]]; then err "Token in $f fehlerhaft (Zeilen: $cnt)."; rc=1; fi
+  done
+  return $rc
+}
+
+# Sicherer, dedizierter Menuepunkt: Cloudflare API Token aendern (Bug 9).
+change_cloudflare_token() {
+  need_root; load_env
+  section "Cloudflare API Token aendern"
+  maybe_backup_before_change
+  local newtok
+  newtok="$(sanitize_token "$(ask_secret "Neuer Cloudflare API Token")")"
+  if [[ -z "$newtok" ]]; then err "Kein Token eingegeben. Abbruch, nichts geaendert."; return 1; fi
+  if yesno "Token online gegen Cloudflare pruefen?" "y"; then
+    if verify_cloudflare_token "$newtok"; then
+      ok "Token von Cloudflare bestaetigt."
+    else
+      warn "Token konnte nicht bestaetigt werden (Netzwerk/Rechte/Format?)."
+      if ! yesno "Trotzdem speichern?" "n"; then warn "Abgebrochen, nichts geaendert."; return 1; fi
+    fi
+  fi
+  CLOUDFLARE_API_TOKEN="$newtok"
+  save_env
+  write_caddy_stack
+  if validate_token_files; then
+    ok "Token gespeichert (einzeilig) in ${ENV_FILE} und ${CADDY_DIR}/.env"
+  else
+    err "Token-Dateien fehlerhaft - bitte pruefen."
+    return 1
+  fi
+  reload_caddy
+  ok "Cloudflare Token aktualisiert. (Anzeige maskiert: cfut_***)"
 }
 
 show_logs() {
@@ -1010,6 +1225,7 @@ backup_export_to_path() {
 
 backup_submenu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     menu_head "HomeEdge - Backup / Restore"
     menu_item 1 "Backup jetzt erstellen"
@@ -1130,6 +1346,7 @@ select_ext_interface() {
 
 network_submenu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     load_env
     menu_head "HomeEdge - Netzwerk / Interfaces"
@@ -1465,6 +1682,7 @@ security_wireguard() { load_env; wg_status; }
 
 security_submenu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     menu_head "HomeEdge - Sicherheitsmenue"
     menu_item 1 "Ampel-Check komplett"
@@ -1702,6 +1920,7 @@ maybe_backup_before_change() {
 
 updates_submenu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     menu_head "HomeEdge - Wartung / Updates"
     menu_item 1 "HomeEdge-Version anzeigen"
@@ -1734,6 +1953,7 @@ updates_submenu() {
 
 menu() {
   need_root
+  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
   while true; do
     load_env
     menu_head "HomeEdge - Secure VPS Gateway for Home Services"
@@ -1760,6 +1980,9 @@ menu() {
     menu_item 19 "Netzwerk / Interfaces"
     menu_item 20 "Backup / Restore"
     menu_item 21 "Wartung / Updates"
+    menu_item 22 "Domains / DNS-Status"
+    menu_item 23 "Domain testen (lokal per SNI)"
+    menu_item 24 "Cloudflare API Token aendern"
     menu_item 0 "Ende"
     line
     read -rp "Auswahl: " choice
@@ -1785,6 +2008,9 @@ menu() {
       19) network_submenu ;;
       20) backup_submenu ;;
       21) updates_submenu ;;
+      22) domains_status; pause ;;
+      23) test_domain; pause ;;
+      24) change_cloudflare_token; pause ;;
       0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -1817,6 +2043,9 @@ case "${1:-menu}" in
   security-check|minimal-check) security_minimal_check ;;
   ports) security_ports ;;
   certs|cert-check) check_certs ;;
+  test-domain) test_domain "${2:-}" ;;
+  domains|dns) domains_status ;;
+  set-token|cf-token) need_root; change_cloudflare_token ;;
   wg-menu) wg_submenu ;;
   wg-values) wg_values ;;
   wg-status) wg_status ;;
@@ -1832,5 +2061,5 @@ case "${1:-menu}" in
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac

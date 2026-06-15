@@ -148,6 +148,38 @@ Zertifikate. Bewertung als einfache Ampel (ASCII):
 [ROT  ] Problem
 ```
 
+## Diagnose & Tests
+
+```bash
+sudo homeedge domains            # pro Domain: Backend, erwartete VPS-IP, A/AAAA-Record, Bewertung
+sudo homeedge test-domain DOMAIN # lokaler HTTPS-Test mit korrektem SNI
+sudo homeedge reload             # Caddyfile neu erzeugen, validieren, reloaden, auf Zertifikat warten
+```
+
+Wichtig: Lokale HTTPS-Tests immer mit SNI per `--resolve` durchfuehren,
+sonst schlaegt der Test fehl (kein SNI):
+
+```bash
+curl -vk --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
+# NICHT: curl -vk https://127.0.0.1 -H "Host: DOMAIN"
+```
+
+`homeedge reload` erzeugt das Caddyfile immer komplett aus der Service-Liste,
+validiert es, ersetzt es atomar und wartet danach bis zu 120 s auf das
+Zertifikat (DNS-01 kann etwas dauern). Ist es noch nicht fertig, gibt es eine
+Warnung statt eines harten Fehlers.
+
+## Cloudflare API Token
+
+- Token aendern: `sudo homeedge set-token` (oder Menue -> Cloudflare API Token aendern).
+  Token wird verdeckt eingelesen, bereinigt, optional gegen die Cloudflare
+  Verify-API geprueft, in `/etc/homeedge/homeedge.env` und `/opt/caddy-edge/.env`
+  geschrieben (immer einzeilig) und Caddy neu geladen.
+- Neue Token im Format `cfut_...` werden unterstuetzt. Der `caddy-dns/cloudflare`
+  Build (xcaddy) zieht die jeweils neueste Version, die diese Token akzeptiert.
+  Falls noetig: Menue -> Wartung -> Caddy/Docker neu bauen (`docker compose build --pull`).
+- HomeEdge zeigt Token nie im Klartext; Ausgaben/Logs werden maskiert.
+
 ## Wichtige Dateien auf dem VPS
 
 ```text
