@@ -73,9 +73,13 @@ select_local_interface() {
   default_src="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
 
   mapfile -t ifs < <(ls /sys/class/net | sort)
-  echo
-  echo "Gefundene Netzwerkadapter auf diesem VPS:"
-  echo
+  # Wichtig: Diese Funktion wird via $(...) aufgerufen. Alle Anzeige-Ausgaben
+  # muessen nach stderr (>&2), damit nur der gewaehlte Interface-Name auf
+  # stdout zurueckkommt. Sonst landet die Liste in der Variable und der
+  # Nutzer sieht nichts.
+  echo >&2
+  echo "Gefundene Netzwerkadapter:" >&2
+  echo >&2
   local default_idx=""
   for i in "${!ifs[@]}"; do
     local n="${ifs[$i]}"
@@ -94,17 +98,17 @@ select_local_interface() {
     if [[ "$n" == "$default_if" && "$default_if" != "$default_name" ]]; then
       hint="$hint <= Config-Vorschlag"
     fi
-    printf "%2d) %-14s Status: %-8s IPv4: %-24s IPv6: %s%s\n" "$num" "$n" "$state" "$ipv4" "$ipv6" "$hint"
+    printf "%2d) %-14s Status: %-8s IPv4: %-24s IPv6: %s%s\n" "$num" "$n" "$state" "$ipv4" "$ipv6" "$hint" >&2
   done
-  echo
+  echo >&2
   if [[ -n "$default_name" ]]; then
-    echo "Empfehlung: $default_name"
-    [[ -n "$default_src" ]] && echo "Source-IP Richtung Internet: $default_src"
+    echo "Empfehlung: $default_name" >&2
+    [[ -n "$default_src" ]] && echo "Source-IP Richtung Internet: $default_src" >&2
   fi
-  echo
+  echo >&2
   local def_answer="${default_idx:-1}"
   local choice
-  choice="$(ask "Netzwerkadapter waehlen: Nummer oder Interface-Name" "$def_answer")"
+  choice="$(ask "Netzwerkadapter auswaehlen (Nummer oder Interface-Name)" "$def_answer")"
   if [[ "$choice" =~ ^[0-9]+$ ]]; then
     local idx=$((choice-1))
     if (( idx >= 0 && idx < ${#ifs[@]} )); then
@@ -163,13 +167,16 @@ EOF
 
 if [[ -f "$CONFIG_PATH" ]]; then
   echo
-  echo "Vorhandene Config gefunden: $CONFIG_PATH"
+  echo "Vorhandene HomeEdge-Konfiguration gefunden:"
+  echo "  $CONFIG_PATH"
+  echo
   if yesno "Diese Werte als Vorschlag verwenden?" "y"; then
     # shellcheck disable=SC1090
     source "$CONFIG_PATH"
     if [[ -n "${ServicesTsvB64:-}" ]]; then
       ServicesTsv="$(printf '%s' "$ServicesTsvB64" | base64 -d)"
     fi
+    echo "Werte geladen. Alle Eingaben sind als Default vorausgefuellt und koennen ueberschrieben werden."
   fi
 fi
 
@@ -203,8 +210,12 @@ fi
 UsePsk="$(cfg_get UsePsk 1)"
 if yesno "WireGuard PresharedKey verwenden?" "$([[ "$UsePsk" == "1" ]] && echo y || echo n)"; then UsePsk="1"; else UsePsk="0"; fi
 
-EnableCaddyFail2ban="$(cfg_get EnableCaddyFail2ban 0)"
-if yesno "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" "$([[ "$EnableCaddyFail2ban" == "1" ]] && echo y || echo n)"; then EnableCaddyFail2ban="1"; else EnableCaddyFail2ban="0"; fi
+echo
+echo "Empfohlen: Ja."
+echo "Schuetzt gegen viele fehlerhafte Login-/Auth-Versuche (401/403)."
+echo "Gebannte IPs koennen spaeter im HomeEdge-Menue wieder entbannt werden."
+EnableCaddyFail2ban="$(cfg_get EnableCaddyFail2ban 1)"
+if yesno "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" "$([[ "$EnableCaddyFail2ban" == "0" ]] && echo n || echo y)"; then EnableCaddyFail2ban="1"; else EnableCaddyFail2ban="0"; fi
 
 ClientPublicKey="$(ask "UniFi/Client WireGuard PublicKey optional" "$(cfg_get ClientPublicKey '')")"
 SwapMb="$(ask "Swap Groesse in MB" "$(cfg_get SwapMb 2048)")"
@@ -215,6 +226,7 @@ else
   echo
   echo "Externe Dienste erfassen. Beispiel: jellyfin.domain.de | http | 192.168.10.99 | 8096"
   ServiceCount="$(ask "Anzahl externe Dienste" "1")"
+  [[ "$ServiceCount" =~ ^[0-9]+$ ]] || { echo "Ungueltige Anzahl, nutze 1."; ServiceCount=1; }
   ServicesTsv=""
   for ((i=1; i<=ServiceCount; i++)); do
     echo
@@ -245,25 +257,59 @@ if yesno "Eingaben fuer naechstes Mal speichern?" "y"; then
   save_config "$SaveToken"
 fi
 
+SvcPretty="$(printf '%s' "$ServicesTsv" | awk -F'\t' 'NF>=4{printf "  %d) %-22s -> %s://%s:%s\n", ++n, $1, $2, $3, $4}')"
+[[ -z "$SvcPretty" ]] && SvcPretty="  (keine Dienste erfasst)"
+F2bCaddyState="$([[ "$EnableCaddyFail2ban" == "1" ]] && echo aktiv || echo inaktiv)"
+TokenState="$([[ -n "${CfToken:-}" ]] && echo gesetzt || echo "nicht gesetzt")"
+HardeningState="$([[ "$CreateAdmin" == "1" ]] && echo "ja (neuer User: ${AdminUser})" || echo nein)"
+
 cat <<EOF
 
 ============================================================
-Zusammenfassung
+HomeEdge Installationszusammenfassung
 ============================================================
-VPS Host/IP:          $VpsPublicHost
-Interface:            $ExtIf
-SSH Port:             $SshPortFinal
-WireGuard:            $WgIf / UDP $WgPort
-VPS WG Adresse:       $VpsWgAddr
-Client WG Adresse:    $ClientWgAddr
-Backend-Netze:        $HomeSubnet
+
+VPS:
+  Host/IP:        $VpsPublicHost
+  Interface:      $ExtIf
+  SSH-Port:       $SshPortFinal
+
+WireGuard:
+  Interface:      $WgIf
+  UDP-Port:       $WgPort
+  VPS WG-IP:      $VpsWgAddr
+  Client WG-IP:   $ClientWgAddr
+  Backend-Netze:  $HomeSubnet
+
 Dienste:
-$(printf '%s' "$ServicesTsv" | sed $'s/\t/ | /g')
+$SvcPretty
+
+Security:
+  UFW:              wird aktiviert
+  Fail2ban SSH:     wird aktiviert
+  Fail2ban Caddy:   $F2bCaddyState
+  Cloudflare Token: $TokenState
+  SSH Hardening:    $HardeningState
 ============================================================
+
+Achtung:
+Ab jetzt werden Pakete installiert und folgende Komponenten konfiguriert:
+- Docker / Caddy
+- WireGuard
+- UFW Firewall
+- Fail2ban
+- automatische Updates
+- Swap
+- HomeEdge Menue
+
+Bitte pruefe die Zusammenfassung oben genau.
 EOF
 
-if ! yesno "Installation jetzt direkt auf diesem VPS starten?" "n"; then
-  echo "Abgebrochen."
+if ! yesno "Konfiguration uebernehmen und Installation jetzt starten?" "n"; then
+  save_config "${SaveToken:-0}"
+  echo
+  echo "Installation abgebrochen."
+  echo "Die eingegebene Konfiguration wurde gespeichert und kann beim naechsten Start wiederverwendet werden."
   exit 0
 fi
 

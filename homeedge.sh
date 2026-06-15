@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.2-homeedge"
+APP_VERSION="0.9.3-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -645,10 +645,16 @@ f2b_test_filter() {
   esac
 }
 
-f2b_restart() {
-  section "Fail2ban neu konfigurieren / neustarten"
+f2b_reconfigure() {
+  section "Fail2ban neu konfigurieren"
   install_fail2ban
   ok "Fail2ban wurde neu konfiguriert und neu gestartet."
+  fail2ban-client status || true
+}
+
+f2b_just_restart() {
+  section "Fail2ban neu starten"
+  systemctl restart fail2ban && ok "Fail2ban neu gestartet." || err "Neustart fehlgeschlagen."
   fail2ban-client status || true
 }
 
@@ -656,13 +662,14 @@ fail2ban_submenu() {
   need_root
   while true; do
     menu_head "HomeEdge - Fail2ban verwalten"
-    menu_item 1 "Status / Jails anzeigen"
+    menu_item 1 "Status anzeigen"
     menu_item 2 "Gebannte IPs anzeigen"
     menu_item 3 "IP aus Liste auswaehlen und entbannen"
     menu_item 4 "IP manuell entbannen"
-    menu_item 5 "Fail2ban Log anzeigen"
+    menu_item 5 "Fail2ban-Logs anzeigen"
     menu_item 6 "Filter testen"
-    menu_item 7 "Fail2ban neu konfigurieren / neustarten"
+    menu_item 7 "Fail2ban neu konfigurieren"
+    menu_item 8 "Fail2ban neu starten"
     menu_item 0 "Zurueck"
     line
     read -rp "Auswahl: " choice
@@ -673,7 +680,8 @@ fail2ban_submenu() {
       4) f2b_unban_manual; pause ;;
       5) f2b_show_log ;;
       6) f2b_test_filter; pause ;;
-      7) f2b_restart; pause ;;
+      7) f2b_reconfigure; pause ;;
+      8) f2b_just_restart; pause ;;
       0) return ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -690,6 +698,7 @@ apply_firewall() {
   fi
   warn "Achtung: falscher SSH-Port kann dich aussperren."
   read -rp "Firewall anwenden? [n]: " a; [[ "$a" =~ ^([YyJj]|yes|ja)$ ]] || return
+  maybe_backup_before_change
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
   ufw allow "${SSH_PORT}/tcp"; ufw allow "443/tcp"; ufw allow "${WG_PORT}/udp"
   [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]] && ufw allow "${cur_ssh_port}/tcp"
@@ -763,6 +772,7 @@ delete_service() {
 edit_settings() {
   load_env
   section "Globale Einstellungen aendern"
+  maybe_backup_before_change
   show_network_interfaces
   if yesno "Externes Interface aus Liste auswaehlen?" "y"; then
     select_ext_interface
@@ -1451,34 +1461,34 @@ security_jellyfin_checklist() {
 EOF
 }
 
+security_wireguard() { load_env; wg_status; }
+
 security_submenu() {
   need_root
   while true; do
     menu_head "HomeEdge - Sicherheitsmenue"
-    menu_item 1 "Minimal-Sicherheitscheck"
-    menu_item 2 "Offene Ports anzeigen/bewerten"
-    menu_item 3 "Firewall/UFW anzeigen"
-    menu_item 4 "SSH-Hardening Status anzeigen"
-    menu_item 5 "Fail2ban verwalten"
-    menu_item 6 "HTTP/3 UDP 443 an/aus"
-    menu_item 7 "Jellyfin/UniFi Sicherheits-Checkliste"
-    menu_item 8 "Zertifikate pruefen"
-    menu_item 9 "Ampel-Check komplett"
-    menu_item 10 "Backup / Restore"
+    menu_item 1 "Ampel-Check komplett"
+    menu_item 2 "Offene Ports anzeigen und bewerten"
+    menu_item 3 "UFW Status anzeigen"
+    menu_item 4 "SSH-Hardening pruefen"
+    menu_item 5 "Fail2ban pruefen"
+    menu_item 6 "Caddy / Zertifikate pruefen"
+    menu_item 7 "WireGuard pruefen"
+    menu_item 8 "HTTP/3 UDP 443 aktivieren/deaktivieren"
+    menu_item 9 "Jellyfin/UniFi Sicherheitscheckliste"
     menu_item 0 "Zurueck"
     line
     read -rp "Auswahl: " choice
     case "$choice" in
-      1) security_minimal_check; pause ;;
+      1) health_check; pause ;;
       2) security_ports; pause ;;
       3) security_firewall; pause ;;
       4) security_ssh_status; pause ;;
-      5) fail2ban_submenu ;;
-      6) security_http3_toggle; pause ;;
-      7) security_jellyfin_checklist; pause ;;
-      8) check_certs; pause ;;
-      9) health_check; pause ;;
-      10) backup_submenu ;;
+      5) security_fail2ban; pause ;;
+      6) check_certs; pause ;;
+      7) security_wireguard; pause ;;
+      8) security_http3_toggle; pause ;;
+      9) security_jellyfin_checklist; pause ;;
       0) return ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -1588,6 +1598,20 @@ homeedge_repo_update() {
     err "Versuchte URL: ${url}"
     return 1
   fi
+  # Optionale Checksumme: falls <url>.sha256 existiert, wird sie geprueft.
+  local sum_remote sum_local
+  if sum_remote="$(curl -fsSL "${url}.sha256" 2>/dev/null)" && [[ -n "$sum_remote" ]] && command -v sha256sum >/dev/null 2>&1; then
+    sum_remote="$(awk '{print $1}' <<< "$sum_remote")"
+    sum_local="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [[ "$sum_remote" != "$sum_local" ]]; then
+      err "Checksumme stimmt nicht ueberein. Abbruch, nichts geaendert."
+      err "erwartet: ${sum_remote}"; err "erhalten: ${sum_local}"
+      return 1
+    fi
+    ok "Checksumme verifiziert (sha256)."
+  else
+    info "Keine Checksumme gefunden (optional). Pruefung erfolgt ueber Marker + bash -n."
+  fi
   _install_homeedge_from_file "$tmp" || return 1
 }
 
@@ -1612,30 +1636,96 @@ homeedge_self_update() {
   _install_homeedge_from_file "$tmp" || return 1
 }
 
+# Prueft, ob im Repo eine neuere Version liegt - ohne zu installieren.
+check_for_update() {
+  load_env
+  section "Nach Update suchen"
+  if ! command -v curl >/dev/null 2>&1; then err "curl ist nicht installiert."; return 1; fi
+  local url remote_ver
+  url="$(_repo_raw_url)"
+  echo "Quelle:      ${url}"
+  echo "Installiert: ${APP_VERSION}"
+  remote_ver="$(curl -fsSL "$url" 2>/dev/null | grep -m1 '^APP_VERSION=' | cut -d'"' -f2 || true)"
+  if [[ -z "$remote_ver" ]]; then
+    warn "Konnte Remote-Version nicht ermitteln. Netzwerk, Repo oder Branch pruefen."
+    return 1
+  fi
+  echo "Verfuegbar:  ${remote_ver}"
+  echo
+  local newest
+  newest="$(printf '%s\n%s\n' "$APP_VERSION" "$remote_ver" | sort -V | tail -n1)"
+  if [[ "$remote_ver" == "$APP_VERSION" ]]; then
+    ok "HomeEdge ist aktuell."
+  elif [[ "$newest" == "$remote_ver" ]]; then
+    warn "Neue Version verfuegbar: ${remote_ver}"
+    info "Aktualisieren: sudo homeedge self-update  (oder Menue -> aus GitHub aktualisieren)"
+  else
+    info "Installierte Version (${APP_VERSION}) ist neuer als die im Repo (${remote_ver})."
+  fi
+}
+
+# Rollback auf eine zuvor gesicherte HomeEdge-Version.
+homeedge_rollback() {
+  need_root
+  section "Rollback auf vorherige HomeEdge-Version"
+  local backups=()
+  mapfile -t backups < <(ls -1t /usr/local/bin/homeedge.backup.* 2>/dev/null || true)
+  if (( ${#backups[@]} == 0 )); then
+    err "Keine vorherige Version gefunden (/usr/local/bin/homeedge.backup.*)."
+    return 1
+  fi
+  local i
+  for i in "${!backups[@]}"; do
+    printf '  %b%2d%b) %s\n' "$C_GREEN" "$((i+1))" "$C_RESET" "${backups[$i]}"
+  done
+  echo
+  local choice; choice="$(ask "Version waehlen (0 = Abbruch)" "1")"
+  [[ "$choice" =~ ^[0-9]+$ ]] || { err "Ungueltige Eingabe."; return 1; }
+  (( choice == 0 )) && return 0
+  if (( choice < 1 || choice > ${#backups[@]} )); then err "Ungueltige Nummer."; return 1; fi
+  local target="${backups[$((choice-1))]}"
+  if ! bash -n "$target"; then err "Backup-Datei ist syntaktisch fehlerhaft. Abbruch."; return 1; fi
+  if ! yesno "Auf ${target} zuruecksetzen?" "n"; then warn "Abgebrochen."; return 0; fi
+  cp -a /usr/local/bin/homeedge "/usr/local/bin/homeedge.backup.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  install -m 0755 "$target" /usr/local/bin/homeedge
+  ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl
+  ok "Rollback abgeschlossen."
+  /usr/local/bin/homeedge --version || true
+}
+
+# Bietet vor kritischen Aenderungen ein Backup an (Default Ja).
+maybe_backup_before_change() {
+  if yesno "Vor dieser Aenderung Backup erstellen?" "y"; then
+    backup_create || warn "Backup fehlgeschlagen - fahre fort."
+  fi
+}
+
 updates_submenu() {
   need_root
   while true; do
     menu_head "HomeEdge - Wartung / Updates"
-    menu_item 1 "Version anzeigen"
-    menu_item 2 "HomeEdge aus GitHub-Repo aktualisieren (empfohlen)"
-    menu_item 3 "GitHub-Repo/Branch konfigurieren"
-    menu_item 4 "HomeEdge aus Update-URL aktualisieren"
-    menu_item 5 "Update-URL anzeigen/aendern"
-    menu_item 6 "Caddy/Docker neu bauen/aktualisieren"
-    menu_item 7 "Systemupdates ausfuehren"
-    menu_item 8 "Backup vor Update erstellen"
+    menu_item 1 "HomeEdge-Version anzeigen"
+    menu_item 2 "Nach Update suchen"
+    menu_item 3 "HomeEdge aus GitHub aktualisieren (empfohlen)"
+    menu_item 4 "Caddy/Docker neu bauen und aktualisieren"
+    menu_item 5 "Systemupdates installieren"
+    menu_item 6 "Backup vor Update erstellen"
+    menu_item 7 "Rollback auf letztes Backup"
+    menu_item 8 "Update-Quelle (Repo/Branch) konfigurieren"
+    menu_item 9 "Update von fester URL (Release-Asset)"
     menu_item 0 "Zurueck"
     line
     read -rp "Auswahl: " choice
     case "$choice" in
       1) show_version; pause ;;
-      2) homeedge_repo_update; pause ;;
-      3) configure_repo_source; pause ;;
-      4) homeedge_self_update; pause ;;
-      5) configure_update_source; pause ;;
-      6) caddy_update; pause ;;
-      7) system_update; pause ;;
-      8) backup_create; pause ;;
+      2) check_for_update; pause ;;
+      3) homeedge_repo_update; pause ;;
+      4) caddy_update; pause ;;
+      5) system_update; pause ;;
+      6) backup_create; pause ;;
+      7) homeedge_rollback; pause ;;
+      8) configure_repo_source; pause ;;
+      9) homeedge_self_update; pause ;;
       0) return ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -1646,7 +1736,7 @@ menu() {
   need_root
   while true; do
     load_env
-    menu_head "HomeEdge - Verwaltung"
+    menu_head "HomeEdge - Secure VPS Gateway for Home Services"
     printf '  %bVPS%b %s  %bWG%b %s:%s  %bCaddy%b %s\n' "$C_CYAN" "$C_RESET" "${VPS_PUBLIC_HOST:-?}" "$C_CYAN" "$C_RESET" "$WG_IF" "$WG_PORT" "$C_CYAN" "$C_RESET" "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$' && echo laeuft || echo unbekannt)"
     line
     menu_item 1 "Uebersicht / aktuelle Werte"
@@ -1713,6 +1803,8 @@ case "${1:-menu}" in
   backup|restore|backup-menu) backup_submenu ;;
   update|updates|wartung) updates_submenu ;;
   self-update|update-repo|repo-update) need_root; homeedge_repo_update ;;
+  check-update|check-updates) check_for_update ;;
+  rollback) need_root; homeedge_rollback ;;
   update-url) need_root; homeedge_self_update ;;
   set-repo) need_root; configure_repo_source ;;
   backup-create) backup_create ;;
@@ -1740,5 +1832,5 @@ case "${1:-menu}" in
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload|self-update|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac

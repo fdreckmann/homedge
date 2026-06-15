@@ -273,7 +273,11 @@ if (-not [string]::IsNullOrWhiteSpace($SavedCfToken)) {
 $DefaultUsePsk = if (Get-CfgBool $LoadedConfig "UsePsk" $true) { "y" } else { "n" }
 $UsePsk = if (Ask-YesNo "WireGuard PresharedKey verwenden?" $DefaultUsePsk) { "1" } else { "0" }
 
-$DefaultCaddyF2b = if (Get-CfgBool $LoadedConfig "EnableCaddyFail2ban" $false) { "y" } else { "n" }
+Write-Host ""
+Write-Host "Empfohlen: Ja."
+Write-Host "Schuetzt gegen viele fehlerhafte Login-/Auth-Versuche (401/403)."
+Write-Host "Gebannte IPs koennen spaeter im HomeEdge-Menue wieder entbannt werden."
+$DefaultCaddyF2b = if (Get-CfgBool $LoadedConfig "EnableCaddyFail2ban" $true) { "y" } else { "n" }
 $EnableCaddyFail2ban = if (Ask-YesNo "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" $DefaultCaddyF2b) { "1" } else { "0" }
 
 $ClientPublicKey = Ask "UniFi/Client WireGuard PublicKey optional, leer lassen falls noch nicht vorhanden" (Get-CfgValue $LoadedConfig "ClientPublicKey" "")
@@ -335,19 +339,50 @@ if ($CreateAdmin) {
     $AdminPubKeyPath = $PubKeyPath
 }
 
+$F2bCaddyState = if ($EnableCaddyFail2ban -eq "1") { "aktiv" } else { "inaktiv" }
+$TokenState = if (-not [string]::IsNullOrWhiteSpace($CfToken)) { "gesetzt" } else { "nicht gesetzt" }
+$HardeningState = if ($CreateAdmin) { "ja (neuer User: $AdminUser)" } else { "nein" }
+
 Write-Host ""
 Write-Host "============================================================"
-Write-Host " Zusammenfassung"
+Write-Host "HomeEdge Installationszusammenfassung"
 Write-Host "============================================================"
-Write-Host "SSH Ziel:               $SshUser@${SshHost}:$SshPortConnect"
-Write-Host "VPS Public Host:        $VpsPublicHost"
-Write-Host "WireGuard:              $WgIf / UDP $WgPort"
-Write-Host "VPS WG Adresse:         $VpsWgAddr"
-Write-Host "Client WG Adresse:      $ClientWgAddr"
-Write-Host "Home Subnet:            $HomeSubnet"
-Write-Host "Dienste:                $ServiceCount"
-Write-Host "SSH Hardening:          $CreateAdmin"
-Write-Host "Config-Datei:           $ConfigPath"
+Write-Host ""
+Write-Host "SSH-Ziel:         $SshUser@${SshHost}:$SshPortConnect"
+Write-Host ""
+Write-Host "VPS:"
+Write-Host "  Host/IP:        $VpsPublicHost"
+Write-Host "  Interface:      $ExtIf"
+Write-Host "  SSH-Port:       $SshPortFinal"
+Write-Host ""
+Write-Host "WireGuard:"
+Write-Host "  Interface:      $WgIf"
+Write-Host "  UDP-Port:       $WgPort"
+Write-Host "  VPS WG-IP:      $VpsWgAddr"
+Write-Host "  Client WG-IP:   $ClientWgAddr"
+Write-Host "  Backend-Netze:  $HomeSubnet"
+Write-Host ""
+Write-Host "Dienste:"
+if ($ServiceLines.Count -eq 0) {
+    Write-Host "  (keine Dienste erfasst)"
+} else {
+    $n = 1
+    foreach ($line in $ServiceLines) {
+        $p = $line -split "`t"
+        if ($p.Count -ge 4) {
+            Write-Host ("  {0}) {1,-22} -> {2}://{3}:{4}" -f $n, $p[0], $p[1], $p[2], $p[3])
+            $n++
+        }
+    }
+}
+Write-Host ""
+Write-Host "Security:"
+Write-Host "  UFW:              wird aktiviert"
+Write-Host "  Fail2ban SSH:     wird aktiviert"
+Write-Host "  Fail2ban Caddy:   $F2bCaddyState"
+Write-Host "  Cloudflare Token: $TokenState"
+Write-Host "  SSH Hardening:    $HardeningState"
+Write-Host "  Config-Datei:     $ConfigPath"
 Write-Host "============================================================"
 Write-Host ""
 
@@ -399,8 +434,13 @@ if (Ask-YesNo "Eingaben lokal als Config fuer naechstes Mal speichern/aktualisie
     Write-Host ""
 }
 
-if (!(Ask-YesNo "Jetzt installieren?" "n")) {
-    Write-Host "Abgebrochen."
+Write-Host ""
+Write-Host "Achtung:"
+Write-Host "Auf dem VPS werden jetzt Pakete installiert und konfiguriert:"
+Write-Host "Docker/Caddy, WireGuard, UFW, Fail2ban, automatische Updates, Swap, HomeEdge-Menue."
+Write-Host ""
+if (!(Ask-YesNo "Konfiguration uebernehmen und Installation jetzt starten?" "n")) {
+    Write-Host "Installation abgebrochen. Die Konfiguration kann beim naechsten Start wiederverwendet werden."
     exit 0
 }
 
