@@ -21,6 +21,7 @@ ACME_EMAIL="$(b64d "__ACME_EMAIL_B64__")"
 CLOUDFLARE_API_TOKEN="$(b64d "__CF_TOKEN_B64__" | tr -d '\r\n[:space:]')"
 USE_PSK="$(b64d "__USE_PSK_B64__")"
 CADDY_FAIL2BAN="$(b64d "__CADDY_FAIL2BAN_B64__")"
+ENABLE_HTTP3="$(b64d "__ENABLE_HTTP3_B64__")"; ENABLE_HTTP3="${ENABLE_HTTP3:-0}"
 CLIENT_PUBLIC_KEY="$(b64d "__CLIENT_PUBLIC_KEY_B64__")"
 SERVICES_TSV="$(b64d "__SERVICES_TSV_B64__")"
 SWAP_MB="$(b64d "__SWAP_MB_B64__")"
@@ -157,6 +158,12 @@ ufw default allow outgoing
 ufw allow "${SSH_PORT}/tcp"
 ufw allow "443/tcp"
 ufw allow "${WG_PORT}/udp"
+if [[ "${ENABLE_HTTP3}" == "1" ]]; then
+  ufw allow "443/udp"
+  echo "HTTP/3 aktiv: 443/udp freigegeben."
+else
+  echo "HTTP/3 aus: 443/udp bleibt geschlossen."
+fi
 if [[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT}" ]]; then
   ufw allow "${CUR_SSH_PORT}/tcp"
   echo "Hinweis: Aktiver SSH-Port ${CUR_SSH_PORT}/tcp wurde zusaetzlich freigegeben (Schutz vor Aussperren)."
