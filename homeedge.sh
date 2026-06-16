@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.9-homeedge"
+APP_VERSION="0.9.10-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -101,7 +101,7 @@ load_env() {
   ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
   HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
-  WG_MTU="${WG_MTU:-1280}"
+  WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
     # Beschaedigten/mehrzeiligen Token VOR dem Sourcen reparieren.
@@ -116,7 +116,7 @@ load_env() {
     ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
     EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
-    WG_MTU="${WG_MTU:-1280}"
+    WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
     F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   fi
 }
@@ -148,6 +148,7 @@ HOMEEDGE_BRANCH=$(q "${HOMEEDGE_BRANCH:-main}")
 EXPERT_MODE=$(q "${EXPERT_MODE:-0}")
 BACKUP_BEHAVIOR=$(q "${BACKUP_BEHAVIOR:-ask}")
 WG_MTU=$(q "${WG_MTU:-1280}")
+ENABLE_IPV6=$(q "${ENABLE_IPV6:-0}")
 F2B_CADDY_MAXRETRY=$(q "${F2B_CADDY_MAXRETRY:-20}")
 F2B_CADDY_FINDTIME=$(q "${F2B_CADDY_FINDTIME:-10m}")
 F2B_CADDY_BANTIME=$(q "${F2B_CADDY_BANTIME:-15m}")
@@ -845,51 +846,91 @@ f2b_just_restart() {
 }
 
 
+# ------------------------------------------------------------
+# IPv6-Helfer (nur externer Zugriff Client -> VPS/Caddy)
+# ------------------------------------------------------------
+# Erste globale IPv6-Adresse des VPS (leer wenn keine). errexit-sicher.
+vps_ipv6() {
+  command -v ip >/dev/null 2>&1 || return 0
+  ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2; exit}' | cut -d/ -f1 2>/dev/null || true
+}
+vps_has_global_ipv6() { [[ -n "$(vps_ipv6)" ]]; }
+ufw_ipv6_enabled() { [[ -f /etc/default/ufw ]] && grep -qiE '^IPV6=yes' /etc/default/ufw; }
+# Lauscht Caddy lokal auf IPv6 :443?
+caddy_listens_ipv6_443() { command -v ss >/dev/null 2>&1 || return 1; ss -H -ltn 'sport = :443' 2>/dev/null | grep -qE '\[?::'; }
+# Stellt sicher, dass UFW IPv6 verwaltet (IPV6=yes), damit v6 kontrolliert (default deny) ist.
+ensure_ufw_ipv6_yes() {
+  [[ -f /etc/default/ufw ]] || return 0
+  if grep -qE '^IPV6=' /etc/default/ufw; then
+    grep -qiE '^IPV6=yes' /etc/default/ufw || sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+  else
+    echo 'IPV6=yes' >> /etc/default/ufw
+  fi
+}
+
+# Setzt die Service-Regeln (kein reset). SSH/WG dual-stack (Lockout-Schutz),
+# 443 familienspezifisch: v4 immer, v6 nur bei ENABLE_IPV6=1; 443/udp nur bei HTTP/3.
+_ufw_rules_apply() {
+  local cur; cur="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
+  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+  [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]] && ufw allow "${cur}/tcp" >/dev/null 2>&1 || true
+  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
+  # alte dual-stack 443-Regeln entfernen, dann familienspezifisch setzen
+  ufw delete allow "443/tcp" >/dev/null 2>&1 || true
+  ufw delete allow "443/udp" >/dev/null 2>&1 || true
+  ufw allow proto tcp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto tcp to ::/0 port 443 >/dev/null 2>&1 || true
+  else ufw delete allow proto tcp to ::/0 port 443 >/dev/null 2>&1 || true; fi
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
+    ufw allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+    if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true
+    else ufw delete allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true; fi
+  else
+    ufw delete allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+    ufw delete allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true
+  fi
+}
+
+# Statusausgabe der UFW-Service-Lage.
+_ufw_status_report() {
+  ok "443/tcp erlaubt (IPv4)"
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "443/tcp (v6) erlaubt"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+  ok "WireGuard ${WG_PORT}/udp erlaubt"
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
+    if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "HTTP/3 aktiv, 443/udp und 443/udp (v6) erlaubt"; else ok "HTTP/3 aktiv, 443/udp erlaubt"; fi
+  else
+    ok "HTTP/3 aus, 443/udp geschlossen"
+  fi
+}
+
 apply_firewall() {
   load_env
   section "Firewall neu anwenden"
   local cur_ssh_port; cur_ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
   echo "UFW wird gesetzt: SSH ${SSH_PORT}/tcp, HTTPS 443/tcp, WireGuard ${WG_PORT}/udp"
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then echo "HTTP/3 aktiv -> zusaetzlich 443/udp"; else echo "HTTP/3 aus -> 443/udp bleibt geschlossen"; fi
+  echo "IPv6 extern: $([[ "${ENABLE_IPV6:-0}" == "1" ]] && echo "an (443/tcp v6)" || echo "aus")  HTTP/3: $([[ "${ENABLE_HTTP3:-0}" == "1" ]] && echo an || echo aus)"
   if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]]; then
     info "Aktive SSH-Sitzung laeuft auf Port ${cur_ssh_port}/tcp - dieser bleibt zusaetzlich offen (Schutz vor Aussperren)."
   fi
   warn "Achtung: falscher SSH-Port kann dich aussperren."
   read -rp "Firewall anwenden? [n]: " a; [[ "$a" =~ ^([YyJj]|yes|ja)$ ]] || return
   maybe_backup_before_change
+  ensure_ufw_ipv6_yes
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
-  ufw allow "${SSH_PORT}/tcp"; ufw allow "443/tcp"; ufw allow "${WG_PORT}/udp"
-  [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]] && ufw allow "${cur_ssh_port}/tcp"
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow "443/udp"; else ufw delete allow "443/udp" 2>/dev/null || true; fi
+  _ufw_rules_apply
   ufw --force enable
   echo
-  ok "443/tcp erlaubt"
-  ok "WireGuard ${WG_PORT}/udp erlaubt"
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ok "HTTP/3 aktiviert, 443/udp erlaubt"; else ok "HTTP/3 deaktiviert, 443/udp geschlossen"; fi
-}
-
-# Nicht-interaktive UFW-Synchronisierung passend zur Konfig (fuer Toggle/Migration).
-ufw_sync() {
-  load_env
-  command -v ufw >/dev/null 2>&1 || { warn "ufw nicht installiert."; return 0; }
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
-    ufw allow "443/udp" >/dev/null 2>&1 && ok "443/udp erlaubt (HTTP/3 aktiv)"
-  else
-    ufw delete allow "443/udp" >/dev/null 2>&1 && ok "443/udp entfernt (HTTP/3 aus)" || ok "443/udp war nicht offen"
-  fi
+  _ufw_status_report
 }
 
 # Nicht-interaktive, additive UFW-Angleichung an die Konfig (kein reset -> kein Lockout).
 ufw_apply_auto() {
   load_env
   command -v ufw >/dev/null 2>&1 || return 0
-  local cur; cur="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
-  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
-  [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]] && ufw allow "${cur}/tcp" >/dev/null 2>&1 || true
-  ufw allow "443/tcp" >/dev/null 2>&1 || true
-  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow "443/udp" >/dev/null 2>&1 || true; else ufw delete allow "443/udp" >/dev/null 2>&1 || true; fi
-  ok "UFW an Konfiguration angeglichen (HTTP/3=${ENABLE_HTTP3})."
+  ensure_ufw_ipv6_yes
+  _ufw_rules_apply
+  ufw reload >/dev/null 2>&1 || true
+  ok "UFW angeglichen (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
 }
 
 show_values() {
@@ -1129,6 +1170,7 @@ status_all() {
   show_values || true
   domains_status || true
   section "WireGuard"; wg show 2>/dev/null || true
+  ipv6_status || true
   section "Docker"; docker ps 2>/dev/null || true
   section "Caddy Logs"; docker logs --tail 30 caddy-edge 2>/dev/null | mask_secrets || true
   section "Fail2ban"; fail2ban-client status 2>/dev/null || true; fail2ban-client status sshd 2>/dev/null || true; fail2ban-client status caddy-auth 2>/dev/null || true
@@ -1140,9 +1182,10 @@ domains_status() {
   load_env
   section "Domains / DNS-Status"
   if [[ ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return 0; fi
-  local expect="${VPS_PUBLIC_HOST:-}"
-  echo "Erwartete VPS-IP/Host: ${expect:-unbekannt}"
-  local domain scheme ip port a aaaa
+  local expect="${VPS_PUBLIC_HOST:-}" expect6; expect6="$(vps_ipv6)"
+  echo "Erwartete VPS-IPv4/Host: ${expect:-unbekannt}"
+  echo "Erwartete VPS-IPv6:      ${expect6:-(keine)}   (ENABLE_IPV6=${ENABLE_IPV6:-0})"
+  local domain scheme ip port profile a aaaa
   while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
@@ -1150,19 +1193,27 @@ domains_status() {
     echo
     printf '%bDomain:%b   %s\n' "$C_BOLD" "$C_RESET" "$domain"
     printf '  Backend:  %s://%s:%s\n' "$scheme" "$ip" "$port"
-    printf '  Erwartet: %s\n' "${expect:-unbekannt}"
     printf '  A:        %s\n' "${a:-(keiner)}"
     printf '  AAAA:     %s\n' "${aaaa:-(keiner)}"
+    # IPv4-Bewertung
     if _is_ip "$expect"; then
-      if [[ -z "$a" ]]; then
-        warn "kein A-Record gefunden"
-      elif [[ "$a" == "$expect" ]]; then
-        ok "zeigt auf diesen VPS"
-      else
-        warn "zeigt nicht auf diesen VPS (moeglicherweise bewusst noch nicht migriert)"
-      fi
+      if [[ -z "$a" ]]; then warn "kein A-Record vorhanden"
+      elif [[ "$a" == "$expect" ]]; then ok "A zeigt auf VPS IPv4"
+      else warn "A zeigt nicht auf diesen VPS (moeglicherweise bewusst noch nicht migriert)"; fi
     else
       info "VPS als DNS-Name konfiguriert - A-Record-Vergleich uebersprungen"
+    fi
+    # IPv6-Bewertung
+    if [[ -z "$aaaa" ]]; then
+      info "kein AAAA-Record vorhanden"
+    elif [[ "${ENABLE_IPV6:-0}" != "1" ]]; then
+      warn "AAAA vorhanden, aber ENABLE_IPV6=0 (IPv6 extern nicht aktiviert)"
+    elif [[ -n "$expect6" && "$aaaa" == "$expect6" ]]; then
+      ok "AAAA zeigt auf VPS IPv6"
+    elif [[ -n "$expect6" ]]; then
+      warn "AAAA zeigt nicht auf diesen VPS (erwartet ${expect6})"
+    else
+      warn "AAAA vorhanden, aber VPS hat keine globale IPv6"
     fi
   done < "$SERVICES_FILE"
 }
@@ -1810,13 +1861,13 @@ security_http3_toggle() {
   if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
     warn "HTTP/3 ist aktuell aktiv (Caddy lauscht zusaetzlich auf UDP 443)."
     if yesno "HTTP/3 deaktivieren?" "y"; then
-      ENABLE_HTTP3="0"; save_env; reload_caddy; ufw_sync
+      ENABLE_HTTP3="0"; save_env; reload_caddy; ufw_apply_auto
       ok "HTTP/3 deaktiviert, 443/udp geschlossen."
     fi
   else
     info "HTTP/3 ist aktuell deaktiviert (nur HTTP/1.1 und HTTP/2)."
     if yesno "HTTP/3 aktivieren?" "n"; then
-      ENABLE_HTTP3="1"; save_env; reload_caddy; ufw_sync
+      ENABLE_HTTP3="1"; save_env; reload_caddy; ufw_apply_auto
       ok "HTTP/3 aktiviert, 443/udp erlaubt."
     fi
   fi
@@ -2148,6 +2199,52 @@ caddy_status() {
   if systemctl is-active --quiet docker 2>/dev/null; then ok "Docker aktiv"; else err "Docker nicht aktiv"; fi
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; fi
   docker ps --filter name=caddy-edge --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
+  echo
+  if tcp_port_open 443; then ok "lauscht auf :443 (IPv4)"; else warn ":443 (IPv4) nicht sichtbar"; fi
+  if caddy_listens_ipv6_443; then ok "lauscht auf :443 (IPv6)"; else info ":443 (IPv6) nicht sichtbar"; fi
+  ss -tulpnH 2>/dev/null | grep ':443' | sed 's/^/  /' | mask_secrets || true
+}
+
+# IPv6-Statusuebersicht (extern Client -> VPS/Caddy).
+ipv6_status() {
+  load_env
+  section "IPv6 Status (extern)"
+  echo "ENABLE_IPV6: ${ENABLE_IPV6:-0}"
+  local v6; v6="$(vps_ipv6)"
+  [[ -n "$v6" ]] && ok "VPS hat globale IPv6: ${v6}" || warn "Keine globale IPv6-Adresse am VPS gefunden."
+  if ufw_ipv6_enabled; then ok "UFW IPv6 aktiv (/etc/default/ufw: IPV6=yes)"; else warn "UFW IPv6 nicht aktiv (IPV6=yes fehlt)"; fi
+  if caddy_listens_ipv6_443; then ok "Caddy lauscht auf IPv6 :443"; else info "Caddy lauscht (noch) nicht sichtbar auf IPv6 :443"; fi
+  echo "Lauschende :443 Sockets:"
+  ss -tulpnH 2>/dev/null | grep ':443' | sed 's/^/  /' | mask_secrets || true
+  echo
+  info "IPv6 betrifft nur den externen Zugriff auf VPS/Caddy. Backend bleibt IPv4 ueber WireGuard."
+}
+
+# IPv6 extern aktivieren/deaktivieren.
+ipv6_toggle() {
+  need_root; load_env
+  section "IPv6 extern aktivieren/deaktivieren"
+  echo "Hinweis: IPv6 betrifft nur den externen Zugriff auf den VPS/Caddy."
+  echo "Der Backend-Zugriff ins Heimnetz bleibt IPv4 ueber WireGuard."
+  echo "Aktuell: ENABLE_IPV6=${ENABLE_IPV6:-0}"
+  echo
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
+    if yesno "IPv6 extern deaktivieren?" "y"; then
+      maybe_backup_before_change
+      ENABLE_IPV6=0; save_env; ufw_apply_auto
+      ok "IPv6 extern deaktiviert (443/tcp v6 geschlossen)."
+    fi
+  else
+    if ! vps_has_global_ipv6; then warn "Dieser VPS hat keine globale IPv6-Adresse - IPv6 extern bringt aktuell nichts."; fi
+    if yesno "IPv6 extern aktivieren?" "n"; then
+      maybe_backup_before_change
+      ENABLE_IPV6=1; save_env; ufw_apply_auto
+      ok "IPv6 extern aktiviert (443/tcp v6 offen)."
+      warn "Fuer Erreichbarkeit AAAA-Records auf die VPS-IPv6 setzen: $(vps_ipv6)"
+    fi
+  fi
+  echo
+  ipv6_status
 }
 show_caddyfile() {
   section "Caddyfile"
@@ -2292,7 +2389,8 @@ sm_status() {
     menu_item 5 "WireGuard Status"
     menu_item 6 "Zertifikatsstatus"
     menu_item 7 "DNS Status pro Domain"
-    menu_item 8 "Server Auslastung"
+    menu_item 8 "IPv6 Status (extern)"
+    menu_item 9 "Server Auslastung"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2303,7 +2401,8 @@ sm_status() {
       5) load_env; wg_status; pause ;;
       6) check_certs; pause ;;
       7) domains_status; pause ;;
-      8) system_usage; pause ;;
+      8) ipv6_status; pause ;;
+      9) system_usage; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2381,6 +2480,8 @@ sm_caddy() {
     menu_item 6 "Cloudflare Token testen"
     menu_item 7 "DNS Challenge pruefen"
     menu_item 8 "HTTP/3 aktivieren/deaktivieren"
+    menu_item 9 "IPv6 extern aktivieren/deaktivieren"
+    menu_item 10 "IPv6 Status anzeigen"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2392,6 +2493,8 @@ sm_caddy() {
       6) verify_current_token; pause ;;
       7) dns_challenge_test; pause ;;
       8) security_http3_toggle; pause ;;
+      9) ipv6_toggle; pause ;;
+      10) ipv6_status; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2634,6 +2737,8 @@ case "${1:-menu}" in
   certs|cert-check) check_certs ;;
   test-domain) test_domain "${2:-}" ;;
   domains|dns) domains_status ;;
+  ipv6) need_root; ipv6_toggle ;;
+  ipv6-status) ipv6_status ;;
   set-token|cf-token) need_root; change_cloudflare_token ;;
   wg-menu) sm_wg ;;
   wg-values) wg_values ;;

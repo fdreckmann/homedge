@@ -135,6 +135,21 @@ Im Menue unter `Wartung / Updates`:
   dabei wird `443/udp` in UFW passend geoeffnet bzw. wieder geschlossen.
 - `sudo homeedge firewall` setzt UFW passend zur Konfiguration (443/udp nur bei HTTP/3).
 
+## IPv6 (optional, nur externer Zugriff)
+
+IPv6 betrifft ausschliesslich den externen Zugriff Client -> VPS/Caddy. Der
+Backend-Zugriff ins Heimnetz bleibt IPv4 ueber WireGuard.
+
+- Standard `ENABLE_IPV6=0`. Aktivieren ueber
+  `Caddy / HTTPS / Cloudflare -> IPv6 extern aktivieren/deaktivieren`
+  (oder `sudo homeedge ipv6`).
+- Aktiv: UFW setzt `IPV6=yes` und gibt `443/tcp` (und bei HTTP/3 `443/udp`)
+  auch fuer IPv6 frei. Aus: kein v6-Service offen (UFW v6 default deny).
+- Status: `sudo homeedge ipv6-status` (VPS-IPv6, UFW-IPv6, Caddy-Listen).
+- `sudo homeedge domains` zeigt je Domain A/AAAA, erwartete VPS-IPv4/IPv6 und
+  bewertet AAAA (z. B. Warnung, wenn AAAA gesetzt aber `ENABLE_IPV6=0`).
+- Kein IPv6 fuer das Backend noetig (keine IPv6-Backend-IP, keine v6-WG-Subnetze).
+
 ## WireGuard MTU
 
 - Standard `WG_MTU=1280`, wird in `/etc/wireguard/<if>.conf` geschrieben.
