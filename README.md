@@ -59,6 +59,11 @@ sudo homeedge self-update   # Update direkt aus dem GitHub-Repo
 sudo homeedge check-update  # nur pruefen, ob ein Update vorliegt
 ```
 
+Direktbefehle oeffnen die jeweilige Menue-Gruppe:
+`homeedge security`, `homeedge fail2ban`, `homeedge backup`, `homeedge update`,
+`homeedge wg-menu`, `homeedge network`. Weitere: `homeedge reload`, `certs`,
+`domains`, `test-domain DOMAIN`, `set-token`, `mtu`, `migrate`, `rollback`.
+
 ## Installation
 
 ### Windows

@@ -90,7 +90,7 @@ case "${ID}" in
     DOCKER_REPO_OS="debian"
     ;;
   *)
-    echo "Nicht unterstütztes OS für dieses Paket: ${ID:-unknown}. Unterstützt: Debian/Ubuntu."
+    echo "Nicht unterstuetztes OS fuer dieses Paket: ${ID:-unknown}. Unterstuetzt: Debian/Ubuntu."
     exit 1
     ;;
 esac
@@ -184,9 +184,9 @@ KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 EOF
   systemctl reload ssh || systemctl reload sshd || true
-  echo "SSH-Hardening aktiv. Teste eine neue SSH-Session mit User ${ADMIN_USER}, bevor du die alte schließt."
+  echo "SSH-Hardening aktiv. Teste eine neue SSH-Session mit User ${ADMIN_USER}, bevor du die alte schliesst."
 else
-  echo "SSH-Hardening nicht aktiviert. Root/Passwort-Login bitte später manuell absichern."
+  echo "SSH-Hardening nicht aktiviert. Root/Passwort-Login bitte spaeter manuell absichern."
 fi
 
 echo
@@ -199,7 +199,7 @@ echo
 echo "============================================================"
 echo "FERTIG"
 echo "============================================================"
-echo "Menü:                  sudo homeedge menu"
+echo "Menue:                  sudo homeedge menu"
 echo "Aktuelle Werte:        sudo homeedge values"
 echo "WireGuard Werte:       sudo homeedge wg-values"
 echo "Status:                sudo homeedge status"

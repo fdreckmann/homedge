@@ -315,7 +315,10 @@ if [[ -z "$ServicesTsv" ]]; then
     s="$(ask "Backend Scheme http/https" "http")"
     ip="$(ask "Backend IP im Heimnetz")"
     p="$(ask "Backend Port")"
-    ServicesTsv+="${d}"$'\t'"${s}"$'\t'"${ip}"$'\t'"${p}"$'\n'
+    echo "Backend-Profil: 1) Standard  2) Jellyfin  3) Jellyseerr"
+    pr="$(ask "Profil" "1")"
+    case "$pr" in 2) pr=jellyfin;; 3) pr=jellyseerr;; *) pr=standard;; esac
+    ServicesTsv+="${d}"$'\t'"${s}"$'\t'"${ip}"$'\t'"${p}"$'\t'"${pr}"$'\n'
   done
 fi
 
@@ -427,7 +430,7 @@ printf '%s' "$RemoteScript" | ssh "${SSH_ARGS[@]}" "$REMOTE_CMD"
 echo
 echo "Installation beendet."
 echo
-if yesno "Direkt jetzt eine SSH-Sitzung zum VPS öffnen?" "y"; then
+if yesno "Direkt jetzt eine SSH-Sitzung zum VPS oeffnen?" "y"; then
   FINAL_USER="$SshUser"
   FINAL_PORT="$SshPortFinal"
   FINAL_KEY="$SshKeyPath"
@@ -441,7 +444,7 @@ if yesno "Direkt jetzt eine SSH-Sitzung zum VPS öffnen?" "y"; then
   SSH_JUMP_ARGS=()
   [[ -n "$FINAL_KEY" ]] && SSH_JUMP_ARGS+=("-i" "$FINAL_KEY")
   SSH_JUMP_ARGS+=("-p" "$FINAL_PORT" "${FINAL_USER}@${SshHost}")
-  if yesno "Direkt das homeedge-Menü starten?" "y"; then
+  if yesno "Direkt das homeedge-Menue starten?" "y"; then
     ssh -t "${SSH_JUMP_ARGS[@]}" "sudo homeedge menu"
   else
     ssh -t "${SSH_JUMP_ARGS[@]}"

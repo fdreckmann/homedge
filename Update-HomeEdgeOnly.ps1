@@ -50,6 +50,6 @@ $Content = Get-Content $EdgectlPath -Raw
 $Content | & ssh @sshArgs "cat >/tmp/homeedge && sed -i 's/\r$//' /tmp/homeedge && chmod +x /tmp/homeedge && sudo mv /tmp/homeedge /usr/local/bin/homeedge && sudo chown root:root /usr/local/bin/homeedge && sudo chmod +x /usr/local/bin/homeedge && sudo ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl && sudo homeedge values"
 
 Write-Host ""
-Write-Host "Fertig. Menü starten mit:"
+Write-Host "Fertig. Menue starten mit:"
 Write-Host "  sudo homeedge menu"
 Write-Host ""
