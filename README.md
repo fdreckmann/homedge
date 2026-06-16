@@ -37,6 +37,17 @@ sudo homeedge menu
 
 `edgectl` bleibt als Kompatibilitaets-Alias erhalten (`sudo edgectl menu`).
 
+Das Terminal-Menue ist in neun Gruppen mit Breadcrumb (z. B. `HomeEdge > Sicherheit`)
+und je `b) Zurueck` / `0) Beenden` organisiert:
+
+```text
+1) Status / Ampel            6) Backup & Restore
+2) Domains & Dienste         7) Updates & Wartung
+3) WireGuard Tunnel          8) Logs & Diagnose
+4) Caddy / HTTPS / Cloudflare 9) Einstellungen
+5) Sicherheit                0) Beenden
+```
+
 Weitere Direktbefehle:
 
 ```bash
@@ -103,6 +114,24 @@ Im Menue unter `Wartung / Updates`:
   bevor er installiert wird. Bei Fehlern bleibt die laufende Version unveraendert.
 - Repo/Branch aendern: `sudo homeedge set-repo`.
 - Empfehlung: nicht blind von `main`, sondern bevorzugt getaggte Releases nutzen.
+- Nach dem Update laeuft automatisch eine Migration (`sudo homeedge migrate`):
+  Cloudflare-Token wird bereinigt (immer einzeilig), fehlende Werte werden
+  ergaenzt (`ENABLE_HTTP3=0`, `WG_MTU=1280`, Fail2ban-Schwellenwerte), die
+  Caddyfile neu erzeugt/validiert und ein Healthcheck ausgefuehrt. Bestehende
+  Dienste, Zertifikate und WireGuard-Keys bleiben erhalten.
+
+## HTTP/3 / QUIC und Firewall
+
+- Standard ist `ENABLE_HTTP3=0` (nur HTTP/1.1 + HTTP/2, UFW oeffnet nur 443/tcp).
+- Aktivieren ueber `Caddy / HTTPS / Cloudflare -> HTTP/3 aktivieren/deaktivieren`;
+  dabei wird `443/udp` in UFW passend geoeffnet bzw. wieder geschlossen.
+- `sudo homeedge firewall` setzt UFW passend zur Konfiguration (443/udp nur bei HTTP/3).
+
+## WireGuard MTU
+
+- Standard `WG_MTU=1280`, wird in `/etc/wireguard/<if>.conf` geschrieben.
+- Aendern ueber `WireGuard Tunnel -> MTU anzeigen/aendern` (oder `sudo homeedge mtu`).
+- Hinweis: MTU ggf. auch auf UniFi-Seite setzen, falls dort ein MTU-Feld existiert.
 
 ## Backup / Restore
 
@@ -208,3 +237,6 @@ und `/root/vps-edge/`.
 - In Cloudflare DNS only / graue Wolke verwenden.
 - In Jellyfin als Known Proxy die VPS-WireGuard-IP eintragen, z. B. `10.0.1.1`.
 - In UniFi nur erlauben: VPS-WG-IP -> Backend-IP:Port.
+- Beim Anlegen eines Dienstes kann ein Profil gewaehlt werden
+  (Standard / Jellyfin / Jellyseerr). Das Jellyfin-Profil setzt im Caddy-Block
+  `flush_interval -1` (besseres Streaming). X-Forwarded-Header setzt Caddy selbst.

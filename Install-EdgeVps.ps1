@@ -245,6 +245,8 @@ $SshPortFinal = Ask "SSH Port auf dem VPS" (Get-CfgValue $LoadedConfig "SshPortF
 
 $WgIf = Ask "WireGuard Interface Name" (Get-CfgValue $LoadedConfig "WgIf" "unifi")
 $WgPort = Ask "WireGuard UDP Port" (Get-CfgValue $LoadedConfig "WgPort" "51821")
+$WgMtu = Ask "WireGuard MTU" (Get-CfgValue $LoadedConfig "WgMtu" "1280")
+if ($WgMtu -notmatch '^[0-9]+$') { $WgMtu = "1280" }
 $VpsWgAddr = Ask "VPS WireGuard Adresse mit CIDR" (Get-CfgValue $LoadedConfig "VpsWgAddr" "10.0.1.1/24")
 $ClientWgAddr = Ask "UniFi/Client WireGuard Adresse mit CIDR" (Get-CfgValue $LoadedConfig "ClientWgAddr" "10.0.1.2/32")
 $HomeSubnet = Ask "Heimnetz/Subnetz hinter UniFi" (Get-CfgValue $LoadedConfig "HomeSubnet" "192.168.10.0/24")
@@ -412,6 +414,7 @@ if (Ask-YesNo "Eingaben lokal als Config fuer naechstes Mal speichern/aktualisie
         SshPortFinal = $SshPortFinal
         WgIf = $WgIf
         WgPort = $WgPort
+        WgMtu = $WgMtu
         VpsWgAddr = $VpsWgAddr
         ClientWgAddr = $ClientWgAddr
         HomeSubnet = $HomeSubnet
@@ -453,6 +456,7 @@ $Replacements = @{
     "__SSH_PORT_B64__" = To-B64 $SshPortFinal
     "__WG_IF_B64__" = To-B64 $WgIf
     "__WG_PORT_B64__" = To-B64 $WgPort
+    "__WG_MTU_B64__" = To-B64 $WgMtu
     "__VPS_WG_ADDR_B64__" = To-B64 $VpsWgAddr
     "__CLIENT_WG_ADDR_B64__" = To-B64 $ClientWgAddr
     "__HOME_SUBNET_B64__" = To-B64 $HomeSubnet

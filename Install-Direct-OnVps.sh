@@ -128,6 +128,7 @@ ExtIf=$(printf '%q' "$ExtIf")
 SshPortFinal=$(printf '%q' "$SshPortFinal")
 WgIf=$(printf '%q' "$WgIf")
 WgPort=$(printf '%q' "$WgPort")
+WgMtu=$(printf '%q' "${WgMtu:-1280}")
 VpsWgAddr=$(printf '%q' "$VpsWgAddr")
 ClientWgAddr=$(printf '%q' "$ClientWgAddr")
 HomeSubnet=$(printf '%q' "$HomeSubnet")
@@ -192,6 +193,8 @@ fi
 SshPortFinal="$(ask "SSH Port auf dem VPS" "$(cfg_get SshPortFinal 22)")"
 WgIf="$(ask "WireGuard Interface Name" "$(cfg_get WgIf unifi)")"
 WgPort="$(ask "WireGuard UDP Port" "$(cfg_get WgPort 51821)")"
+WgMtu="$(ask "WireGuard MTU" "$(cfg_get WgMtu 1280)")"
+[[ "$WgMtu" =~ ^[0-9]+$ ]] || WgMtu=1280
 VpsWgAddr="$(ask "VPS WireGuard Adresse mit CIDR" "$(cfg_get VpsWgAddr 10.0.1.1/24)")"
 ClientWgAddr="$(ask "UniFi/Client WireGuard Adresse mit CIDR" "$(cfg_get ClientWgAddr 10.0.1.2/32)")"
 HomeSubnet="$(ask "Backend-Netze hinter UniFi, komma-getrennt" "$(cfg_get HomeSubnet 192.168.10.0/24)")"
@@ -321,6 +324,7 @@ replace_token "__VPS_PUBLIC_HOST_B64__" "$(b64 "$VpsPublicHost")"
 replace_token "__SSH_PORT_B64__" "$(b64 "$SshPortFinal")"
 replace_token "__WG_IF_B64__" "$(b64 "$WgIf")"
 replace_token "__WG_PORT_B64__" "$(b64 "$WgPort")"
+replace_token "__WG_MTU_B64__" "$(b64 "${WgMtu:-1280}")"
 replace_token "__VPS_WG_ADDR_B64__" "$(b64 "$VpsWgAddr")"
 replace_token "__CLIENT_WG_ADDR_B64__" "$(b64 "$ClientWgAddr")"
 replace_token "__HOME_SUBNET_B64__" "$(b64 "$HomeSubnet")"
