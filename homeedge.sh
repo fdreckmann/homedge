@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.8-homeedge"
+APP_VERSION="0.9.9-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -525,6 +525,12 @@ wait_for_certs() {
 # (auf vorherige Version zurueckgerollt, nichts kaputt).
 _caddy_prepare_config() {
   load_env
+  # services.tsv ZWINGEND validieren, bevor irgendetwas generiert wird.
+  if ! validate_services_file; then
+    err "services.tsv ist ungueltig - Caddyfile wird NICHT neu erzeugt, letzte Version bleibt aktiv."
+    err "Bitte ausfuehren: sudo homeedge repair-services"
+    return 1
+  fi
   write_caddy_stack
   mkdir -p "$CADDY_DIR"
   local cf="${CADDY_DIR}/Caddyfile" tmp="${CADDY_DIR}/.Caddyfile.new" bak="${CADDY_DIR}/.Caddyfile.bak"
@@ -908,7 +914,17 @@ show_values() {
   list_services
 }
 
-list_services() { if [[ ! -f "$SERVICES_FILE" || ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return; fi; nl -w2 -s'. ' "$SERVICES_FILE" | sed $'s/\t/ | /g'; }
+list_services() {
+  if [[ ! -f "$SERVICES_FILE" || ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return; fi
+  if ! validate_services_file >/dev/null 2>&1; then
+    err "services.tsv ist ungueltig:"
+    validate_services_file || true
+    echo
+    err "Bitte ausfuehren: sudo homeedge repair-services"
+    return 1
+  fi
+  nl -w2 -s'. ' "$SERVICES_FILE" | sed $'s/\t/ | /g'
+}
 
 # Fragt das Backend-Profil ab (Anzeige nach stderr, Rueckgabe nach stdout).
 ask_profile() {
@@ -917,6 +933,110 @@ ask_profile() {
   { echo "Backend-Profil:"; echo "  1) Standard"; echo "  2) Jellyfin (flush_interval -1 fuer Streaming)"; echo "  3) Jellyseerr"; } >&2
   c="$(ask "Profil" "$def")"
   case "$c" in 2|jellyfin) printf 'jellyfin' ;; 3|jellyseerr) printf 'jellyseerr' ;; *) printf 'standard' ;; esac
+}
+
+# ------------------------------------------------------------
+# services.tsv Integritaet (Append/Validierung/Repair)
+# ------------------------------------------------------------
+# Profil-Vorschlag anhand Port.
+profile_suggest() { case "$1" in 8096) echo jellyfin ;; 5055) echo jellyseerr ;; *) echo standard ;; esac; }
+
+# Haengt einen Dienst sicher an: stellt erst Trailing-Newline sicher, dann genau
+# 5 Felder. Verhindert das Verkleben mit der letzten Zeile.
+append_service() {
+  local domain="$1" scheme="$2" ip="$3" port="$4" profile="$5"
+  touch "$SERVICES_FILE"
+  if [[ -s "$SERVICES_FILE" && -n "$(tail -c1 "$SERVICES_FILE")" ]]; then
+    printf '\n' >> "$SERVICES_FILE"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$domain" "$scheme" "$ip" "$port" "$profile" >> "$SERVICES_FILE"
+}
+
+# Validiert services.tsv ($1 optional, default SERVICES_FILE). 0 = ok, 1 = defekt.
+validate_services_file() {
+  local f="${1:-$SERVICES_FILE}"
+  [[ -f "$f" && -s "$f" ]] || return 0   # keine/leere Datei = keine Dienste = ok
+  local rc=0 ln=0 line nf d s i p pr
+  if [[ -n "$(tail -c1 "$f")" ]]; then err "services.tsv endet nicht mit Newline (Zeilen koennen verkleben)."; rc=1; fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ln=$((ln+1)); [[ -z "$line" ]] && continue
+    nf=$(awk -F'\t' '{print NF}' <<<"$line")
+    if [[ "$nf" -ne 5 ]]; then err "Zeile ${ln}: ${nf} Felder statt 5 (verklebt?): ${line}"; rc=1; continue; fi
+    IFS=$'\t' read -r d s i p pr <<<"$line"
+    [[ -n "$d" && ! "$d" =~ [[:space:]] ]] || { err "Zeile ${ln}: ungueltige Domain '${d}'"; rc=1; }
+    [[ "$s" == "http" || "$s" == "https" ]] || { err "Zeile ${ln}: scheme '${s}' (erwartet http/https)"; rc=1; }
+    [[ -n "$i" && ! "$i" =~ [[:space:]] ]] || { err "Zeile ${ln}: ungueltige Backend-Adresse '${i}'"; rc=1; }
+    [[ "$p" =~ ^[0-9]+$ ]] || { err "Zeile ${ln}: Port '${p}' nicht numerisch (verklebt?)"; rc=1; }
+    case "$pr" in standard|jellyfin|jellyseerr) ;; *) err "Zeile ${ln}: Profil '${pr}' (erwartet standard/jellyfin/jellyseerr)"; rc=1 ;; esac
+  done < "$f"
+  return $rc
+}
+
+# Validiert SERVICES_FILE; bei Fehler Rollback aus $1. 0 = ok.
+_services_commit_check() {
+  if validate_services_file; then rm -f "$1"; return 0; fi
+  err "services.tsv ungueltig - stelle vorherigen Stand wieder her."
+  [[ -f "$1" ]] && mv "$1" "$SERVICES_FILE"
+  return 1
+}
+
+# Rekonstruiert saubere 5-Feld-Zeilen aus einer defekten Datei (stdout).
+# Nutzt scheme (http/https) als Anker. Rueckgabe 2 = unsichere Zuordnung.
+repair_build() {
+  local f="$1" t
+  local -a toks=()
+  while IFS= read -r t; do
+    [[ -z "$t" ]] && continue
+    # verklebtes <port><domain> auftrennen (Ziffern direkt gefolgt von Buchstabe)
+    while [[ "$t" =~ ^([0-9]+)([A-Za-z].*)$ ]]; do
+      toks+=("${BASH_REMATCH[1]}"); t="${BASH_REMATCH[2]}"
+    done
+    toks+=("$t")
+  done < <(tr '\t' '\n' < "$f")
+  local i=0 n=${#toks[@]} d s ip p pr
+  local -a out=()
+  while (( i < n )); do
+    d="${toks[i]:-}"; s="${toks[i+1]:-}"; ip="${toks[i+2]:-}"; p="${toks[i+3]:-}"; pr="${toks[i+4]:-}"
+    if [[ ( "$s" == "http" || "$s" == "https" ) && "$p" =~ ^[0-9]+$ ]]; then
+      if [[ "$pr" == standard || "$pr" == jellyfin || "$pr" == jellyseerr ]]; then i=$((i+5)); else pr="$(profile_suggest "$p")"; i=$((i+4)); fi
+      out+=("${d}"$'\t'"${s}"$'\t'"${ip}"$'\t'"${p}"$'\t'"${pr}")
+    else
+      return 2
+    fi
+  done
+  (( ${#out[@]} == 0 )) && return 2
+  printf '%s\n' "${out[@]}"
+}
+
+# Analysiert/repariert services.tsv (Backup der defekten Datei vorher).
+repair_services() {
+  need_root; load_env
+  section "services.tsv reparieren"
+  [[ -f "$SERVICES_FILE" ]] || { warn "Keine services.tsv vorhanden."; return 0; }
+  if validate_services_file >/dev/null 2>&1; then ok "services.tsv ist bereits gueltig."; return 0; fi
+  warn "services.tsv ist defekt. Reparatur wird versucht."
+  local bak="${SERVICES_FILE}.broken.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$SERVICES_FILE" "$bak"; chmod 600 "$bak" 2>/dev/null || true
+  warn "Defekte Datei gesichert: $bak"
+  local tmp; tmp="$(mktemp)"
+  if repair_build "$SERVICES_FILE" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]] && validate_services_file "$tmp" >/dev/null 2>&1; then
+    echo "Vorschlag fuer reparierte services.tsv:"
+    nl -w2 -s'. ' "$tmp" | sed $'s/\t/ | /g'
+    echo
+    if yesno "Diese reparierte Version uebernehmen?" "y"; then
+      cat "$tmp" > "$SERVICES_FILE"; rm -f "$tmp"
+      ok "services.tsv repariert."
+      validate_services_file && ok "Validierung erfolgreich."
+    else
+      rm -f "$tmp"; warn "Nicht uebernommen. Original (defekt) bleibt, Backup: $bak"; return 1
+    fi
+  else
+    rm -f "$tmp"
+    err "Automatische Reparatur unsicher - bitte manuell pruefen."
+    echo "Datei:  $SERVICES_FILE"
+    echo "Backup: $bak"
+    return 1
+  fi
 }
 
 validate_service() {
@@ -936,7 +1056,9 @@ add_service() {
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
   profile="$(ask_profile standard)"
   maybe_backup_before_change
-  printf "%s\t%s\t%s\t%s\t%s\n" "$domain" "$scheme" "$ip" "$port" "$profile" >> "$SERVICES_FILE"
+  local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
+  append_service "$domain" "$scheme" "$ip" "$port" "$profile"
+  _services_commit_check "$_bak" || return 1
   write_unifi_values; reload_caddy
   ok "Dienst hinzugefuegt."
   warn "UniFi Firewall erlauben: ${VPS_WG_IP} -> ${ip}:${port}/tcp"
@@ -944,6 +1066,7 @@ add_service() {
 
 edit_service() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
+  validate_services_file >/dev/null 2>&1 || { err "services.tsv ist ungueltig. Bitte zuerst: sudo homeedge repair-services"; return 1; }
   list_services; local num; num="$(ask "Nummer aendern")"; mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
   local old_domain old_scheme old_ip old_port old_profile; IFS=$'\t' read -r old_domain old_scheme old_ip old_port old_profile <<< "${lines[$idx]}"
@@ -952,16 +1075,22 @@ edit_service() {
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
   profile="$(ask_profile "${old_profile:-standard}")"
   maybe_backup_before_change
+  local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
   lines[$idx]="${domain}"$'\t'"${scheme}"$'\t'"${ip}"$'\t'"${port}"$'\t'"${profile}"; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
+  _services_commit_check "$_bak" || return 1
   write_unifi_values; reload_caddy; ok "Dienst aktualisiert."
 }
 
 delete_service() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
+  validate_services_file >/dev/null 2>&1 || { err "services.tsv ist ungueltig. Bitte zuerst: sudo homeedge repair-services"; return 1; }
   list_services; local num; num="$(ask "Nummer loeschen")"; mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
   maybe_backup_before_change
-  unset 'lines[$idx]'; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"; write_unifi_values; reload_caddy; ok "Dienst geloescht."
+  local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
+  unset 'lines[$idx]'; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
+  _services_commit_check "$_bak" || return 1
+  write_unifi_values; reload_caddy; ok "Dienst geloescht."
 }
 
 edit_settings() {
@@ -1152,6 +1281,17 @@ backup_create() {
   need_root
   load_env
   section "Backup erstellen"
+  # Vor dem Backup pruefen, ob services.tsv valide ist (sonst defekter Stand).
+  # Im auto-Modus (z. B. Pre-Restore-Backup) ohne Rueckfrage durchziehen.
+  if [[ -s "$SERVICES_FILE" ]] && ! validate_services_file >/dev/null 2>&1; then
+    warn "services.tsv ist fehlerhaft. Dieses Backup wuerde einen defekten Stand enthalten."
+    if [[ "${BACKUP_BEHAVIOR:-ask}" != "auto" ]]; then
+      if ! yesno "Backup trotzdem erstellen?" "n"; then
+        warn "Abgebrochen. Tipp: sudo homeedge repair-services"
+        return 1
+      fi
+    fi
+  fi
   mkdir -p "$BACKUP_DIR"
   local ts backup_file manifest_file tmp_manifest
   ts="$(date +%Y%m%d-%H%M%S)"
@@ -1241,44 +1381,82 @@ backup_show_content() {
   info "Eintraege gesamt: $total"
 }
 
-backup_restore() {
-  need_root
-  section "Backup wiederherstellen"
-  local f
-  f="$(backup_select_file)" || return 0
-  echo
-  warn "Restore stellt Konfigurationen wieder her. Aktueller Zustand wird vorher gesichert."
-  warn "Backup enthaelt Secrets und ueberschreibt u.a. HomeEdge, WireGuard, Caddy und Fail2ban-Konfig."
-  echo
-  tar -tzf "$f" | sed -n '1,60p'
-  echo
-  if ! yesno "Dieses Backup wirklich wiederherstellen?" "n"; then
-    warn "Abgebrochen."
-    return 0
-  fi
+# Gemeinsame, atomare Restore-Routine. $1 = Backup-Datei, $2 = mode (full|config).
+_do_restore() {
+  local f="$1" mode="$2"
+  # 1) Pre-Restore-Backup des aktuellen Zustands.
+  info "Erstelle Pre-Restore-Backup des aktuellen Zustands..."
+  BACKUP_BEHAVIOR=auto backup_create >/dev/null 2>&1 || warn "Pre-Restore-Backup unvollstaendig (fahre fort)."
 
-  backup_create || true
-
-  info "Dienste werden kurz gestoppt/neugeladen..."
+  info "Dienste werden kurz gestoppt..."
+  load_env || true
   systemctl stop "wg-quick@${WG_IF:-unifi}" 2>/dev/null || true
 
-  tar -xzf "$f" -C /
+  # 2) Entpacken. Bei config-Modus die Software (Binary) NICHT ueberschreiben.
+  if [[ "$mode" == "config" ]]; then
+    tar -xzf "$f" -C / --exclude='usr/local/bin/homeedge' 2>/dev/null || tar -xzf "$f" -C /
+  else
+    tar -xzf "$f" -C /
+  fi
+
+  # 3) Rechte/Token/Symlink.
+  repair_env_file || true
   chmod 600 /etc/homeedge/homeedge.env 2>/dev/null || true
   chmod 600 /etc/wireguard/*.conf /etc/wireguard/*.template 2>/dev/null || true
-  if [[ -f /usr/local/bin/homeedge ]]; then
+  if [[ "$mode" == "full" && -f /usr/local/bin/homeedge ]]; then
     chmod +x /usr/local/bin/homeedge 2>/dev/null || true
     ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl 2>/dev/null || true
   fi
 
   load_env || true
-  if [[ -d "$CADDY_DIR" && -f "$CADDY_DIR/docker-compose.yml" ]]; then
-    (cd "$CADDY_DIR" && docker compose up -d) || warn "Caddy konnte nicht automatisch gestartet werden. Bitte pruefen."
-  fi
-  systemctl restart fail2ban 2>/dev/null || true
-  restart_wg || true
 
-  ok "Restore abgeschlossen."
-  warn "Bitte pruefen: sudo homeedge health"
+  # 4) services.tsv validieren - bei Defekt Reparatur versuchen.
+  if ! validate_services_file; then
+    warn "Wiederhergestellte services.tsv ist ungueltig - versuche automatische Reparatur..."
+    repair_services || true
+  fi
+  if ! validate_services_file; then
+    err "Restore unvollstaendig: services.tsv weiterhin defekt. Bitte: sudo homeedge repair-services"
+    return 1
+  fi
+  ok "services.tsv valide."
+
+  # 5) Caddyfile neu generieren + validieren + reload (blockiert bei Fehler).
+  if command -v docker >/dev/null 2>&1; then
+    reload_caddy || { err "Caddy-Reload fehlgeschlagen - bitte pruefen."; return 1; }
+  fi
+  # 6) Fail2ban (mit Config-Test), WireGuard, UFW.
+  command -v fail2ban-client >/dev/null 2>&1 && install_fail2ban || true
+  restart_wg || true
+  ufw_apply_auto || true
+
+  ok "Restore (${mode}) abgeschlossen."
+  echo
+  info "Abschluss-Healthcheck:"
+  health_check || true
+  return 0
+}
+
+backup_restore() {
+  need_root
+  section "Komplettes Restore (Software + Config)"
+  local f; f="$(backup_select_file)" || return 0
+  echo
+  tar -tzf "$f" 2>/dev/null | sed -n '1,40p'
+  echo
+  warn "Achtung: Restore ueberschreibt aktuelle Konfiguration UND HomeEdge-Software."
+  if ! yesno "Fortfahren?" "n"; then warn "Abgebrochen."; return 0; fi
+  _do_restore "$f" full
+}
+
+restore_config() {
+  need_root
+  section "Config Restore (nur Konfiguration)"
+  local f; f="$(backup_select_file)" || return 0
+  echo
+  warn "Achtung: Restore ueberschreibt aktuelle Konfiguration. HomeEdge-Software bleibt unveraendert."
+  if ! yesno "Fortfahren?" "n"; then warn "Abgebrochen."; return 0; fi
+  _do_restore "$f" config
 }
 
 backup_delete() {
@@ -2143,6 +2321,7 @@ sm_services() {
     menu_item 6 "Backend direkt testen"
     menu_item 7 "Caddyfile aus Diensten neu generieren"
     menu_item 8 "Caddyfile anzeigen"
+    menu_item 9 "services.tsv reparieren"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2154,6 +2333,7 @@ sm_services() {
       6) test_backends; pause ;;
       7) reload_caddy; pause ;;
       8) show_caddyfile; pause ;;
+      9) repair_services; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2281,19 +2461,23 @@ sm_backup() {
   while true; do
     hmenu_head "Backup & Restore"
     warn "Backups enthalten Secrets (WireGuard Keys, PSK, Cloudflare Token). Nicht unverschluesselt teilen."
+    echo "   Hinweis: Vor jedem Restore wird automatisch ein Pre-Restore-Backup erstellt."
+    line
     menu_item 1 "Backup erstellen"
     menu_item 2 "Backups anzeigen"
-    menu_item 3 "Backup wiederherstellen"
-    menu_item 4 "Backup exportieren"
-    menu_item 5 "Backup loeschen"
+    menu_item 3 "Komplettes Restore (Software + Config)"
+    menu_item 4 "Config Restore (nur Konfiguration)"
+    menu_item 5 "Backup exportieren"
+    menu_item 6 "Backup loeschen"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
       1) backup_create; pause ;;
       2) backup_list; pause ;;
       3) backup_restore; pause ;;
-      4) backup_export_to_path; pause ;;
-      5) backup_delete; pause ;;
+      4) restore_config; pause ;;
+      5) backup_export_to_path; pause ;;
+      6) backup_delete; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2428,6 +2612,8 @@ case "${1:-menu}" in
   fail2ban|f2b) sm_fail2ban ;;
   network|interfaces|net) sm_settings ;;
   backup|restore|backup-menu) sm_backup ;;
+  restore-config) need_root; restore_config ;;
+  repair-services) need_root; repair_services ;;
   update|updates|wartung) sm_updates ;;
   migrate) need_root; homeedge_migrate "${2:-}" ;;
   mtu) need_root; edit_wg_mtu ;;
@@ -2464,5 +2650,5 @@ case "${1:-menu}" in
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|wg-values|add-service|reload|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|wg-values|add-service|reload|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac
