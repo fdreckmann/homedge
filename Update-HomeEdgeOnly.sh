@@ -58,9 +58,41 @@ SSH_ARGS=()
 SSH_ARGS+=("-p" "$SshPortConnect" "${SshUser}@${SshHost}")
 
 EDGECTL_B64="$(b64_file "$EDGECTL_PATH")"
-REMOTE_CMD='tmp=/tmp/homeedge.b64; cat > "$tmp"; chmod 600 "$tmp"; if [ "$(id -u)" -eq 0 ]; then base64 -d "$tmp" > /usr/local/bin/homeedge && chmod +x /usr/local/bin/homeedge && ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl; else sudo bash -c "base64 -d /tmp/homeedge.b64 > /usr/local/bin/homeedge && chmod +x /usr/local/bin/homeedge && ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl"; fi; rm -f "$tmp"; echo "homeedge aktualisiert."; /usr/local/bin/homeedge --version 2>/dev/null || true'
 
-printf '%s' "$EDGECTL_B64" | ssh "${SSH_ARGS[@]}" "$REMOTE_CMD"
+# Remote-Script: ersetzt das Binary und fuehrt danach Migration, Validierung
+# und Healthcheck aus. Bei Fehlern wird ein Rollback-Hinweis ausgegeben.
+RS="$(cat <<'EOS'
+#!/usr/bin/env bash
+set -u
+TS="$(date +%Y%m%d-%H%M%S)"
+FAIL=0
+if [ -f /usr/local/bin/homeedge ]; then cp -a /usr/local/bin/homeedge "/usr/local/bin/homeedge.preupdate.${TS}" 2>/dev/null || true; fi
+printf '%s' "__HOMEEDGE_B64__" | base64 -d > /usr/local/bin/homeedge || { echo "[ERR] Schreiben des Binaries fehlgeschlagen."; exit 1; }
+chmod +x /usr/local/bin/homeedge
+ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl
+echo "[OK] homeedge ersetzt: $(/usr/local/bin/homeedge --version 2>/dev/null)"
+# 1) Pre-Update-Backup (best effort)
+if /usr/local/bin/homeedge backup-create </dev/null >/dev/null 2>&1; then echo "[OK] Pre-Update-Backup erstellt"; else echo "[WARN] Pre-Update-Backup uebersprungen"; fi
+# 3) Migration (Token bereinigen, Defaults, services-Repair, Caddyfile, Fail2ban)
+if /usr/local/bin/homeedge migrate --no-backup; then echo "[OK] Migration ok"; else echo "[ERR] Migration fehlgeschlagen"; FAIL=1; fi
+# 4) services.tsv hart validieren
+if /usr/local/bin/homeedge validate-services; then echo "[OK] services.tsv valide"; else echo "[ERR] services.tsv ungueltig"; FAIL=1; fi
+# 5) Healthcheck
+/usr/local/bin/homeedge health || true
+if [ "$FAIL" -ne 0 ]; then
+  echo "[ERR] Update mit Fehlern abgeschlossen."
+  echo "      Rollback Binary: cp /usr/local/bin/homeedge.preupdate.${TS} /usr/local/bin/homeedge"
+  echo "      Config wiederherstellen: sudo homeedge restore-config"
+  exit 1
+fi
+echo "[OK] Update abgeschlossen."
+EOS
+)"
+RS="${RS//__HOMEEDGE_B64__/$EDGECTL_B64}"
+
+REMOTE_CMD='tmp=/tmp/he-update.sh; cat > "$tmp"; chmod 700 "$tmp"; if [ "$(id -u)" -eq 0 ]; then bash "$tmp"; else sudo bash "$tmp"; fi; rc=$?; rm -f "$tmp"; exit $rc'
+
+printf '%s' "$RS" | ssh "${SSH_ARGS[@]}" "$REMOTE_CMD"
 
 echo
 if yesno "Direkt homeedge-Menue oeffnen?" "y"; then

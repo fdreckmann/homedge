@@ -73,9 +73,11 @@ else
 fi
 
 echo "[3/10] IP Forwarding aktivieren..."
+# Nur IPv4-Forwarding noetig (Backend-Weg laeuft IPv4 ueber WireGuard).
+# IPv6-Forwarding wird NICHT pauschal aktiviert; IPv6 betrifft nur externen
+# Zugriff (Caddy) und braucht kein Forwarding.
 cat >/etc/sysctl.d/99-homeedge.conf <<EOF
 net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
 EOF
 sysctl --system >/dev/null || true
 

@@ -124,6 +124,12 @@ Im Menue unter `Wartung / Updates`:
   ergaenzt (`ENABLE_HTTP3=0`, `WG_MTU=1280`, Fail2ban-Schwellenwerte), die
   Caddyfile neu erzeugt/validiert und ein Healthcheck ausgefuehrt. Bestehende
   Dienste, Zertifikate und WireGuard-Keys bleiben erhalten.
+- Die "Nur HomeEdge aktualisieren"-Skripte (`Update-HomeEdgeOnly.sh/.ps1`)
+  ersetzen das Script, erstellen ein Pre-Update-Backup und fuehren danach
+  Migration, `validate-services` und `health` aus; bei Fehlern wird ein
+  Rollback-Hinweis ausgegeben.
+- Logs (Menue Logs & Diagnose, Diagnosebericht) werden maskiert ausgegeben;
+  ein Caddy-Container im Status "Restarting" gilt als Fehler, nicht als OK.
 
 ## HTTP/3 / QUIC und Firewall
 
