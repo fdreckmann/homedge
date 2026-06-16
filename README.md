@@ -155,9 +155,27 @@ UFW-Regeln
 ```
 
 - Vor kritischen Aenderungen bietet HomeEdge automatisch ein Backup an.
-- Restore warnt deutlich und ueberschreibt die aktuelle Konfiguration.
+- **Restore-Varianten:** "Komplettes Restore" (Software + Config) oder
+  "Config Restore" (nur Konfiguration, Software bleibt). Vor jedem Restore wird
+  automatisch ein Pre-Restore-Backup erstellt.
+- Restore validiert `services.tsv` und die Config, generiert die Caddyfile neu
+  und meldet **keinen** Erfolg, wenn `services.tsv` defekt ist.
+- Vor dem Erstellen eines Backups wird `services.tsv` geprueft; ein defekter
+  Stand wird nur nach Rueckfrage gesichert.
 - **WICHTIG: Backups enthalten Secrets** (WireGuard-Keys, Cloudflare Token).
   Niemals unverschluesselt teilen oder ins Repo legen.
+
+## Dienste-Datei (services.tsv)
+
+- Jeder Dienst ist eine Zeile mit genau 5 Feldern:
+  `domain<TAB>scheme<TAB>ip<TAB>port<TAB>profile`.
+- HomeEdge haengt neue Dienste immer sauber an (Trailing-Newline-Schutz) und
+  validiert die Datei nach jeder Aenderung; bei Fehlern wird zurueckgerollt.
+- Ist die Datei defekt (z. B. verklebte Zeilen aus aelteren Versionen), zeigt
+  `homeedge list-services` einen Fehler. Reparatur:
+  `sudo homeedge repair-services` (sichert die defekte Datei vorher).
+- `homeedge reload` verweigert das Neu-Generieren der Caddyfile bei defekter
+  `services.tsv` und behaelt die letzte funktionierende Version.
 
 ## Fail2ban: IP entbannen
 
