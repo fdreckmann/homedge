@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.6-homeedge"
+APP_VERSION="0.9.7-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -56,6 +56,10 @@ ask_secret() { local p="$1" v; read -rsp "$p: " v; echo >&2; printf '%s' "$v"; }
 sanitize_token() { printf '%s' "${1:-}" | tr -d '\r\n[:space:]'; }
 # Maskiert Cloudflare-Tokens in beliebigen Ausgaben/Logs.
 mask_secrets() { sed -E 's/cfut_[A-Za-z0-9_]+/cfut_***MASKED***/g; s/(CLOUDFLARE_API_TOKEN[=:][[:space:]]*).*/\1***MASKED***/g'; }
+# Robuster Check, ob lokal ein UDP-Port lauscht (ss-Filter statt Spalten-Parsing).
+udp_port_open() { local p="$1"; ss -H -lun "sport = :${p}" 2>/dev/null | grep -q . ; }
+udp443_open() { udp_port_open 443; }
+tcp_port_open() { local p="$1"; ss -H -ltn "sport = :${p}" 2>/dev/null | grep -q . ; }
 yesno() { local p="$1" d="${2:-n}" a; read -rp "$p [$d]: " a; a="${a:-$d}"; [[ "$a" =~ ^([YyJj]|yes|YES|Yes|ja|JA|Ja)$ ]]; }
 q() { printf '%q' "$1"; }
 pause() { echo; read -rp "Enter druecken zum Fortfahren..."; }
@@ -77,8 +81,12 @@ load_env() {
   WG_MTU="${WG_MTU:-1280}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
+    # Tolerant gegen kaputte Zeilen (z. B. fehlerhaft gespeicherter, mehrzeiliger
+    # Token): || true verhindert errexit-Abbruch waehrend des Sourcens.
     # shellcheck disable=SC1090
-    source "$ENV_FILE"
+    source "$ENV_FILE" 2>/dev/null || true
+    # Token defensiv bereinigen, falls beschaedigt eingelesen.
+    CLOUDFLARE_API_TOKEN="$(sanitize_token "${CLOUDFLARE_API_TOKEN:-}")"
     # Neue Variablen, die in aelteren Env-Dateien fehlen koennen, absichern:
     ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
@@ -211,7 +219,7 @@ UniFi Firewall-Regeln:
 Erlaube von ${VPS_WG_IP} zu deinen Backend-Diensten:
 EOVAL
   if [[ -f "$SERVICES_FILE" ]]; then
-    while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do [[ -z "${domain:-}" ]] && continue; echo "  ${VPS_WG_IP} -> ${ip}:${port}/tcp  (${domain})" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"; done < "$SERVICES_FILE"
+    while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do [[ -z "${domain:-}" ]] && continue; echo "  ${VPS_WG_IP} -> ${ip}:${port}/tcp  (${domain})" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"; done < "$SERVICES_FILE"
   fi
   cat >> "${EDGE_DIR}/unifi-wireguard-werte.txt" <<EOVAL
 
@@ -331,54 +339,6 @@ toggle_psk() {
   fi
 }
 
-wg_submenu() {
-  need_root
-  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
-  while true; do
-    load_env
-    menu_head "HomeEdge - WireGuard konfigurieren"
-    printf '  %bInterface%b: %s    %bPort%b: %s/udp\n' "$C_CYAN" "$C_RESET" "$WG_IF" "$C_CYAN" "$C_RESET" "$WG_PORT"
-    printf '  %bVPS%b:       %s    %bClient%b: %s\n' "$C_CYAN" "$C_RESET" "$VPS_WG_ADDR" "$C_CYAN" "$C_RESET" "$CLIENT_WG_ADDR"
-    printf '  %bBackend-Netze%b: %s\n' "$C_CYAN" "$C_RESET" "$HOME_SUBNET"
-    printf '  %bUniFi PublicKey%b: %s    %bPSK%b: %s\n' "$C_CYAN" "$C_RESET" "$([[ -n "${CLIENT_PUBLIC_KEY:-}" ]] && echo gesetzt || echo fehlt)" "$C_CYAN" "$C_RESET" "$([[ "$USE_PSK" == "1" ]] && echo aktiv || echo aus)"
-    line
-    menu_item 1 "WireGuard/UniFi Werte anzeigen"
-    menu_item 2 "WireGuard Status anzeigen"
-    menu_item 3 "UniFi PublicKey setzen/aendern"
-    menu_item 4 "WG Interface-Name aendern"
-    menu_item 5 "WG UDP-Port aendern"
-    menu_item 6 "VPS WG-Adresse aendern"
-    menu_item 7 "UniFi/Client WG-Adresse aendern"
-    menu_item 8 "Backend-Netze hinter UniFi aendern"
-    menu_item 9 "PresharedKey an/aus"
-    menu_item 10 "PresharedKey neu erzeugen"
-    menu_item 11 "VPS WireGuard Keys neu erzeugen"
-    menu_item 12 "WG-Konfig neu schreiben + Dienst neu starten"
-    menu_item 13 "WG-Konfig anzeigen, Secrets maskiert"
-    menu_item 14 "Backends testen"
-    menu_item 0 "Zurueck"
-    line
-    read -rp "Auswahl: " choice
-    case "$choice" in
-      1) wg_values; pause ;;
-      2) wg_status; pause ;;
-      3) set_wg_key; pause ;;
-      4) edit_wg_interface; pause ;;
-      5) edit_wg_port; pause ;;
-      6) edit_vps_wg_addr; pause ;;
-      7) edit_client_wg_addr; pause ;;
-      8) edit_backend_networks; pause ;;
-      9) toggle_psk; pause ;;
-      10) regenerate_psk; restart_wg; pause ;;
-      11) regenerate_server_keys; restart_wg; pause ;;
-      12) write_wg_config; write_unifi_values; restart_wg; ok "WireGuard-Konfig neu geschrieben."; pause ;;
-      13) show_wg_config; pause ;;
-      14) test_backends; pause ;;
-      0) return ;;
-      *) err "Ungueltige Auswahl."; sleep 1 ;;
-    esac
-  done
-}
 
 # ------------------------------------------------------------
 # Caddy / Fail2ban / Services
@@ -517,7 +477,7 @@ wait_for_certs() {
   info "Pruefe Zertifikate lokal per SNI (bis zu 120s, DNS-01 kann dauern)..."
   while :; do
     pending=0
-    while IFS=$'\t' read -r domain _s _i _p || [[ -n "$domain" ]]; do
+    while IFS=$'\t' read -r domain _s _i _p _pr || [[ -n "$domain" ]]; do
       [[ -z "$domain" ]] && continue
       cert_ready "$domain" || pending=$((pending+1))
     done < "$SERVICES_FILE"
@@ -525,7 +485,7 @@ wait_for_certs() {
     (( SECONDS >= deadline )) && break
     sleep 5
   done
-  while IFS=$'\t' read -r domain _s _i _p || [[ -n "$domain" ]]; do
+  while IFS=$'\t' read -r domain _s _i _p _pr || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     if cert_ready "$domain"; then
       ok "Zertifikat aktiv (SNI ok): ${domain}"
@@ -535,63 +495,63 @@ wait_for_certs() {
   done < "$SERVICES_FILE"
 }
 
-reload_caddy() {
+# Schreibt Stack, generiert das Caddyfile atomar aus der Service-Liste, prueft
+# Vollstaendigkeit und validiert. 0 = ok (neues Caddyfile aktiv), 1 = Fehler
+# (auf vorherige Version zurueckgerollt, nichts kaputt).
+_caddy_prepare_config() {
   load_env
-  section "Caddy neu laden"
   write_caddy_stack
   mkdir -p "$CADDY_DIR"
   local cf="${CADDY_DIR}/Caddyfile" tmp="${CADDY_DIR}/.Caddyfile.new" bak="${CADDY_DIR}/.Caddyfile.bak"
-
-  # Caddyfile IMMER komplett aus der Service-Liste neu erzeugen.
   generate_caddyfile_to "$tmp"
-
-  # Sync-Check: jede Domain aus der Service-Liste muss enthalten sein.
-  local missing=0 d _s _i _p
+  local missing=0 d _s _i _p _pr
   if [[ -s "$SERVICES_FILE" ]]; then
-    while IFS=$'\t' read -r d _s _i _p || [[ -n "$d" ]]; do
+    while IFS=$'\t' read -r d _s _i _p _pr || [[ -n "$d" ]]; do
       [[ -z "$d" ]] && continue
       grep -q "^${d//./\\.} {" "$tmp" || { err "Domain fehlt im generierten Caddyfile: $d"; missing=1; }
     done < "$SERVICES_FILE"
   fi
   if (( missing )); then rm -f "$tmp"; err "Abbruch: Caddyfile unvollstaendig, nichts geaendert."; return 1; fi
-
-  # atomar einsetzen (vorherige Version sichern)
   [[ -f "$cf" ]] && cp -a "$cf" "$bak" 2>/dev/null || true
   mv "$tmp" "$cf"
   ok "Caddyfile generiert (alle Dienste enthalten)"
-
-  # validieren
   if validate_caddyfile; then
-    ok "Config validiert"
+    ok "Config validiert"; rm -f "$bak"; return 0
   else
     err "Caddyfile ungueltig - vorherige Version wird wiederhergestellt."
     [[ -f "$bak" ]] && mv "$bak" "$cf"
     return 1
   fi
+}
 
-  # anwenden
+reload_caddy() {
+  section "Caddy neu laden"
+  _caddy_prepare_config || return 1
   cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
     docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || docker compose up -d >/dev/null 2>&1
   else
     docker compose build >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1
   fi
-
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
-    ok "Container laeuft"
-  else
-    err "Container laeuft nicht"
-    rm -f "$bak"
-    return 1
-  fi
-  rm -f "$bak"
-
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
   wait_for_certs
   echo
   info "Test einer Domain: sudo homeedge test-domain DEINE.DOMAIN"
 }
 
-restart_caddy() { load_env; write_caddy_stack; generate_caddyfile; cd "$CADDY_DIR"; docker compose build; docker compose up -d; }
+# Wie reload, aber baut das Image neu (build) - mit gleicher Validierung/Rollback.
+restart_caddy() {
+  section "Caddy neu starten / neu bauen"
+  _caddy_prepare_config || return 1
+  cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
+  if docker compose build >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1; then
+    :
+  else
+    err "Caddy-Build/Start fehlgeschlagen."; return 1
+  fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
+  wait_for_certs
+}
 
 install_fail2ban() {
   load_env; mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
@@ -853,36 +813,6 @@ f2b_just_restart() {
   fail2ban-client status || true
 }
 
-fail2ban_submenu() {
-  need_root
-  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
-  while true; do
-    menu_head "HomeEdge - Fail2ban verwalten"
-    menu_item 1 "Status anzeigen"
-    menu_item 2 "Gebannte IPs anzeigen"
-    menu_item 3 "IP aus Liste auswaehlen und entbannen"
-    menu_item 4 "IP manuell entbannen"
-    menu_item 5 "Fail2ban-Logs anzeigen"
-    menu_item 6 "Filter testen"
-    menu_item 7 "Fail2ban neu konfigurieren"
-    menu_item 8 "Fail2ban neu starten"
-    menu_item 0 "Zurueck"
-    line
-    read -rp "Auswahl: " choice
-    case "$choice" in
-      1) f2b_status_overview; pause ;;
-      2) f2b_show_banned_ips; pause ;;
-      3) f2b_unban_select; pause ;;
-      4) f2b_unban_manual; pause ;;
-      5) f2b_show_log ;;
-      6) f2b_test_filter; pause ;;
-      7) f2b_reconfigure; pause ;;
-      8) f2b_just_restart; pause ;;
-      0) return ;;
-      *) err "Ungueltige Auswahl."; sleep 1 ;;
-    esac
-  done
-}
 
 apply_firewall() {
   load_env
@@ -916,6 +846,19 @@ ufw_sync() {
   else
     ufw delete allow "443/udp" >/dev/null 2>&1 && ok "443/udp entfernt (HTTP/3 aus)" || ok "443/udp war nicht offen"
   fi
+}
+
+# Nicht-interaktive, additive UFW-Angleichung an die Konfig (kein reset -> kein Lockout).
+ufw_apply_auto() {
+  load_env
+  command -v ufw >/dev/null 2>&1 || return 0
+  local cur; cur="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
+  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+  [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]] && ufw allow "${cur}/tcp" >/dev/null 2>&1 || true
+  ufw allow "443/tcp" >/dev/null 2>&1 || true
+  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow "443/udp" >/dev/null 2>&1 || true; else ufw delete allow "443/udp" >/dev/null 2>&1 || true; fi
+  ok "UFW an Konfiguration angeglichen (HTTP/3=${ENABLE_HTTP3})."
 }
 
 show_values() {
@@ -1021,7 +964,7 @@ edit_settings() {
 test_backends() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
   section "Backend-Test"
-  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
+  while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue; printf '%b\n' "${C_BOLD}${domain}${C_RESET} -> ${scheme}://${ip}:${port}"
     if [[ "$scheme" == "https" ]]; then curl -k -I --connect-timeout 5 "https://${ip}:${port}" || true; else curl -I --connect-timeout 5 "http://${ip}:${port}" || true; fi; echo
   done < "$SERVICES_FILE"
@@ -1046,7 +989,7 @@ domains_status() {
   local expect="${VPS_PUBLIC_HOST:-}"
   echo "Erwartete VPS-IP/Host: ${expect:-unbekannt}"
   local domain scheme ip port a aaaa
-  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
+  while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
     aaaa="$(dig +short AAAA "$domain" 2>/dev/null | tail -n1 || true)"
@@ -1337,32 +1280,6 @@ backup_export_to_path() {
   warn "Datei enthaelt Secrets. Sicher speichern."
 }
 
-backup_submenu() {
-  need_root
-  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
-  while true; do
-    menu_head "HomeEdge - Backup / Restore"
-    menu_item 1 "Backup jetzt erstellen"
-    menu_item 2 "Backups anzeigen"
-    menu_item 3 "Backup-Inhalt anzeigen"
-    menu_item 4 "Backup wiederherstellen"
-    menu_item 5 "Backup exportieren/kopieren"
-    menu_item 6 "Backup loeschen"
-    menu_item 0 "Zurueck"
-    line
-    read -rp "Auswahl: " choice
-    case "$choice" in
-      1) backup_create; pause ;;
-      2) backup_list; pause ;;
-      3) backup_show_content; pause ;;
-      4) backup_restore; pause ;;
-      5) backup_export_to_path; pause ;;
-      6) backup_delete; pause ;;
-      0) return ;;
-      *) err "Ungueltige Auswahl."; sleep 1 ;;
-    esac
-  done
-}
 
 # ------------------------------------------------------------
 # Netzwerk / Interfaces
@@ -1458,39 +1375,8 @@ select_ext_interface() {
   ok "Externes Interface gespeichert: ${EXT_IF}"
 }
 
-network_submenu() {
-  need_root
-  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
-  while true; do
-    load_env
-    menu_head "HomeEdge - Netzwerk / Interfaces"
-    local def src
-    def="$(default_interface)"; src="$(default_source_ip)"
-    printf '  %bAktuelles EXT_IF%b: %s\n' "$C_CYAN" "$C_RESET" "${EXT_IF:-<leer>}"
-    printf '  %bDefault-Interface%b: %s\n' "$C_CYAN" "$C_RESET" "${def:-<keins>}"
-    printf '  %bSource-IP Internet%b: %s\n' "$C_CYAN" "$C_RESET" "${src:-<keine>}"
-    line
-    menu_item 1 "Netzwerkadapter mit IPs anzeigen"
-    menu_item 2 "Externes Interface aus Liste auswaehlen"
-    menu_item 3 "Default-Route anzeigen"
-    menu_item 4 "IP-Adressen kompakt anzeigen"
-    menu_item 5 "Route zu 1.1.1.1 testen"
-    menu_item 0 "Zurueck"
-    line
-    read -rp "Auswahl: " choice
-    case "$choice" in
-      1) show_network_interfaces; pause ;;
-      2) select_ext_interface; pause ;;
-      3) section "Default-Route"; ip route show default || true; pause ;;
-      4) section "IP-Adressen"; ip -br addr; pause ;;
-      5) section "Route-Test"; ip route get 1.1.1.1 || true; pause ;;
-      0) return ;;
-      *) err "Ungueltige Auswahl."; sleep 1 ;;
-    esac
-  done
-}
 
-apply_all() { need_root; generate_keys; write_wg_config; write_unifi_values; reload_caddy; install_fail2ban; restart_wg; }
+apply_all() { need_root; generate_keys; write_wg_config; write_unifi_values; reload_caddy; install_fail2ban; restart_wg; ufw_apply_auto; }
 
 # ------------------------------------------------------------
 # Ampel / Health checks
@@ -1544,7 +1430,7 @@ check_certs() {
     return 1
   fi
 
-  while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
+  while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue
     _tls_check_one "$domain"
   done < "$SERVICES_FILE"
@@ -1609,7 +1495,7 @@ health_check() {
 
   if [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]]; then
     local domain scheme ip port route code rc url tmp msg dns
-    while IFS=$'\t' read -r domain scheme ip port || [[ -n "$domain" ]]; do
+    while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
       [[ -z "${domain:-}" ]] && continue
 
       route="$(ip route get "$ip" 2>/dev/null || true)"
@@ -1666,8 +1552,8 @@ security_ports() {
   ss -tulpn || true
   echo
   info "Erwartet: TCP ${SSH_PORT} (SSH), TCP 443 (HTTPS), UDP ${WG_PORT} (WireGuard)."
-  info "127.0.0.1:2019 ist Caddy Admin API nur lokal und von außen nicht erreichbar. Das ist ok."
-  if ss -u -lpnH 2>/dev/null | awk '{print $5}' | grep -qE '(^|:)443$'; then
+  info "127.0.0.1:2019 ist Caddy Admin API nur lokal und von aussen nicht erreichbar. Das ist ok."
+  if udp443_open; then
     warn "UDP 443 ist Caddy HTTP/3/QUIC. Nicht schlimm, aber optional. Fuer minimalen Footprint kannst du HTTP/3 deaktivieren."
   else
     ok "UDP 443 ist nicht offen. Caddy laeuft nur mit HTTP/1.1 und HTTP/2."
@@ -1735,7 +1621,7 @@ security_http3_toggle() {
   section "UFW Status"
   ufw status verbose 2>/dev/null | grep -E '443|Status' || true
   echo
-  if ss -u -lnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)443$'; then info "UDP 443 ist offen."; else info "UDP 443 ist geschlossen."; fi
+  if udp443_open; then info "UDP 443 ist offen."; else info "UDP 443 ist geschlossen."; fi
 }
 
 security_minimal_check() {
@@ -1749,12 +1635,12 @@ security_minimal_check() {
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; bad=$((bad+1)); fi
   if ip link show "$WG_IF" >/dev/null 2>&1; then ok "WireGuard Interface ${WG_IF} vorhanden"; else err "WireGuard Interface fehlt"; bad=$((bad+1)); fi
 
-  if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${SSH_PORT}$"; then ok "SSH Port ${SSH_PORT}/tcp offen"; else warn "SSH Port ${SSH_PORT}/tcp nicht sichtbar"; warnc=$((warnc+1)); fi
-  if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)443$'; then ok "HTTPS 443/tcp offen"; else err "HTTPS 443/tcp nicht offen"; bad=$((bad+1)); fi
-  if ss -ulnH 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${WG_PORT}$"; then ok "WireGuard ${WG_PORT}/udp offen"; else err "WireGuard ${WG_PORT}/udp nicht offen"; bad=$((bad+1)); fi
+  if tcp_port_open "${SSH_PORT}"; then ok "SSH Port ${SSH_PORT}/tcp offen"; else warn "SSH Port ${SSH_PORT}/tcp nicht sichtbar"; warnc=$((warnc+1)); fi
+  if tcp_port_open 443; then ok "HTTPS 443/tcp offen"; else err "HTTPS 443/tcp nicht offen"; bad=$((bad+1)); fi
+  if udp_port_open "${WG_PORT}"; then ok "WireGuard ${WG_PORT}/udp offen"; else err "WireGuard ${WG_PORT}/udp nicht offen"; bad=$((bad+1)); fi
 
-  if ss -u -lpnH 2>/dev/null | awk '{print $5}' | grep -qE '(^|:)443$'; then
-    if [[ "${ENABLE_HTTP3:-1}" == "1" ]]; then warn "UDP 443 offen wegen HTTP/3/QUIC (optional)"; warnc=$((warnc+1)); else warn "UDP 443 offen, obwohl HTTP/3 deaktiviert sein sollte"; warnc=$((warnc+1)); fi
+  if udp443_open; then
+    if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then warn "UDP 443 offen wegen HTTP/3/QUIC (optional)"; warnc=$((warnc+1)); else warn "UDP 443 offen, obwohl HTTP/3 deaktiviert sein sollte"; warnc=$((warnc+1)); fi
   else
     ok "UDP 443 nicht offen"
   fi
@@ -1800,38 +1686,6 @@ EOF
 
 security_wireguard() { load_env; wg_status; }
 
-security_submenu() {
-  need_root
-  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
-  while true; do
-    menu_head "HomeEdge - Sicherheitsmenue"
-    menu_item 1 "Ampel-Check komplett"
-    menu_item 2 "Offene Ports anzeigen und bewerten"
-    menu_item 3 "UFW Status anzeigen"
-    menu_item 4 "SSH-Hardening pruefen"
-    menu_item 5 "Fail2ban pruefen"
-    menu_item 6 "Caddy / Zertifikate pruefen"
-    menu_item 7 "WireGuard pruefen"
-    menu_item 8 "HTTP/3 UDP 443 aktivieren/deaktivieren"
-    menu_item 9 "Jellyfin/UniFi Sicherheitscheckliste"
-    menu_item 0 "Zurueck"
-    line
-    read -rp "Auswahl: " choice
-    case "$choice" in
-      1) health_check; pause ;;
-      2) security_ports; pause ;;
-      3) security_firewall; pause ;;
-      4) security_ssh_status; pause ;;
-      5) security_fail2ban; pause ;;
-      6) check_certs; pause ;;
-      7) security_wireguard; pause ;;
-      8) security_http3_toggle; pause ;;
-      9) security_jellyfin_checklist; pause ;;
-      0) return ;;
-      *) err "Ungueltige Auswahl."; sleep 1 ;;
-    esac
-  done
-}
 
 # ------------------------------------------------------------
 # Wartung / Updates
@@ -1938,7 +1792,7 @@ homeedge_migrate() {
   # Fail2ban mit Config-Test.
   command -v fail2ban-client >/dev/null 2>&1 && install_fail2ban || true
   # UFW an HTTP/3 angleichen (nicht-interaktiv, ohne Reset).
-  ufw_sync || true
+  ufw_apply_auto || true
   echo
   info "Healthcheck:"
   health_check || true
@@ -2072,38 +1926,6 @@ maybe_backup_before_change() {
   esac
 }
 
-updates_submenu() {
-  need_root
-  set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
-  while true; do
-    menu_head "HomeEdge - Wartung / Updates"
-    menu_item 1 "HomeEdge-Version anzeigen"
-    menu_item 2 "Nach Update suchen"
-    menu_item 3 "HomeEdge aus GitHub aktualisieren (empfohlen)"
-    menu_item 4 "Caddy/Docker neu bauen und aktualisieren"
-    menu_item 5 "Systemupdates installieren"
-    menu_item 6 "Backup vor Update erstellen"
-    menu_item 7 "Rollback auf letztes Backup"
-    menu_item 8 "Update-Quelle (Repo/Branch) konfigurieren"
-    menu_item 9 "Update von fester URL (Release-Asset)"
-    menu_item 0 "Zurueck"
-    line
-    read -rp "Auswahl: " choice
-    case "$choice" in
-      1) show_version; pause ;;
-      2) check_for_update; pause ;;
-      3) homeedge_repo_update; pause ;;
-      4) caddy_update; pause ;;
-      5) system_update; pause ;;
-      6) backup_create; pause ;;
-      7) homeedge_rollback; pause ;;
-      8) configure_repo_source; pause ;;
-      9) homeedge_self_update; pause ;;
-      0) return ;;
-      *) err "Ungueltige Auswahl."; sleep 1 ;;
-    esac
-  done
-}
 
 # ------------------------------------------------------------
 # Strukturiertes Menue (Breadcrumb, ASCII-only)
@@ -2192,17 +2014,30 @@ diag_report() {
   section "Diagnosebericht erstellen"
   local f="${EDGE_DIR}/diagnose-$(date +%Y%m%d-%H%M%S).txt"
   {
-    echo "HomeEdge Diagnose $(date -Is)"; echo "Version: ${APP_VERSION}"; echo
+    echo "HomeEdge Diagnose $(date -Is)"
+    echo "Version: ${APP_VERSION}"
+    echo "Host: $(hostname)   Kernel: $(uname -r)"
+    [[ -r /etc/os-release ]] && { . /etc/os-release 2>/dev/null; echo "OS: ${PRETTY_NAME:-unbekannt}"; }
+    echo "Update-Repo: ${HOMEEDGE_REPO}@${HOMEEDGE_BRANCH}"
+    echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  BACKUP_BEHAVIOR=${BACKUP_BEHAVIOR}  EXPERT_MODE=${EXPERT_MODE}"
+    echo
     echo "## Werte"; show_values
     echo; echo "## Domains/DNS"; domains_status
-    echo; echo "## Docker"; docker ps 2>/dev/null
+    echo; echo "## Offene Ports (ss -tulpn)"; ss -tulpn 2>/dev/null
+    echo; echo "## Docker"; docker ps -a 2>/dev/null
     echo; echo "## WireGuard"; wg show 2>/dev/null
+    echo; echo "## WireGuard Konfig (/etc/wireguard)"; ls -l /etc/wireguard 2>/dev/null; grep -RnE '^(Address|ListenPort|MTU|AllowedIPs|PersistentKeepalive)' /etc/wireguard 2>/dev/null
+    echo; echo "## Routen"; ip route 2>/dev/null
     echo; echo "## UFW"; ufw status verbose 2>/dev/null
-    echo; echo "## Fail2ban"; fail2ban-client status 2>/dev/null
-    echo; echo "## Caddy Logs (tail)"; docker logs --tail 50 caddy-edge 2>/dev/null
+    echo; echo "## Fail2ban"; fail2ban-client status 2>/dev/null; for j in sshd caddy-auth; do echo "- jail $j:"; fail2ban-client status "$j" 2>/dev/null; done
+    echo; echo "## Caddyfile"; [[ -f "${CADDY_DIR}/Caddyfile" ]] && cat "${CADDY_DIR}/Caddyfile"
+    echo; echo "## Zertifikate (lokaler SNI-Check)"; check_certs 2>/dev/null
+    echo; echo "## Speicher/Disk"; free -h 2>/dev/null; echo; df -h / 2>/dev/null
+    echo; echo "## Caddy Logs (tail)"; docker logs --tail 80 caddy-edge 2>/dev/null
   } 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | mask_secrets > "$f"
   chmod 600 "$f"
   ok "Diagnosebericht gespeichert: $f (Secrets maskiert)."
+  warn "Bericht kann WireGuard-PublicKeys/IPs enthalten - vor Weitergabe pruefen."
 }
 show_last_error() {
   section "Letzte Fehler"
@@ -2566,9 +2401,9 @@ case "${1:-menu}" in
   health|ampel) health_check ;;
   usage|auslastung) system_usage ;;
   fail2ban|f2b) sm_fail2ban ;;
-  network|interfaces|net) network_submenu ;;
-  backup|restore|backup-menu) backup_submenu ;;
-  update|updates|wartung) updates_submenu ;;
+  network|interfaces|net) sm_settings ;;
+  backup|restore|backup-menu) sm_backup ;;
+  update|updates|wartung) sm_updates ;;
   migrate) need_root; homeedge_migrate "${2:-}" ;;
   mtu) need_root; edit_wg_mtu ;;
   self-update|update-repo|repo-update) need_root; homeedge_repo_update ;;
@@ -2582,14 +2417,14 @@ case "${1:-menu}" in
   select-interface) select_ext_interface ;;
   f2b-status) f2b_status_overview ;;
   f2b-banned) f2b_show_banned_ips ;;
-  security|sec) security_submenu ;;
+  security|sec) sm_security ;;
   security-check|minimal-check) security_minimal_check ;;
   ports) security_ports ;;
   certs|cert-check) check_certs ;;
   test-domain) test_domain "${2:-}" ;;
   domains|dns) domains_status ;;
   set-token|cf-token) need_root; change_cloudflare_token ;;
-  wg-menu) wg_submenu ;;
+  wg-menu) sm_wg ;;
   wg-values) wg_values ;;
   wg-status) wg_status ;;
   set-wg-public-key) set_wg_key ;;

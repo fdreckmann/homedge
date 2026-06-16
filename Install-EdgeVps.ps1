@@ -2,11 +2,11 @@
 # Starten mit:
 # powershell -ExecutionPolicy Bypass -File .\Install-EdgeVps.ps1
 #
-# Dieses Script läuft lokal auf Windows und installiert per SSH den Edge-VPS.
+# Dieses Script laeuft lokal auf Windows und installiert per SSH den Edge-VPS.
 # Es nutzt die Dateien homeedge.sh und remote-bootstrap.template.sh aus demselben Ordner.
 #
 # Neu: Eingaben werden lokal in Install-EdgeVps.config.json gespeichert.
-# Beim nächsten Start fragt das Script, ob diese Werte wiederverwendet werden sollen.
+# Beim naechsten Start fragt das Script, ob diese Werte wiederverwendet werden sollen.
 
 param(
     [string]$ConfigPath = ""
@@ -219,7 +219,7 @@ if (Test-Path $ConfigPath) {
     if (Ask-YesNo "Diese Werte als Vorschlag verwenden?" "y") {
         $LoadedConfig = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         $UseLoadedConfig = $true
-        Write-Host "Config geladen. Alle Werte können trotzdem überschrieben werden."
+        Write-Host "Config geladen. Alle Werte koennen trotzdem ueberschrieben werden."
     }
 }
 
@@ -303,7 +303,8 @@ if ($null -ne $LoadedConfig -and $LoadedConfig.PSObject.Properties.Name -contain
     if (Ask-YesNo "Gespeicherte Dienste verwenden?" "y") {
         $UseSavedServices = $true
         foreach ($svc in $LoadedConfig.Services) {
-            $ServiceLines += "$($svc.Domain)`t$($svc.Scheme)`t$($svc.BackendIp)`t$($svc.BackendPort)"
+            $prof = if ($svc.PSObject.Properties.Name -contains "Profile" -and $svc.Profile) { $svc.Profile } else { "standard" }
+            $ServiceLines += "$($svc.Domain)`t$($svc.Scheme)`t$($svc.BackendIp)`t$($svc.BackendPort)`t$prof"
         }
     }
 }
@@ -319,7 +320,10 @@ if (-not $UseSavedServices) {
         $s = Ask "Backend Scheme http/https" "http"
         $ip = Ask "Backend IP im Heimnetz"
         $p = Ask "Backend Port"
-        $ServiceLines += "$d`t$s`t$ip`t$p"
+        Write-Host "Backend-Profil: 1) Standard  2) Jellyfin  3) Jellyseerr"
+        $prc = Ask "Profil" "1"
+        $prof = switch ($prc) { "2" { "jellyfin" } "3" { "jellyseerr" } default { "standard" } }
+        $ServiceLines += "$d`t$s`t$ip`t$p`t$prof"
     }
 }
 
@@ -398,6 +402,7 @@ if (Ask-YesNo "Eingaben lokal als Config fuer naechstes Mal speichern/aktualisie
                 Scheme = $parts[1]
                 BackendIp = $parts[2]
                 BackendPort = $parts[3]
+                Profile = if ($parts.Count -ge 5) { $parts[4] } else { "standard" }
             }
         }
     }
@@ -485,7 +490,7 @@ $sshArgs += @("-p", $SshPortConnect, "$SshUser@$SshHost")
 
 Write-Host ""
 Write-Host "Verbinde per SSH und starte Installation..."
-Write-Host "Die Ausgabe wird hier angezeigt und zusätzlich auf dem VPS nach /root/edge-install.log geschrieben."
+Write-Host "Die Ausgabe wird hier angezeigt und zusaetzlich auf dem VPS nach /root/edge-install.log geschrieben."
 Write-Host ""
 
 $RemoteScript | & ssh @sshArgs "cat >/tmp/edge-bootstrap.sh && chmod +x /tmp/edge-bootstrap.sh && bash -lc 'set -o pipefail; /tmp/edge-bootstrap.sh 2>&1 | tee /root/edge-install.log'"

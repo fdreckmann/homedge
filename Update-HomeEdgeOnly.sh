@@ -63,6 +63,6 @@ REMOTE_CMD='tmp=/tmp/homeedge.b64; cat > "$tmp"; chmod 600 "$tmp"; if [ "$(id -u
 printf '%s' "$EDGECTL_B64" | ssh "${SSH_ARGS[@]}" "$REMOTE_CMD"
 
 echo
-if yesno "Direkt homeedge-Menü öffnen?" "y"; then
+if yesno "Direkt homeedge-Menue oeffnen?" "y"; then
   ssh -t "${SSH_ARGS[@]}" "sudo homeedge menu"
 fi

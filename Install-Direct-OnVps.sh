@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Install-Direct-OnVps.sh
-# Direkt auf dem VPS ausführen.
+# Direkt auf dem VPS ausfuehren.
 # Voraussetzungen: Dieses Script liegt im gleichen Ordner wie homeedge.sh und remote-bootstrap.template.sh
 # Start:
 #   sudo bash Install-Direct-OnVps.sh
@@ -13,7 +13,7 @@ HOMEEDGE_PATH="${SCRIPT_DIR}/homeedge.sh"
 BOOTSTRAP_TEMPLATE="${SCRIPT_DIR}/remote-bootstrap.template.sh"
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "Bitte direkt auf dem VPS als root ausführen: sudo bash Install-Direct-OnVps.sh"
+  echo "Bitte direkt auf dem VPS als root ausfuehren: sudo bash Install-Direct-OnVps.sh"
   exit 1
 fi
 
@@ -161,7 +161,7 @@ cat <<'EOF'
 ============================================================
  HomeEdge Direkt-Installer
 ============================================================
-Dieses Script läuft direkt auf dem VPS.
+Dieses Script laeuft direkt auf dem VPS.
 Es installiert WireGuard, Caddy, Docker, Fail2ban, UFW und homeedge.
 ============================================================
 EOF
@@ -238,7 +238,10 @@ else
     s="$(ask "Backend Scheme http/https" "http")"
     ip="$(ask "Backend IP im Heimnetz")"
     p="$(ask "Backend Port")"
-    ServicesTsv+="${d}"$'\t'"${s}"$'\t'"${ip}"$'\t'"${p}"$'\n'
+    echo "Backend-Profil: 1) Standard  2) Jellyfin  3) Jellyseerr"
+    pr="$(ask "Profil" "1")"
+    case "$pr" in 2) pr=jellyfin;; 3) pr=jellyseerr;; *) pr=standard;; esac
+    ServicesTsv+="${d}"$'\t'"${s}"$'\t'"${ip}"$'\t'"${p}"$'\t'"${pr}"$'\n'
   done
 fi
 
@@ -248,7 +251,7 @@ AdminPubKey=""
 if yesno "Optional: Admin-User mit SSH-Key erstellen und Root/Password-SSH deaktivieren?" "$([[ "$CreateAdmin" == "1" ]] && echo y || echo n)"; then
   CreateAdmin="1"
   AdminUser="$(ask "Neuer Admin-User" "$AdminUser")"
-  echo "Public Key einfügen, z. B. ssh-ed25519 AAAA... user@pc"
+  echo "Public Key einfuegen, z. B. ssh-ed25519 AAAA... user@pc"
   AdminPubKey="$(ask "Public Key")"
 else
   CreateAdmin="0"
@@ -345,4 +348,4 @@ chmod +x /tmp/edge-bootstrap-direct.sh
 bash -lc '/tmp/edge-bootstrap-direct.sh 2>&1 | tee /root/edge-install.log'
 
 echo
-echo "Fertig. Menü starten mit: sudo homeedge menu"
+echo "Fertig. Menue starten mit: sudo homeedge menu"
