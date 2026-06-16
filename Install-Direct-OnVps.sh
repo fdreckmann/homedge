@@ -135,6 +135,7 @@ HomeSubnet=$(printf '%q' "$HomeSubnet")
 AcmeEmail=$(printf '%q' "$AcmeEmail")
 UsePsk=$(printf '%q' "$UsePsk")
 EnableCaddyFail2ban=$(printf '%q' "$EnableCaddyFail2ban")
+EnableHttp3=$(printf '%q' "${EnableHttp3:-0}")
 ClientPublicKey=$(printf '%q' "$ClientPublicKey")
 SwapMb=$(printf '%q' "$SwapMb")
 CreateAdmin=$(printf '%q' "$CreateAdmin")
@@ -219,6 +220,12 @@ echo "Schuetzt gegen viele fehlerhafte Login-/Auth-Versuche (401/403)."
 echo "Gebannte IPs koennen spaeter im HomeEdge-Menue wieder entbannt werden."
 EnableCaddyFail2ban="$(cfg_get EnableCaddyFail2ban 1)"
 if yesno "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" "$([[ "$EnableCaddyFail2ban" == "0" ]] && echo n || echo y)"; then EnableCaddyFail2ban="1"; else EnableCaddyFail2ban="0"; fi
+
+echo
+echo "HTTP/3 / QUIC nutzt zusaetzlich UDP 443. Fuer Jellyfin erstmal AUS empfohlen."
+echo "Kann spaeter im Menue aktiviert werden."
+EnableHttp3="$(cfg_get EnableHttp3 0)"
+if yesno "HTTP/3 / QUIC aktivieren?" "$([[ "$EnableHttp3" == "1" ]] && echo y || echo n)"; then EnableHttp3="1"; else EnableHttp3="0"; fi
 
 ClientPublicKey="$(ask "UniFi/Client WireGuard PublicKey optional" "$(cfg_get ClientPublicKey '')")"
 SwapMb="$(ask "Swap Groesse in MB" "$(cfg_get SwapMb 2048)")"
@@ -335,6 +342,7 @@ replace_token "__ACME_EMAIL_B64__" "$(b64 "$AcmeEmail")"
 replace_token "__CF_TOKEN_B64__" "$(b64 "$CfToken")"
 replace_token "__USE_PSK_B64__" "$(b64 "$UsePsk")"
 replace_token "__CADDY_FAIL2BAN_B64__" "$(b64 "$EnableCaddyFail2ban")"
+replace_token "__ENABLE_HTTP3_B64__" "$(b64 "${EnableHttp3:-0}")"
 replace_token "__CLIENT_PUBLIC_KEY_B64__" "$(b64 "$ClientPublicKey")"
 replace_token "__SERVICES_TSV_B64__" "$(b64 "$ServicesTsv")"
 replace_token "__SWAP_MB_B64__" "$(b64 "$SwapMb")"

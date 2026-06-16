@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.7-homeedge"
+APP_VERSION="0.9.8-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -64,6 +64,29 @@ yesno() { local p="$1" d="${2:-n}" a; read -rp "$p [$d]: " a; a="${a:-$d}"; [[ "
 q() { printf '%q' "$1"; }
 pause() { echo; read -rp "Enter druecken zum Fortfahren..."; }
 
+# Repariert eine beschaedigte Env-Datei VOR dem Sourcen: erkennt einen cfut_-Token,
+# der durch alte Bugs in einer Extra-Zeile oder mehrzeilig gespeichert wurde, und
+# schreibt ihn als genau eine Zeile "CLOUDFLARE_API_TOKEN=cfut_...". Idempotent.
+repair_env_file() {
+  local f="$ENV_FILE"
+  [[ -f "$f" ]] || return 0
+  grep -q 'cfut_' "$f" 2>/dev/null || return 0
+  # Bereits korrekt einzeilig? Dann nichts tun.
+  if grep -qE "^CLOUDFLARE_API_TOKEN=['\"]?cfut_[A-Za-z0-9_-]+['\"]?$" "$f"; then
+    return 0
+  fi
+  local tok
+  tok="$(grep -oE 'cfut_[A-Za-z0-9_-]+' "$f" 2>/dev/null | head -n1 || true)"
+  [[ -z "$tok" ]] && return 0
+  local tmp; tmp="$(mktemp)"
+  # Alle alten Token-/Bare-cfut-Zeilen entfernen, danach eine saubere Zeile setzen.
+  grep -vE '^CLOUDFLARE_API_TOKEN=|^[[:space:]]*cfut_[A-Za-z0-9_-]+[[:space:]]*$' "$f" > "$tmp" 2>/dev/null || true
+  printf 'CLOUDFLARE_API_TOKEN=%s\n' "$tok" >> "$tmp"
+  cat "$tmp" > "$f"
+  rm -f "$tmp"
+  chmod 600 "$f" 2>/dev/null || true
+}
+
 load_env() {
   # Defaults immer zuerst setzen (set -u-sicher via :-), danach ggf. aus der
   # Env-Datei ueberschreiben. So fuehrt eine unvollstaendige Datei nie zu
@@ -81,6 +104,8 @@ load_env() {
   WG_MTU="${WG_MTU:-1280}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
+    # Beschaedigten/mehrzeiligen Token VOR dem Sourcen reparieren.
+    repair_env_file
     # Tolerant gegen kaputte Zeilen (z. B. fehlerhaft gespeicherter, mehrzeiliger
     # Token): || true verhindert errexit-Abbruch waehrend des Sourcens.
     # shellcheck disable=SC1090

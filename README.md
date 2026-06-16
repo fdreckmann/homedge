@@ -128,6 +128,9 @@ Im Menue unter `Wartung / Updates`:
 ## HTTP/3 / QUIC und Firewall
 
 - Standard ist `ENABLE_HTTP3=0` (nur HTTP/1.1 + HTTP/2, UFW oeffnet nur 443/tcp).
+  Fuer Jellyfin erstmal AUS empfohlen.
+- Die Installer fragen HTTP/3 beim Setup ab (Default: nein); der Bootstrap
+  oeffnet `443/udp` nur, wenn HTTP/3 aktiviert wurde.
 - Aktivieren ueber `Caddy / HTTPS / Cloudflare -> HTTP/3 aktivieren/deaktivieren`;
   dabei wird `443/udp` in UFW passend geoeffnet bzw. wieder geschlossen.
 - `sudo homeedge firewall` setzt UFW passend zur Konfiguration (443/udp nur bei HTTP/3).

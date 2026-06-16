@@ -97,6 +97,7 @@ HomeSubnet=$(printf '%q' "$HomeSubnet")
 AcmeEmail=$(printf '%q' "$AcmeEmail")
 UsePsk=$(printf '%q' "$UsePsk")
 EnableCaddyFail2ban=$(printf '%q' "$EnableCaddyFail2ban")
+EnableHttp3=$(printf '%q' "${EnableHttp3:-0}")
 ClientPublicKey=$(printf '%q' "$ClientPublicKey")
 SwapMb=$(printf '%q' "$SwapMb")
 CreateAdmin=$(printf '%q' "$CreateAdmin")
@@ -286,6 +287,15 @@ else
   EnableCaddyFail2ban="0"
 fi
 
+echo
+echo "HTTP/3 / QUIC nutzt zusaetzlich UDP 443. Fuer Jellyfin erstmal AUS empfohlen."
+echo "Kann spaeter im Menue aktiviert werden."
+if yesno "HTTP/3 / QUIC aktivieren?" "$( [[ "$(cfg_get EnableHttp3 "0")" == "1" ]] && echo y || echo n )"; then
+  EnableHttp3="1"
+else
+  EnableHttp3="0"
+fi
+
 ClientPublicKey="$(ask "UniFi/Client WireGuard PublicKey optional, leer lassen falls noch nicht vorhanden" "$(cfg_get ClientPublicKey "")")"
 SwapMb="$(ask "Swap Groesse in MB" "$(cfg_get SwapMb "2048")")"
 
@@ -411,6 +421,7 @@ RemoteScript="${RemoteScript//__ACME_EMAIL_B64__/$(b64 "$AcmeEmail")}"
 RemoteScript="${RemoteScript//__CF_TOKEN_B64__/$(b64 "$CfToken")}"
 RemoteScript="${RemoteScript//__USE_PSK_B64__/$(b64 "$UsePsk")}"
 RemoteScript="${RemoteScript//__CADDY_FAIL2BAN_B64__/$(b64 "$EnableCaddyFail2ban")}"
+RemoteScript="${RemoteScript//__ENABLE_HTTP3_B64__/$(b64 "${EnableHttp3:-0}")}"
 RemoteScript="${RemoteScript//__CLIENT_PUBLIC_KEY_B64__/$(b64 "$ClientPublicKey")}"
 RemoteScript="${RemoteScript//__SERVICES_TSV_B64__/$(b64 "$ServicesTsv")}"
 RemoteScript="${RemoteScript//__SWAP_MB_B64__/$(b64 "$SwapMb")}"

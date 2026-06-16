@@ -282,6 +282,12 @@ Write-Host "Gebannte IPs koennen spaeter im HomeEdge-Menue wieder entbannt werde
 $DefaultCaddyF2b = if (Get-CfgBool $LoadedConfig "EnableCaddyFail2ban" $true) { "y" } else { "n" }
 $EnableCaddyFail2ban = if (Ask-YesNo "Fail2ban fuer Caddy/Jellyfin 401/403 aktivieren?" $DefaultCaddyF2b) { "1" } else { "0" }
 
+Write-Host ""
+Write-Host "HTTP/3 / QUIC nutzt zusaetzlich UDP 443. Fuer Jellyfin erstmal AUS empfohlen."
+Write-Host "Kann spaeter im Menue aktiviert werden."
+$DefaultHttp3 = if (Get-CfgBool $LoadedConfig "EnableHttp3" $false) { "y" } else { "n" }
+$EnableHttp3 = if (Ask-YesNo "HTTP/3 / QUIC aktivieren?" $DefaultHttp3) { "1" } else { "0" }
+
 $ClientPublicKey = Ask "UniFi/Client WireGuard PublicKey optional, leer lassen falls noch nicht vorhanden" (Get-CfgValue $LoadedConfig "ClientPublicKey" "")
 $SwapMb = Ask "Swap Groesse in MB" (Get-CfgValue $LoadedConfig "SwapMb" "2048")
 
@@ -427,6 +433,7 @@ if (Ask-YesNo "Eingaben lokal als Config fuer naechstes Mal speichern/aktualisie
         CloudflareApiTokenProtected = Protect-PlainText $CfToken
         UsePsk = ($UsePsk -eq "1")
         EnableCaddyFail2ban = ($EnableCaddyFail2ban -eq "1")
+        EnableHttp3 = ($EnableHttp3 -eq "1")
         ClientPublicKey = $ClientPublicKey
         SwapMb = $SwapMb
         ServiceCount = $ServiceCount
@@ -469,6 +476,7 @@ $Replacements = @{
     "__CF_TOKEN_B64__" = To-B64 $CfToken
     "__USE_PSK_B64__" = To-B64 $UsePsk
     "__CADDY_FAIL2BAN_B64__" = To-B64 $EnableCaddyFail2ban
+    "__ENABLE_HTTP3_B64__" = To-B64 $EnableHttp3
     "__CLIENT_PUBLIC_KEY_B64__" = To-B64 $ClientPublicKey
     "__SERVICES_TSV_B64__" = To-B64 $ServicesTsv
     "__SWAP_MB_B64__" = To-B64 $SwapMb
