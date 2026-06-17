@@ -10,9 +10,9 @@ b64d() { printf '%s' "$1" | base64 -d; }
 
 EXT_IF="$(b64d "__EXT_IF_B64__")"
 VPS_PUBLIC_HOST="$(b64d "__VPS_PUBLIC_HOST_B64__")"
-SSH_PORT="$(b64d "__SSH_PORT_B64__")"
-WG_IF="$(b64d "__WG_IF_B64__")"
-WG_PORT="$(b64d "__WG_PORT_B64__")"
+SSH_PORT="$(b64d "__SSH_PORT_B64__")"; SSH_PORT="${SSH_PORT:-22}"
+WG_IF="$(b64d "__WG_IF_B64__")"; WG_IF="${WG_IF:-unifi}"
+WG_PORT="$(b64d "__WG_PORT_B64__")"; WG_PORT="${WG_PORT:-51821}"
 # Leer = automatisch (keine MTU-Zeile, WireGuard-Default). Kein 1280-Fallback.
 WG_MTU="$(b64d "__WG_MTU_B64__")"
 VPS_WG_ADDR="$(b64d "__VPS_WG_ADDR_B64__")"
@@ -23,6 +23,9 @@ CLOUDFLARE_API_TOKEN="$(b64d "__CF_TOKEN_B64__" | tr -d '\r\n[:space:]')"
 USE_PSK="$(b64d "__USE_PSK_B64__")"
 CADDY_FAIL2BAN="$(b64d "__CADDY_FAIL2BAN_B64__")"
 ENABLE_HTTP3="$(b64d "__ENABLE_HTTP3_B64__")"; ENABLE_HTTP3="${ENABLE_HTTP3:-0}"
+# ENABLE_IPV6 wird vom Installer (noch) nicht abgefragt - Default 0. WICHTIG:
+# Ohne diesen Default bricht der UFW-Schritt unter set -u mit "unbound variable" ab.
+ENABLE_IPV6="${ENABLE_IPV6:-0}"
 CLIENT_PUBLIC_KEY="$(b64d "__CLIENT_PUBLIC_KEY_B64__")"
 SERVICES_TSV="$(b64d "__SERVICES_TSV_B64__")"
 SWAP_MB="$(b64d "__SWAP_MB_B64__")"
@@ -166,21 +169,21 @@ fi
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow "${SSH_PORT}/tcp"
-ufw allow "${WG_PORT}/udp"
-[[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT}" ]] && ufw allow "${CUR_SSH_PORT}/tcp"
+ufw allow "${SSH_PORT:-22}/tcp"
+ufw allow "${WG_PORT:-51821}/udp"
+[[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT:-22}" ]] && ufw allow "${CUR_SSH_PORT}/tcp"
 # 443/tcp: IPv4 immer, IPv6 nur bei ENABLE_IPV6=1
 ufw allow proto tcp to 0.0.0.0/0 port 443
-if [[ "${ENABLE_IPV6}" == "1" ]]; then ufw allow proto tcp to ::/0 port 443; echo "IPv6 extern aktiv: 443/tcp (v6) freigegeben."; else echo "IPv6 extern aus: 443/tcp (v6) bleibt geschlossen."; fi
+if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto tcp to ::/0 port 443; echo "IPv6 extern aktiv: 443/tcp (v6) freigegeben."; else echo "IPv6 extern aus: 443/tcp (v6) bleibt geschlossen."; fi
 # 443/udp nur bei HTTP/3
-if [[ "${ENABLE_HTTP3}" == "1" ]]; then
+if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
   ufw allow proto udp to 0.0.0.0/0 port 443
-  [[ "${ENABLE_IPV6}" == "1" ]] && ufw allow proto udp to ::/0 port 443
+  [[ "${ENABLE_IPV6:-0}" == "1" ]] && ufw allow proto udp to ::/0 port 443
   echo "HTTP/3 aktiv: 443/udp freigegeben."
 else
   echo "HTTP/3 aus: 443/udp bleibt geschlossen."
 fi
-if [[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT}" ]]; then
+if [[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT:-22}" ]]; then
   echo "Hinweis: Aktiver SSH-Port ${CUR_SSH_PORT}/tcp wurde zusaetzlich freigegeben (Schutz vor Aussperren)."
   echo "         HomeEdge aendert den sshd-Port nicht. SSH_PORT=${SSH_PORT} gilt nur fuer Firewall/Fail2ban."
 fi
@@ -240,13 +243,15 @@ else
   echo "============================================================"
   echo "SETUP NICHT VOLLSTAENDIG"
   echo "============================================================"
-  echo "Mindestens ein Schritt ist fehlgeschlagen (Liste oben)."
+  echo "Mindestens ein Schritt ist fehlgeschlagen (Fehlerliste oben)."
   echo "HomeEdge ist NICHT als fertig konfiguriert zu betrachten."
   echo
-  echo "Reparieren und erneut pruefen:"
+  echo "Reparatur (in dieser Reihenfolge):"
+  echo "  sudo homeedge migrate"
+  echo "  sudo homeedge repair-services"
+  echo "  sudo homeedge apply-all"
   echo "  sudo homeedge health"
-  echo "  sudo homeedge diagnose"
-  echo "  sudo homeedge verify-setup"
+  echo "Weitere Diagnose: sudo homeedge diagnose ; sudo homeedge verify-setup"
   echo "Install-Log: /root/edge-install.log"
   echo "============================================================"
   exit 1
