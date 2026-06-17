@@ -135,6 +135,7 @@ CADDY_FAIL2BAN=$(printf '%q' "${CADDY_FAIL2BAN}")
 CLIENT_PUBLIC_KEY=$(printf '%q' "${CLIENT_PUBLIC_KEY}")
 ENABLE_HTTP3=$(printf '%q' "${ENABLE_HTTP3:-0}")
 ENABLE_IPV6=$(printf '%q' "${ENABLE_IPV6:-0}")
+MIGRATION_MODE=$(printf '%q' "${MIGRATION_MODE:-0}")
 HOMEEDGE_REPO=$(printf '%q' "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(printf '%q' "${HOMEEDGE_BRANCH:-main}")
 EOF
@@ -142,7 +143,9 @@ chmod 600 "${ENV_FILE}"
 printf '%s' "${SERVICES_TSV}" > "${SERVICES_FILE}"
 
 echo "[7/10] WireGuard, Caddy und Fail2ban anwenden..."
-homeedge apply-all
+# Fehler hier nicht sofort abbrechen: die finale Verifikation (verify-setup)
+# bewertet den Gesamtzustand und gibt eine klare Fehlerliste aus.
+homeedge apply-all || echo "[WARN] apply-all meldete Probleme - finale Verifikation entscheidet."
 
 echo "[8/10] Automatische Updates aktivieren..."
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -214,14 +217,36 @@ echo "Anzeigen mit: sudo homeedge wg-values"
 echo "(Bewusst nicht hier ausgegeben, damit keine Secrets im Install-Log landen.)"
 
 echo
-echo "============================================================"
-echo "FERTIG"
-echo "============================================================"
-echo "Menue:                  sudo homeedge menu"
-echo "Aktuelle Werte:        sudo homeedge values"
-echo "WireGuard Werte:       sudo homeedge wg-values"
-echo "Status:                sudo homeedge status"
-echo "Jellyfin Known Proxy:  ${VPS_WG_IP}"
-echo "Install-Log:           /root/edge-install.log"
-echo "Cloudflare DNS:        A-Records auf ${VPS_PUBLIC_HOST}; Jellyfin DNS only/graue Wolke"
-echo "============================================================"
+echo "[Verifikation] Setup wird abschliessend geprueft..."
+# Wizard-Abschluss: Caddy holt Zertifikate per DNS-01, daher ist im Parallel-
+# betrieb ein DNS-Eintrag, der noch auf den alten VPS zeigt, nur eine Warnung
+# (--migration). Schlaegt eine harte Pruefung fehl, wird NICHT "FERTIG" gemeldet.
+if homeedge verify-setup --migration; then
+  echo
+  echo "============================================================"
+  echo "FERTIG"
+  echo "============================================================"
+  echo "Menue:                  sudo homeedge menu"
+  echo "Aktuelle Werte:        sudo homeedge values"
+  echo "WireGuard Werte:       sudo homeedge wg-values"
+  echo "Status:                sudo homeedge status"
+  echo "Jellyfin Known Proxy:  ${VPS_WG_IP}"
+  echo "Install-Log:           /root/edge-install.log"
+  echo "Cloudflare DNS:        A-Records auf ${VPS_PUBLIC_HOST}; Jellyfin DNS only/graue Wolke"
+  echo "============================================================"
+else
+  echo
+  echo "============================================================"
+  echo "SETUP NICHT VOLLSTAENDIG"
+  echo "============================================================"
+  echo "Mindestens ein Schritt ist fehlgeschlagen (Liste oben)."
+  echo "HomeEdge ist NICHT als fertig konfiguriert zu betrachten."
+  echo
+  echo "Reparieren und erneut pruefen:"
+  echo "  sudo homeedge health"
+  echo "  sudo homeedge diagnose"
+  echo "  sudo homeedge verify-setup"
+  echo "Install-Log: /root/edge-install.log"
+  echo "============================================================"
+  exit 1
+fi
