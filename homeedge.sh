@@ -1993,6 +1993,49 @@ select_ext_interface() {
 
 apply_all() {
   need_root
+  # load_env setzt ALLE Defaults (ENABLE_IPV6=0, ENABLE_HTTP3=0, WG_MTU=, SSH_PORT=22,
+  # WG_PORT=51821, ...), damit nachfolgende Schritte nie auf unset-Variablen laufen.
+  load_env
+  section "apply-all: Preflight"
+
+  # --- A) Preflight: nichts veraendern, nur pruefen/reparieren. ---
+  local -a pf=()
+  # services.tsv: leer = ok. Sonst 4->5 migrieren, dann ggf. reparieren.
+  if [[ -s "$SERVICES_FILE" ]]; then
+    migrate_services_4to5 || true
+    if ! validate_services_file >/dev/null 2>&1; then
+      warn "services.tsv ungueltig - versuche automatische Reparatur..."
+      repair_services --non-interactive >/dev/null 2>&1 || true
+    fi
+    if ! validate_services_file >/dev/null 2>&1; then
+      pf+=("services.tsv ungueltig  ->  sudo homeedge repair-services")
+    else
+      ok "services.tsv valide"
+    fi
+  else
+    ok "services.tsv leer (keine Dienste) - ok"
+  fi
+  # WireGuard-Pflichtwerte.
+  [[ -n "${WG_IF:-}" && -n "${WG_PORT:-}" && -n "${VPS_WG_ADDR:-}" ]] || pf+=("WireGuard-Basiswerte fehlen (WG_IF/WG_PORT/VPS_WG_ADDR)  ->  sudo homeedge settings")
+  # Docker vorhanden (Caddy-Stack braucht Docker).
+  command -v docker >/dev/null 2>&1 || pf+=("Docker ist nicht installiert/erreichbar")
+  # Cloudflare Token noetig, sobald Dienste konfiguriert sind (DNS-01).
+  if [[ -s "$SERVICES_FILE" && -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    pf+=("Cloudflare API Token fehlt (fuer Zertifikate noetig)  ->  sudo homeedge set-token")
+  fi
+  if (( ${#pf[@]} > 0 )); then
+    section "apply-all: ABBRUCH (Preflight fehlgeschlagen)"
+    err "Es wird NICHTS veraendert. Folgende Punkte zuerst beheben:"
+    local p; for p in "${pf[@]}"; do printf '  %b-%b %s\n' "$C_RED" "$C_RESET" "$p"; done
+    echo
+    err "Reparatur:"
+    printf '  %s\n' "sudo homeedge migrate" "sudo homeedge repair-services" "sudo homeedge apply-all" "sudo homeedge health"
+    return 1
+  fi
+  ok "Preflight ok"
+
+  # --- B) Apply ---
+  section "apply-all: Apply"
   local rc=0
   generate_keys || rc=1
   write_wg_config || rc=1
@@ -2004,6 +2047,9 @@ apply_all() {
   restart_wg || true
   # UFW muss am Ende wirklich AKTIV sein (mit SSH-Lockout-Schutz), sonst Fehler.
   ufw_ensure_active || rc=1
+  if (( rc != 0 )); then
+    err "apply-all: mindestens ein Apply-Schritt ist fehlgeschlagen. Details: sudo homeedge health"
+  fi
   return $rc
 }
 
