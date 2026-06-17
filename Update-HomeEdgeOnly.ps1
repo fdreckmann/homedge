@@ -72,6 +72,13 @@ echo "[OK] Update abgeschlossen."
 $Content = Get-Content $EdgectlPath -Raw
 $Content | & ssh @sshArgs ("cat >/tmp/homeedge && " + $remote)
 
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "UPDATE NICHT VOLLSTAENDIG (Exitcode $LASTEXITCODE)."
+    Write-Host "Pruefen auf dem VPS: sudo homeedge health"
+    throw "Remote-Update fehlgeschlagen."
+}
+
 Write-Host ""
 Write-Host "Fertig. Menue starten mit:"
 Write-Host "  sudo homeedge menu"

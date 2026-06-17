@@ -245,8 +245,14 @@ $SshPortFinal = Ask "SSH Port auf dem VPS" (Get-CfgValue $LoadedConfig "SshPortF
 
 $WgIf = Ask "WireGuard Interface Name" (Get-CfgValue $LoadedConfig "WgIf" "unifi")
 $WgPort = Ask "WireGuard UDP Port" (Get-CfgValue $LoadedConfig "WgPort" "51821")
-$WgMtu = Ask "WireGuard MTU" (Get-CfgValue $LoadedConfig "WgMtu" "1280")
-if ($WgMtu -notmatch '^[0-9]+$') { $WgMtu = "1280" }
+# Leer = automatisch (keine MTU-Zeile, WireGuard-Default, empfohlen).
+$WgMtu = Ask "WireGuard MTU (leer = automatisch/WireGuard-Default, empfohlen)" (Get-CfgValue $LoadedConfig "WgMtu" "")
+if ($WgMtu -ne "") {
+    if (($WgMtu -notmatch '^[0-9]+$') -or ([int]$WgMtu -lt 1200) -or ([int]$WgMtu -gt 1420)) {
+        Write-Host "Ungueltige MTU '$WgMtu' - nutze automatisch (leer)."
+        $WgMtu = ""
+    }
+}
 $VpsWgAddr = Ask "VPS WireGuard Adresse mit CIDR" (Get-CfgValue $LoadedConfig "VpsWgAddr" "10.0.1.1/24")
 $ClientWgAddr = Ask "UniFi/Client WireGuard Adresse mit CIDR" (Get-CfgValue $LoadedConfig "ClientWgAddr" "10.0.1.2/32")
 $HomeSubnet = Ask "Heimnetz/Subnetz hinter UniFi" (Get-CfgValue $LoadedConfig "HomeSubnet" "192.168.10.0/24")
@@ -502,6 +508,17 @@ Write-Host "Die Ausgabe wird hier angezeigt und zusaetzlich auf dem VPS nach /ro
 Write-Host ""
 
 $RemoteScript | & ssh @sshArgs "cat >/tmp/edge-bootstrap.sh && chmod +x /tmp/edge-bootstrap.sh && bash -lc 'set -o pipefail; /tmp/edge-bootstrap.sh 2>&1 | tee /root/edge-install.log'"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "============================================================"
+    Write-Host "SETUP NICHT VOLLSTAENDIG"
+    Write-Host "============================================================"
+    Write-Host "Die Remote-Installation ist fehlgeschlagen (Exitcode $LASTEXITCODE)."
+    Write-Host "Log auf dem VPS: /root/edge-install.log"
+    Write-Host "Pruefen/Reparieren: sudo homeedge health ; sudo homeedge apply-all"
+    throw "Remote-Installation fehlgeschlagen. Siehe /root/edge-install.log"
+}
 
 Write-Host ""
 Write-Host "Fertig. Auf dem VPS sind jetzt diese Befehle verfuegbar:"

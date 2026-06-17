@@ -155,7 +155,7 @@ load_env() {
   ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
   HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
-  WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
+  WG_MTU="${WG_MTU:-}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
   MIGRATION_MODE="${MIGRATION_MODE:-0}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
@@ -171,7 +171,7 @@ load_env() {
     ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
     EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
-    WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
+    WG_MTU="${WG_MTU:-}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
     MIGRATION_MODE="${MIGRATION_MODE:-0}"
     F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   fi
@@ -203,7 +203,7 @@ HOMEEDGE_REPO=$(q "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(q "${HOMEEDGE_BRANCH:-main}")
 EXPERT_MODE=$(q "${EXPERT_MODE:-0}")
 BACKUP_BEHAVIOR=$(q "${BACKUP_BEHAVIOR:-ask}")
-WG_MTU=$(q "${WG_MTU:-1280}")
+WG_MTU=$(q "${WG_MTU:-}")
 ENABLE_IPV6=$(q "${ENABLE_IPV6:-0}")
 MIGRATION_MODE=$(q "${MIGRATION_MODE:-0}")
 F2B_CADDY_MAXRETRY=$(q "${F2B_CADDY_MAXRETRY:-20}")
@@ -253,7 +253,11 @@ write_wg_config() {
 PrivateKey = $(cat "${KEY_DIR}/server_private.key")
 Address = ${VPS_WG_ADDR}
 ListenPort = ${WG_PORT}
-MTU = ${WG_MTU}
+EOWG
+  # MTU-Zeile nur schreiben, wenn WG_MTU gesetzt ist. Leer = WireGuard/Linux
+  # nutzt den Default (1280 ist nur ein optionaler Troubleshooting-Wert).
+  if [[ -n "${WG_MTU:-}" ]]; then echo "MTU = ${WG_MTU}" >> "$target"; fi
+  cat >> "$target" <<EOWG
 
 [Peer]
 PublicKey = ${key}
@@ -413,13 +417,35 @@ edit_backend_networks() {
 edit_wg_mtu() {
   need_root; load_env
   section "WireGuard MTU anzeigen/aendern"
-  echo "Aktuelle MTU: ${WG_MTU}"
-  local mtu; mtu="$(ask "WireGuard MTU" "${WG_MTU}")"
-  if ! [[ "$mtu" =~ ^[0-9]+$ ]] || (( mtu < 1280 || mtu > 1500 )); then err "MTU muss zwischen 1280 und 1500 liegen."; return 1; fi
-  maybe_backup_before_change
-  WG_MTU="$mtu"; save_env; write_wg_config; restart_wg
-  ok "WireGuard MTU gesetzt: ${WG_MTU}"
-  warn "Hinweis: MTU ggf. auch auf UniFi-Seite setzen, falls UniFi ein MTU-Feld anbietet."
+  echo "Aktuell: $([[ -n "${WG_MTU:-}" ]] && echo "MTU = ${WG_MTU}" || echo "automatisch (keine MTU-Zeile, WireGuard-Default)")"
+  echo
+  echo "  1) MTU automatisch / WireGuard-Default verwenden (empfohlen)"
+  echo "  2) MTU manuell setzen"
+  echo "  3) Empfehlung anzeigen"
+  echo "  0) Abbruch"
+  local c; c="$(ask "Auswahl" "1")"
+  case "$c" in
+    1)
+      maybe_backup_before_change
+      WG_MTU=""; save_env; write_wg_config; restart_wg
+      ok "WireGuard MTU auf automatisch gesetzt (keine MTU-Zeile in der Konfig)."
+      ;;
+    2)
+      local mtu; mtu="$(ask "WireGuard MTU (numerisch, 1200-1420)" "${WG_MTU:-1280}")"
+      if ! [[ "$mtu" =~ ^[0-9]+$ ]] || (( mtu < 1200 || mtu > 1420 )); then err "MTU muss numerisch und zwischen 1200 und 1420 liegen."; return 1; fi
+      maybe_backup_before_change
+      WG_MTU="$mtu"; save_env; write_wg_config; restart_wg
+      ok "WireGuard MTU gesetzt: MTU = ${WG_MTU}"
+      warn "Hinweis: MTU ggf. auch auf UniFi-Seite setzen, falls UniFi ein MTU-Feld anbietet."
+      ;;
+    3)
+      info "Empfehlung: Lass die MTU auf automatisch (leer). WireGuard waehlt selbst."
+      info "Nur bei Problemen (haengende Verbindungen, Fragmentierung) manuell testen:"
+      info "  - 1420 als erster Versuch, sonst schrittweise reduzieren (1380, 1280)."
+      info "  - 1280 ist der robusteste Wert, kann aber den Durchsatz leicht senken."
+      ;;
+    *) warn "Abgebrochen."; return 0 ;;
+  esac
 }
 
 toggle_psk() {
@@ -552,6 +578,17 @@ validate_caddyfile() {
   fi
 }
 
+# Validiert eine beliebige Caddyfile (Host-Pfad) in einem Wegwerf-Container, OHNE
+# die produktive Caddyfile anzufassen (Bug P2: erst Temp validieren, dann ersetzen).
+_validate_caddyfile_path() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  caddy_compose_file_exists || return 1
+  caddy_compose build >/dev/null 2>&1 || return 1
+  caddy_compose run --rm --no-deps -T -v "${f}:/tmp/Caddyfile.check:ro" \
+    --entrypoint caddy caddy validate --config /tmp/Caddyfile.check >/dev/null 2>&1
+}
+
 # Prueft, ob fuer eine Domain lokal (per SNI auf 127.0.0.1) ein Zertifikat ausgeliefert wird.
 cert_ready() {
   local domain="$1"
@@ -600,26 +637,30 @@ _caddy_prepare_config() {
   fi
   write_caddy_stack
   mkdir -p "$CADDY_DIR"
-  local cf="${CADDY_DIR}/Caddyfile" tmp="${CADDY_DIR}/.Caddyfile.new" bak="${CADDY_DIR}/.Caddyfile.bak"
+  local cf="${CADDY_DIR}/Caddyfile" tmp="${CADDY_DIR}/.Caddyfile.new"
   generate_caddyfile_to "$tmp"
+  # Vollstaendigkeit pruefen: grep -F (Fixstring), KEIN Regex mit Domain-Inhalt,
+  # damit Wildcard-Domains wie *.example.de sicher gematcht werden (Bug P2).
   local missing=0 d _s _i _p _pr
   if [[ -s "$SERVICES_FILE" ]]; then
     while IFS=$'\t' read -r d _s _i _p _pr || [[ -n "$d" ]]; do
       [[ -z "$d" ]] && continue
-      grep -q "^${d//./\\.} {" "$tmp" || { err "Domain fehlt im generierten Caddyfile: $d"; missing=1; }
+      grep -Fq "${d} {" "$tmp" || { err "Domain fehlt im generierten Caddyfile: $d"; missing=1; }
     done < "$SERVICES_FILE"
   fi
   if (( missing )); then rm -f "$tmp"; err "Abbruch: Caddyfile unvollstaendig, nichts geaendert."; return 1; fi
-  [[ -f "$cf" ]] && cp -a "$cf" "$bak" 2>/dev/null || true
-  mv "$tmp" "$cf"
-  ok "Caddyfile generiert (alle Dienste enthalten)"
-  if validate_caddyfile; then
-    ok "Config validiert"; rm -f "$bak"; return 0
-  else
-    err "Caddyfile ungueltig - vorherige Version wird wiederhergestellt."
-    [[ -f "$bak" ]] && mv "$bak" "$cf"
+  # Temp-Caddyfile VOR dem produktiven Ersetzen validieren. Nur bei OK ersetzen.
+  if ! _validate_caddyfile_path "$tmp"; then
+    rm -f "$tmp"
+    err "Neue Caddyfile ist ungueltig - die produktive Caddyfile bleibt unveraendert."
     return 1
   fi
+  ok "Config validiert"
+  # Gueltig: produktiv ersetzen. (Es liegt also nie eine ungueltige Caddyfile
+  # aktiv; gibt es noch keine alte, bleibt bei Fehler gar keine kaputte zurueck.)
+  mv "$tmp" "$cf"
+  ok "Caddyfile generiert (alle Dienste enthalten)"
+  return 0
 }
 
 reload_caddy() {
@@ -1012,6 +1053,28 @@ ufw_apply_auto() {
   _ufw_rules_apply
   ufw reload >/dev/null 2>&1 || true
   ok "UFW angeglichen (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
+}
+
+# Stellt sicher, dass UFW AKTIV ist (mit SSH-Lockout-Schutz): erst SSH/443/WG
+# erlauben (_ufw_rules_apply), dann aktivieren. 0 = aktiv, 1 = konnte nicht
+# sicher aktiviert werden. Fuer apply-all/Wizard (Bug P1: UFW nicht faelschlich
+# als OK melden, wenn sie inaktiv bleibt).
+ufw_ensure_active() {
+  load_env
+  if ! command -v ufw >/dev/null 2>&1; then err "ufw ist nicht installiert - Firewall kann nicht aktiviert werden."; return 1; fi
+  ensure_ufw_ipv6_yes
+  # SSH-Port (und aktiven SSH-Sitzungsport) VOR enable erlauben -> kein Lockout.
+  _ufw_rules_apply
+  if ufw status 2>/dev/null | grep -qiE "Status: (active|aktiv)"; then
+    ufw reload >/dev/null 2>&1 || true
+  else
+    ufw --force enable >/dev/null 2>&1 || true
+  fi
+  if ufw status 2>/dev/null | grep -qiE "Status: (active|aktiv)"; then
+    return 0
+  fi
+  err "UFW konnte nicht aktiviert werden."
+  return 1
 }
 
 show_values() {
@@ -1626,7 +1689,18 @@ EOF
   local items=()
   [[ -d /etc/homeedge ]] && items+=("etc/homeedge")
   [[ -d /etc/wireguard ]] && items+=("etc/wireguard")
-  [[ -d /opt/caddy-edge ]] && items+=("opt/caddy-edge/Caddyfile" "opt/caddy-edge/Dockerfile" "opt/caddy-edge/docker-compose.yml" "opt/caddy-edge/.env" "opt/caddy-edge/data" "opt/caddy-edge/config")
+  # Caddy-Dateien EINZELN pruefen - ein halb erstellter Stack (z. B. ohne
+  # docker-compose.yml) darf das Backup nicht crashen lassen (Bug P1).
+  local caddy_complete=1 cf
+  for cf in Caddyfile Dockerfile docker-compose.yml .env; do
+    if [[ -f "/opt/caddy-edge/${cf}" ]]; then items+=("opt/caddy-edge/${cf}"); else caddy_complete=0; fi
+  done
+  [[ -d /opt/caddy-edge/data ]] && items+=("opt/caddy-edge/data")
+  [[ -d /opt/caddy-edge/config ]] && items+=("opt/caddy-edge/config")
+  if [[ -d /opt/caddy-edge && "$caddy_complete" -eq 0 ]]; then
+    warn "Caddy-Stack ist unvollstaendig - es werden nur die vorhandenen Dateien gesichert."
+    warn "Reparatur nach dem Backup: sudo homeedge caddy-rebuild"
+  fi
   [[ -f /etc/fail2ban/jail.d/sshd-local.conf ]] && items+=("etc/fail2ban/jail.d/sshd-local.conf")
   [[ -f /etc/fail2ban/jail.d/caddy-auth.local ]] && items+=("etc/fail2ban/jail.d/caddy-auth.local")
   [[ -f /etc/fail2ban/filter.d/caddy-auth.conf ]] && items+=("etc/fail2ban/filter.d/caddy-auth.conf")
@@ -1721,11 +1795,20 @@ _do_restore() {
   load_env || true
   systemctl stop "wg-quick@${WG_IF:-unifi}" 2>/dev/null || true
 
-  # 2) Entpacken. Bei config-Modus die Software (Binary) NICHT ueberschreiben.
+  # 2) Entpacken. Bei config-Modus die Software (Binary) NIEMALS ueberschreiben.
+  #    KEIN Fallback ohne --exclude: schlaegt der Restore mit Exclude fehl, wird
+  #    abgebrochen, damit nicht doch /usr/local/bin/homeedge ueberschrieben wird.
   if [[ "$mode" == "config" ]]; then
-    tar -xzf "$f" -C / --exclude='usr/local/bin/homeedge' 2>/dev/null || tar -xzf "$f" -C /
+    if ! tar -xzf "$f" -C / --exclude='usr/local/bin/homeedge'; then
+      err "Restore (config) fehlgeschlagen. Es wird NICHT ohne --exclude erneut entpackt."
+      err "Die installierte HomeEdge-Version bleibt unveraendert. Backup pruefen: $f"
+      return 1
+    fi
   else
-    tar -xzf "$f" -C /
+    if ! tar -xzf "$f" -C /; then
+      err "Restore (full) fehlgeschlagen. Backup pruefen: $f"
+      return 1
+    fi
   fi
 
   # 3) Rechte/Token/Symlink.
@@ -1919,7 +2002,8 @@ apply_all() {
   install_fail2ban || rc=1
   # WG ist evtl. noch nicht aktivierbar (UniFi PublicKey fehlt) - nicht fatal.
   restart_wg || true
-  ufw_apply_auto || rc=1
+  # UFW muss am Ende wirklich AKTIV sein (mit SSH-Lockout-Schutz), sonst Fehler.
+  ufw_ensure_active || rc=1
   return $rc
 }
 
@@ -1995,18 +2079,38 @@ verify_setup() {
     warn "WireGuard Interface ${WG_IF} noch nicht aktiv (UniFi/Client PublicKey fehlt - im Parallelbetrieb ok)"; warns=$((warns+1))
   fi
 
-  # Lokaler SNI-Test pro Domain + DNS-Bewertung (MIGRATION_MODE-aware)
+  # Lokaler SNI-Test pro Domain + DNS-Bewertung (MIGRATION_MODE-aware).
+  # Zertifikate werden per DNS-01 geholt - das funktioniert auch im Parallel-
+  # betrieb mit altem DNS. Ein dauerhaft fehlendes Zertifikat ist daher ein
+  # echter Fehler (z. B. falscher Cloudflare Token) und KEIN reiner Migrations-
+  # zustand -> harter Fehler (Bug P2: Zertifikatsstatus ernst nehmen).
   if [[ -s "$SERVICES_FILE" ]] && validate_services_file >/dev/null 2>&1; then
-    local domain scheme ip port profile a expect="${VPS_PUBLIC_HOST:-}"
+    local domain scheme ip port profile a expect="${VPS_PUBLIC_HOST:-}" deadline pending
+    if command -v openssl >/dev/null 2>&1; then
+      # Kurze Schonfrist (reload hat bereits bis 120s gewartet).
+      deadline=$((SECONDS+45))
+      while :; do
+        pending=0
+        while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
+          [[ -z "$domain" ]] && continue
+          cert_ready "$domain" || pending=$((pending+1))
+        done < "$SERVICES_FILE"
+        (( pending == 0 )) && break
+        (( SECONDS >= deadline )) && break
+        sleep 5
+      done
+    fi
     while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
       [[ -z "$domain" ]] && continue
       # Lokaler SNI/TLS-Test: curl --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
       if cert_ready "$domain"; then
-        ok "SNI/TLS lokal ok: ${domain}"
+        ok "SNI/TLS lokal ok (Zertifikat aktiv): ${domain}"
       else
-        warn "Zertifikat fuer ${domain} noch nicht aktiv (DNS-01 kann 1-2 Min dauern). Test: sudo homeedge test-domain ${domain}"; warns=$((warns+1))
+        err "Zertifikat/HTTPS fuer ${domain} nicht verfuegbar (lokaler SNI-Test fehlgeschlagen)."
+        problems+=("Zertifikat fehlt fuer ${domain}  ->  Cloudflare Token pruefen (sudo homeedge set-token), dann: sudo homeedge reload ; Test: sudo homeedge test-domain ${domain}")
+        fail=1
       fi
-      # DNS-Bewertung
+      # DNS-Bewertung (nur DNS-Ziel ist migrations-tolerant, nicht das Zertifikat)
       a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
       if [[ "$mig" == "1" ]]; then
         if [[ -z "$a" ]]; then info "DNS ${domain}: kein A-Record (Parallelbetrieb)"
@@ -2467,12 +2571,13 @@ homeedge_migrate() {
   section "Migration / Reparatur bestehender Installation"
   [[ "${1:-}" == "--no-backup" ]] || maybe_backup_before_change
   load_env
-  # load_env hat Defaults gesetzt (ENABLE_HTTP3=0, WG_MTU=1280, CADDY_FAIL2BAN,
-  # F2B_*). save_env bereinigt zugleich den Token (sanitize) und schreibt alle
-  # Variablen einzeilig - repariert damit alte/mehrzeilige Token-Zeilen.
+  # load_env hat Defaults gesetzt (ENABLE_HTTP3=0, WG_MTU= leer/automatisch,
+  # CADDY_FAIL2BAN, F2B_*). save_env bereinigt zugleich den Token (sanitize) und
+  # schreibt alle Variablen einzeilig - repariert alte/mehrzeilige Token-Zeilen.
+  # Bestehende manuelle WG_MTU-Werte bleiben erhalten (kein Auto-Umstellen).
   save_env
   ok "Konfiguration repariert: Token bereinigt, fehlende Werte ergaenzt."
-  echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  caddy-auth=${F2B_CADDY_MAXRETRY}/${F2B_CADDY_FINDTIME}/${F2B_CADDY_BANTIME}"
+  echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU:-auto}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  caddy-auth=${F2B_CADDY_MAXRETRY}/${F2B_CADDY_FINDTIME}/${F2B_CADDY_BANTIME}"
   # Alte 4-Spalten-Eintraege (ohne Profil) vor der Validierung migrieren, damit
   # saubere Legacy-Dateien nicht faelschlich als "defekt" gemeldet werden.
   migrate_services_4to5 || true
@@ -2776,6 +2881,10 @@ ufw_logs() {
 }
 diag_report() {
   need_root; load_env
+  # Diagnose muss gerade bei Fehlern komplett durchlaufen - keine harten
+  # Abbrueche durch set -e oder durch Funktionen, die bei kaputter services.tsv
+  # mit return 1 aussteigen (Bug P2).
+  set +e
   section "Diagnosebericht erstellen"
   # services.tsv vorab pruefen (Bug P2). Fuer die Diagnose NICHT abbrechen, da
   # der Bericht gerade bei defekter Konfig nuetzlich ist - aber klar markieren.
@@ -3212,6 +3321,7 @@ case "${1:-menu}" in
   repair-services) need_root; repair_services "${2:-}" ;;
   validate-services) if validate_services_file; then ok "services.tsv valide."; else err "services.tsv ungueltig."; exit 1; fi ;;
   verify-setup|verify|apply-verify) verify_setup "${2:-}" ;;
+  diagnose|diag) need_root; diag_report ;;
   migration-mode) need_root; load_env
     case "${2:-}" in
       on|1) MIGRATION_MODE=1; save_env; ok "MIGRATION_MODE=1 (DNS-Umzug laeuft - DNS auf altem VPS wird nur als Warnung gewertet)." ;;
