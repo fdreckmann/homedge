@@ -125,6 +125,7 @@ load_env() {
   HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
   WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
+  MIGRATION_MODE="${MIGRATION_MODE:-0}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
     # Beschaedigten/mehrzeiligen Token VOR dem Sourcen reparieren.
@@ -140,6 +141,7 @@ load_env() {
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
     EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
     WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
+    MIGRATION_MODE="${MIGRATION_MODE:-0}"
     F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   fi
 }
@@ -172,6 +174,7 @@ EXPERT_MODE=$(q "${EXPERT_MODE:-0}")
 BACKUP_BEHAVIOR=$(q "${BACKUP_BEHAVIOR:-ask}")
 WG_MTU=$(q "${WG_MTU:-1280}")
 ENABLE_IPV6=$(q "${ENABLE_IPV6:-0}")
+MIGRATION_MODE=$(q "${MIGRATION_MODE:-0}")
 F2B_CADDY_MAXRETRY=$(q "${F2B_CADDY_MAXRETRY:-20}")
 F2B_CADDY_FINDTIME=$(q "${F2B_CADDY_FINDTIME:-10m}")
 F2B_CADDY_BANTIME=$(q "${F2B_CADDY_BANTIME:-15m}")
@@ -1860,7 +1863,128 @@ select_ext_interface() {
 }
 
 
-apply_all() { need_root; generate_keys; write_wg_config; write_unifi_values; reload_caddy; install_fail2ban; restart_wg; ufw_apply_auto; }
+apply_all() {
+  need_root
+  local rc=0
+  generate_keys || rc=1
+  write_wg_config || rc=1
+  # Dienst-Werte sind optional (haengen an services.tsv) - kein Apply-Blocker.
+  write_unifi_values || true
+  reload_caddy || rc=1
+  install_fail2ban || rc=1
+  # WG ist evtl. noch nicht aktivierbar (UniFi PublicKey fehlt) - nicht fatal.
+  restart_wg || true
+  ufw_apply_auto || rc=1
+  return $rc
+}
+
+# ------------------------------------------------------------
+# Wizard-/Apply-Abschluss: Verifikation
+# Prueft, ob HomeEdge nach Setup/Apply wirklich vollstaendig funktionsfaehig ist.
+# Respektiert MIGRATION_MODE (Parallelbetrieb): DNS auf altem VPS = WARN, nicht ROT.
+# Caddy holt Zertifikate per DNS-01 und startet daher auch, wenn A/AAAA noch auf
+# den alten VPS zeigen. 0 = alles Kritische ok, 1 = mindestens ein harter Fehler.
+# Aufruf: verify_setup [--migration]
+# ------------------------------------------------------------
+verify_setup() {
+  need_root; load_env
+  [[ "${1:-}" == "--migration" ]] && MIGRATION_MODE=1
+  section "Wizard-Abschluss: Verifikation"
+  local fail=0 warns=0
+  local -a problems=()
+  local mig="${MIGRATION_MODE:-0}"
+  [[ "$mig" == "1" ]] && info "MIGRATION_MODE=1: DNS darf noch auf den alten VPS zeigen (WARN, kein Fehler)."
+
+  # services.tsv valide
+  if validate_services_file >/dev/null 2>&1; then ok "services.tsv valide"
+  else err "services.tsv ungueltig"; problems+=("services.tsv ungueltig  ->  sudo homeedge repair-services"); fail=1; fi
+
+  # Caddyfile generiert
+  if [[ -s "${CADDY_DIR}/Caddyfile" ]]; then ok "Caddyfile generiert"
+  else err "Caddyfile fehlt"; problems+=("Caddyfile fehlt  ->  sudo homeedge reload"); fail=1; fi
+
+  # Caddyfile validate OK
+  if validate_caddyfile; then ok "Caddyfile validate OK"
+  else err "Caddyfile validate fehlgeschlagen"; problems+=("Caddyfile ungueltig  ->  sudo homeedge reload"); fail=1; fi
+
+  # Caddy Container running=true restarting=false
+  if caddy_is_running; then ok "Caddy Container laeuft (running=true, restarting=false)"
+  else err "Caddy Container laeuft nicht oder ist im Restarting-Zustand"; problems+=("Caddy startet nicht  ->  sudo homeedge restart"); fail=1; fi
+
+  # UFW aktiv
+  local ufw_out; ufw_out="$(ufw status 2>/dev/null || true)"
+  if grep -qiE "Status: (active|aktiv)" <<<"$ufw_out"; then ok "UFW aktiv"
+  else err "UFW nicht aktiv"; problems+=("UFW inaktiv  ->  sudo homeedge firewall"); fail=1; fi
+
+  # 443/tcp erlaubt
+  if grep -qE "(^|[[:space:]])443/tcp" <<<"$ufw_out"; then ok "443/tcp erlaubt"
+  else err "443/tcp nicht freigegeben"; problems+=("443/tcp fehlt  ->  sudo homeedge firewall"); fail=1; fi
+
+  # WG-Port udp erlaubt
+  if grep -qE "(^|[[:space:]])${WG_PORT}/udp" <<<"$ufw_out"; then ok "WireGuard ${WG_PORT}/udp erlaubt"
+  else err "${WG_PORT}/udp nicht freigegeben"; problems+=("${WG_PORT}/udp fehlt  ->  sudo homeedge firewall"); fail=1; fi
+
+  # Fail2ban aktiv
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then ok "Fail2ban aktiv"
+  else err "Fail2ban nicht aktiv"; problems+=("Fail2ban inaktiv  ->  sudo systemctl restart fail2ban"); fail=1; fi
+
+  # caddy-auth Jail vorhanden, wenn aktiviert
+  if [[ "${CADDY_FAIL2BAN}" == "1" ]]; then
+    if fail2ban-client status caddy-auth >/dev/null 2>&1; then ok "caddy-auth Jail vorhanden"
+    else err "caddy-auth aktiviert, aber Jail fehlt"; problems+=("caddy-auth Jail fehlt  ->  sudo homeedge fail2ban"); fail=1; fi
+  fi
+
+  # WireGuard Interface vorhanden
+  if ip link show "$WG_IF" >/dev/null 2>&1; then ok "WireGuard Interface ${WG_IF} vorhanden"
+  elif [[ -n "${CLIENT_PUBLIC_KEY:-}" ]]; then
+    err "WireGuard Interface ${WG_IF} fehlt"; problems+=("WG Interface fehlt  ->  sudo systemctl restart wg-quick@${WG_IF}"); fail=1
+  else
+    warn "WireGuard Interface ${WG_IF} noch nicht aktiv (UniFi/Client PublicKey fehlt - im Parallelbetrieb ok)"; warns=$((warns+1))
+  fi
+
+  # Lokaler SNI-Test pro Domain + DNS-Bewertung (MIGRATION_MODE-aware)
+  if [[ -s "$SERVICES_FILE" ]] && validate_services_file >/dev/null 2>&1; then
+    local domain scheme ip port profile a expect="${VPS_PUBLIC_HOST:-}"
+    while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
+      [[ -z "$domain" ]] && continue
+      # Lokaler SNI/TLS-Test: curl --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
+      if cert_ready "$domain"; then
+        ok "SNI/TLS lokal ok: ${domain}"
+      else
+        warn "Zertifikat fuer ${domain} noch nicht aktiv (DNS-01 kann 1-2 Min dauern). Test: sudo homeedge test-domain ${domain}"; warns=$((warns+1))
+      fi
+      # DNS-Bewertung
+      a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
+      if [[ "$mig" == "1" ]]; then
+        if [[ -z "$a" ]]; then info "DNS ${domain}: kein A-Record (Parallelbetrieb)"
+        elif [[ -n "$expect" ]] && _is_ip "$expect" && [[ "$a" != "$expect" ]]; then warn "DNS ${domain} -> ${a} zeigt noch auf alten VPS (bewusst, MIGRATION_MODE=1)"; warns=$((warns+1))
+        else ok "DNS ${domain} -> ${a:-?}"; fi
+      else
+        if [[ -z "$a" ]]; then err "DNS ${domain}: kein A-Record"; problems+=("DNS ${domain} fehlt  ->  A-Record auf diesen VPS setzen oder MIGRATION_MODE=1"); fail=1
+        elif _is_ip "$expect" && [[ "$a" != "$expect" ]]; then err "DNS ${domain} -> ${a}, erwartet ${expect}"; problems+=("DNS ${domain} zeigt nicht auf diesen VPS  ->  A-Record korrigieren oder MIGRATION_MODE=1"); fail=1
+        else ok "DNS ${domain} -> ${a}"; fi
+      fi
+    done < "$SERVICES_FILE"
+  else
+    info "Keine gueltigen Dienste eingetragen - SNI/DNS-Test uebersprungen."
+  fi
+
+  section "Ergebnis"
+  if (( fail )); then
+    err "Setup NICHT vollstaendig erfolgreich - bitte folgende Punkte beheben:"
+    local p; for p in "${problems[@]}"; do printf '  %b-%b %s\n' "$C_RED" "$C_RESET" "$p"; done
+    echo
+    err "Allgemeine Diagnose: sudo homeedge health   und   sudo homeedge diagnose"
+    err "Nach der Reparatur erneut pruefen: sudo homeedge verify-setup"
+    return 1
+  fi
+  if (( warns )); then
+    warn "Setup funktionsfaehig. ${warns} Hinweis(e) (z. B. DNS-Migration laeuft noch oder Zertifikate werden gerade ausgestellt)."
+  else
+    ok "Setup vollstaendig erfolgreich und funktionsfaehig."
+  fi
+  return 0
+}
 
 # ------------------------------------------------------------
 # Ampel / Health checks
@@ -2651,6 +2775,8 @@ sm_status() {
     menu_item 7 "DNS Status pro Domain"
     menu_item 8 "IPv6 Status (extern)"
     menu_item 9 "Server Auslastung"
+    menu_item 10 "Setup verifizieren (Wizard-Abschluss)"
+    menu_item 11 "Migrationsmodus an/aus (DNS-Umzug)"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2663,6 +2789,14 @@ sm_status() {
       7) domains_status; pause ;;
       8) ipv6_status; pause ;;
       9) system_usage; pause ;;
+      10) verify_setup; pause ;;
+      11) load_env
+          if [[ "${MIGRATION_MODE:-0}" == "1" ]]; then
+            if yesno "Migrationsmodus ausschalten (DNS muss dann auf diesen VPS zeigen)?" "n"; then MIGRATION_MODE=0; save_env; ok "MIGRATION_MODE=0"; fi
+          else
+            if yesno "Migrationsmodus einschalten (DNS darf noch auf alten VPS zeigen)?" "y"; then MIGRATION_MODE=1; save_env; ok "MIGRATION_MODE=1"; fi
+          fi
+          pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2978,6 +3112,13 @@ case "${1:-menu}" in
   restore-config) need_root; restore_config ;;
   repair-services) need_root; repair_services "${2:-}" ;;
   validate-services) if validate_services_file; then ok "services.tsv valide."; else err "services.tsv ungueltig."; exit 1; fi ;;
+  verify-setup|verify|apply-verify) verify_setup "${2:-}" ;;
+  migration-mode) need_root; load_env
+    case "${2:-}" in
+      on|1) MIGRATION_MODE=1; save_env; ok "MIGRATION_MODE=1 (DNS-Umzug laeuft - DNS auf altem VPS wird nur als Warnung gewertet)." ;;
+      off|0) MIGRATION_MODE=0; save_env; ok "MIGRATION_MODE=0 (DNS muss auf diesen VPS zeigen)." ;;
+      *) echo "Aktuell: MIGRATION_MODE=${MIGRATION_MODE:-0}"; echo "Nutzung: sudo homeedge migration-mode on|off" ;;
+    esac ;;
   update|updates|wartung) sm_updates ;;
   migrate) need_root; homeedge_migrate "${2:-}" ;;
   mtu) need_root; edit_wg_mtu ;;
@@ -3016,5 +3157,5 @@ case "${1:-menu}" in
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|wg-values|add-service|reload|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac
