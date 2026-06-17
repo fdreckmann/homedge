@@ -8,6 +8,10 @@ APP_VERSION="0.9.11-homeedge"
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
 CADDY_DIR="/opt/caddy-edge"
+# Zentrale Compose-Datei fuer den Caddy-Stack. IMMER mit explizitem -f nutzen,
+# nie auf das aktuelle Arbeitsverzeichnis verlassen (sonst "no configuration
+# file provided: not found", wenn man nicht in /opt/caddy-edge steht).
+CADDY_COMPOSE_FILE="${CADDY_DIR}/docker-compose.yml"
 SERVICES_FILE="${CFG_DIR}/services.tsv"
 ENV_FILE="${CFG_DIR}/homeedge.env"
 KEY_DIR="${CFG_DIR}/keys"
@@ -78,6 +82,33 @@ mask_secrets() {
 # running=true UND restarting=false -> OK; sonst (fehlt/Restarting) -> Fehler.
 caddy_is_running() {
   [[ "$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' caddy-edge 2>/dev/null)" == "true false" ]]
+}
+# docker compose fuer den Caddy-Stack mit explizitem Compose-Pfad (cwd-unabhaengig).
+caddy_compose() { docker compose -f "$CADDY_COMPOSE_FILE" "$@"; }
+caddy_compose_file_exists() { [[ -f "$CADDY_COMPOSE_FILE" ]]; }
+# Granulare Zustandspruefung des Caddy-Stacks. Gibt genau einen Status aus:
+#   dir_missing | caddyfile_missing | env_missing | compose_missing |
+#   compose_invalid | no_container | restarting | exited | running
+caddy_stack_state() {
+  [[ -d "$CADDY_DIR" ]] || { echo dir_missing; return; }
+  [[ -f "${CADDY_DIR}/Caddyfile" ]] || { echo caddyfile_missing; return; }
+  [[ -f "${CADDY_DIR}/.env" ]] || { echo env_missing; return; }
+  caddy_compose_file_exists || { echo compose_missing; return; }
+  caddy_compose config >/dev/null 2>&1 || { echo compose_invalid; return; }
+  local line running restarting status
+  line="$(docker inspect -f '{{.State.Running}} {{.State.Restarting}} {{.State.Status}}' caddy-edge 2>/dev/null)" || { echo no_container; return; }
+  [[ -z "$line" ]] && { echo no_container; return; }
+  read -r running restarting status <<<"$line"
+  if [[ "$running" == "true" && "$restarting" == "false" ]]; then echo running
+  elif [[ "$restarting" == "true" ]]; then echo restarting
+  elif [[ "$status" == "exited" ]]; then echo exited
+  else echo "${status:-exited}"; fi
+}
+# Einheitlicher Reparaturhinweis bei fehlendem/defektem Caddy-Stack.
+caddy_stack_repair_hint() {
+  info "Reparatur:"
+  printf '  %s\n' "sudo homeedge apply-all"
+  printf '  %s\n' "sudo homeedge caddy-rebuild"
 }
 # Robuster Check, ob lokal ein UDP-Port lauscht (ss-Filter statt Spalten-Parsing).
 udp_port_open() { local p="$1"; ss -H -lun "sport = :${p}" 2>/dev/null | grep -q . ; }
@@ -512,12 +543,12 @@ generate_caddyfile() { generate_caddyfile_to "${CADDY_DIR}/Caddyfile"; }
 # Validiert das aktuelle Caddyfile. Nutzt den laufenden Container oder baut
 # bei Bedarf das Image und validiert in einem Wegwerf-Container.
 validate_caddyfile() {
-  cd "$CADDY_DIR" || return 1
+  caddy_compose_file_exists || { err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; return 1; }
   if caddy_is_running; then
-    docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
+    caddy_compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
   else
-    docker compose build >/dev/null 2>&1 || return 1
-    docker compose run --rm --no-deps -T --entrypoint caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
+    caddy_compose build >/dev/null 2>&1 || return 1
+    caddy_compose run --rm --no-deps -T --entrypoint caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
   fi
 }
 
@@ -595,13 +626,13 @@ reload_caddy() {
   section "Caddy neu laden"
   require_valid_services || return 1
   _caddy_prepare_config || return 1
-  cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
+  caddy_compose_file_exists || { err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; }
   if caddy_is_running; then
-    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || docker compose up -d >/dev/null 2>&1
+    caddy_compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || caddy_compose up -d >/dev/null 2>&1
   else
-    docker compose build >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1
+    caddy_compose build >/dev/null 2>&1 && caddy_compose up -d >/dev/null 2>&1
   fi
-  if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
+  if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
   wait_for_certs
   echo
   info "Test einer Domain: sudo homeedge test-domain DEINE.DOMAIN"
@@ -611,14 +642,28 @@ reload_caddy() {
 restart_caddy() {
   section "Caddy neu starten / neu bauen"
   _caddy_prepare_config || return 1
-  cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
-  if docker compose build >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1; then
+  caddy_compose_file_exists || { err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; }
+  if caddy_compose build >/dev/null 2>&1 && caddy_compose up -d >/dev/null 2>&1; then
     :
   else
     err "Caddy-Build/Start fehlgeschlagen."; return 1
   fi
-  if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
+  if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
   wait_for_certs
+}
+
+# Erzwingt das Neuschreiben des kompletten Caddy-Stacks und baut/startet ihn neu.
+# Fuer die "Caddy Stack fehlt"-Reparatur (sudo homeedge caddy-rebuild).
+caddy_rebuild() {
+  need_root; load_env
+  section "Caddy Stack neu erstellen / neu bauen"
+  # Stack-Dateien (Dockerfile, docker-compose.yml, .env, Verzeichnisse) sicher
+  # anlegen, BEVOR validiert/gebaut wird - auch wenn vorher gar nichts da war.
+  write_caddy_stack
+  mkdir -p "${CADDY_DIR}/data" "${CADDY_DIR}/config" "${CADDY_DIR}/logs"
+  caddy_compose_file_exists || { err "Compose-Datei konnte nicht geschrieben werden: $CADDY_COMPOSE_FILE"; return 1; }
+  ok "Caddy-Stack-Dateien geschrieben (Dockerfile, docker-compose.yml, .env)"
+  restart_caddy
 }
 
 install_fail2ban() {
@@ -1513,7 +1558,7 @@ show_logs() {
   menu_item 0 "Zurueck"
   line
   local c; c="$(ask "Auswahl" "1")"
-  case "$c" in 1) docker logs -f --tail 100 caddy-edge 2>&1 | mask_secrets ;; 2) tail -f "${CADDY_DIR}/logs/access.log" 2>/dev/null | mask_secrets ;; 3) { tail -f /var/log/fail2ban.log 2>/dev/null || journalctl -u fail2ban -f; } | mask_secrets ;; 4) watch -n 2 wg show ;; 0) return ;; *) err "Ungueltig." ;; esac
+  case "$c" in 1) if caddy_compose_file_exists; then caddy_compose logs -f --tail 100 2>&1 | mask_secrets; else docker logs -f --tail 100 caddy-edge 2>&1 | mask_secrets; fi ;; 2) tail -f "${CADDY_DIR}/logs/access.log" 2>/dev/null | mask_secrets ;; 3) { tail -f /var/log/fail2ban.log 2>/dev/null || journalctl -u fail2ban -f; } | mask_secrets ;; 4) watch -n 2 wg show ;; 0) return ;; *) err "Ungueltig." ;; esac
 }
 
 system_usage() {
@@ -1899,17 +1944,25 @@ verify_setup() {
   if validate_services_file >/dev/null 2>&1; then ok "services.tsv valide"
   else err "services.tsv ungueltig"; problems+=("services.tsv ungueltig  ->  sudo homeedge repair-services"); fail=1; fi
 
-  # Caddyfile generiert
-  if [[ -s "${CADDY_DIR}/Caddyfile" ]]; then ok "Caddyfile generiert"
-  else err "Caddyfile fehlt"; problems+=("Caddyfile fehlt  ->  sudo homeedge reload"); fail=1; fi
-
-  # Caddyfile validate OK
-  if validate_caddyfile; then ok "Caddyfile validate OK"
-  else err "Caddyfile validate fehlgeschlagen"; problems+=("Caddyfile ungueltig  ->  sudo homeedge reload"); fail=1; fi
-
-  # Caddy Container running=true restarting=false
-  if caddy_is_running; then ok "Caddy Container laeuft (running=true, restarting=false)"
-  else err "Caddy Container laeuft nicht oder ist im Restarting-Zustand"; problems+=("Caddy startet nicht  ->  sudo homeedge restart"); fail=1; fi
+  # Caddy-Stack vollstaendig pruefen: Verzeichnis, Caddyfile, .env, Compose-Datei,
+  # Compose-Config und Container-Zustand (Bug P1: Wizard darf nicht ohne Stack
+  # "fertig" melden).
+  local stack; stack="$(caddy_stack_state)"
+  case "$stack" in
+    dir_missing)       err "Caddy Verzeichnis fehlt: $CADDY_DIR"; problems+=("Caddy Stack fehlt  ->  sudo homeedge apply-all  oder  sudo homeedge caddy-rebuild"); fail=1 ;;
+    caddyfile_missing) err "Caddyfile fehlt: ${CADDY_DIR}/Caddyfile"; problems+=("Caddyfile fehlt  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
+    env_missing)       err "Caddy .env fehlt: ${CADDY_DIR}/.env"; problems+=(".env fehlt  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
+    compose_missing)   err "Caddy Docker Compose Datei fehlt: $CADDY_COMPOSE_FILE"; problems+=("Compose-Datei fehlt  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
+    compose_invalid)   err "docker compose config ungueltig (${CADDY_COMPOSE_FILE})"; problems+=("Compose ungueltig  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
+    no_container)      err "Caddy Container existiert nicht"; problems+=("Container fehlt  ->  sudo homeedge apply-all"); fail=1 ;;
+    restarting)        err "Caddy Container im Restarting-Zustand (Crash-Loop)"; problems+=("Caddy crasht  ->  sudo homeedge restart; sudo homeedge caddy-logs"); fail=1 ;;
+    exited)            err "Caddy Container ist exited (gestoppt)"; problems+=("Caddy gestoppt  ->  sudo homeedge restart"); fail=1 ;;
+    running)
+      ok "Caddy Stack vollstaendig (Verzeichnis, Caddyfile, .env, docker-compose.yml)"
+      ok "Caddy Container laeuft (running=true, restarting=false)"
+      if validate_caddyfile; then ok "Caddyfile validate OK"
+      else err "Caddyfile validate fehlgeschlagen"; problems+=("Caddyfile ungueltig  ->  sudo homeedge reload"); fail=1; fi ;;
+  esac
 
   # UFW aktiv
   local ufw_out; ufw_out="$(ufw status 2>/dev/null || true)"
@@ -2058,16 +2111,33 @@ health_check() {
 
   if systemctl is-active --quiet docker 2>/dev/null; then _health_line green "Docker" "aktiv"; else _health_line red "Docker" "nicht aktiv"; fi
 
-  if caddy_is_running; then
-    _health_line green "Caddy Container" "laeuft"
-    if (cd "$CADDY_DIR" && docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1); then
-      _health_line green "Caddy Konfig" "valid"
-    else
-      _health_line red "Caddy Konfig" "ungueltig oder nicht pruefbar"
-    fi
-  else
-    _health_line red "Caddy Container" "laeuft nicht"
-  fi
+  # Caddy-Stack granular bewerten: Verzeichnis, Caddyfile, .env, Compose-Datei,
+  # Compose-Config und Container-Zustand getrennt melden (Bug P1).
+  case "$(caddy_stack_state)" in
+    dir_missing)
+      _health_line red "Caddy Stack" "Verzeichnis fehlt: $CADDY_DIR"; caddy_stack_repair_hint ;;
+    caddyfile_missing)
+      _health_line red "Caddy Stack" "Caddyfile fehlt: ${CADDY_DIR}/Caddyfile"; caddy_stack_repair_hint ;;
+    env_missing)
+      _health_line red "Caddy Stack" ".env fehlt: ${CADDY_DIR}/.env"; caddy_stack_repair_hint ;;
+    compose_missing)
+      _health_line red "Caddy Stack" "fehlt: ${CADDY_COMPOSE_FILE} nicht gefunden"; caddy_stack_repair_hint ;;
+    compose_invalid)
+      _health_line red "Caddy Stack" "docker compose config ungueltig"; caddy_stack_repair_hint ;;
+    no_container)
+      _health_line red "Caddy Container" "existiert nicht"; caddy_stack_repair_hint ;;
+    restarting)
+      _health_line red "Caddy Container" "Restarting (Crash-Loop) - Logs: sudo homeedge caddy-logs" ;;
+    exited)
+      _health_line red "Caddy Container" "exited (gestoppt) - Reparatur: sudo homeedge restart" ;;
+    running)
+      _health_line green "Caddy Container" "laeuft (running=true, restarting=false)"
+      if caddy_compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+        _health_line green "Caddy Konfig" "valid"
+      else
+        _health_line red "Caddy Konfig" "ungueltig oder nicht pruefbar"
+      fi ;;
+  esac
 
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
     _health_line green "Fail2ban" "aktiv"
@@ -2322,12 +2392,11 @@ system_update() {
 caddy_update() {
   need_root
   section "Caddy / Docker aktualisieren"
-  if [[ ! -f "${CADDY_DIR}/docker-compose.yml" ]]; then err "Caddy Compose-Datei nicht gefunden."; return 1; fi
+  if ! caddy_compose_file_exists; then err "Caddy Compose-Datei nicht gefunden: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; fi
   maybe_backup_before_change
   # services.tsv pruefen + Caddyfile generieren/validieren (atomar, mit Rollback).
   if ! _caddy_prepare_config; then err "Abbruch: Konfiguration ungueltig, kein Rebuild. Letzte Caddyfile bleibt."; return 1; fi
-  cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
-  if docker compose build --pull >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1; then
+  if caddy_compose build --pull >/dev/null 2>&1 && caddy_compose up -d >/dev/null 2>&1; then
     :
   else
     err "Caddy-Build/Start fehlgeschlagen. Vorherige Caddyfile bleibt erhalten - bei Bedarf Rollback ueber Backup."
@@ -2571,12 +2640,34 @@ caddy_status() {
   load_env
   section "Caddy / Docker Status"
   if systemctl is-active --quiet docker 2>/dev/null; then ok "Docker aktiv"; else err "Docker nicht aktiv"; fi
-  if caddy_is_running; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; fi
-  docker ps --filter name=caddy-edge --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
+  case "$(caddy_stack_state)" in
+    dir_missing)       err "Caddy Verzeichnis fehlt: $CADDY_DIR"; caddy_stack_repair_hint ;;
+    caddyfile_missing) err "Caddyfile fehlt: ${CADDY_DIR}/Caddyfile"; caddy_stack_repair_hint ;;
+    env_missing)       err "Caddy .env fehlt: ${CADDY_DIR}/.env"; caddy_stack_repair_hint ;;
+    compose_missing)   err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint ;;
+    compose_invalid)   err "docker compose config ungueltig"; caddy_stack_repair_hint ;;
+    no_container)      err "Caddy Container existiert nicht"; caddy_stack_repair_hint ;;
+    restarting)        err "Caddy Container Restarting (Crash-Loop) - Logs: sudo homeedge caddy-logs" ;;
+    exited)            err "Caddy Container exited (gestoppt) - Reparatur: sudo homeedge restart" ;;
+    running)           ok "Caddy Container laeuft (running=true, restarting=false)" ;;
+  esac
+  docker ps -a --filter name=caddy-edge --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
   echo
   if tcp_port_open 443; then ok "lauscht auf :443 (IPv4)"; else warn ":443 (IPv4) nicht sichtbar"; fi
   if caddy_listens_ipv6_443; then ok "lauscht auf :443 (IPv6)"; else info ":443 (IPv6) nicht sichtbar"; fi
   ss -tulpnH 2>/dev/null | grep ':443' | sed 's/^/  /' | mask_secrets || true
+}
+
+# Caddy-Logs mit explizitem Compose-Pfad (cwd-unabhaengig). Fallback: docker logs.
+caddy_logs() {
+  local n="${1:-120}"
+  section "Caddy Logs (letzte ${n})"
+  if caddy_compose_file_exists; then
+    caddy_compose logs --tail "$n" 2>&1 | mask_secrets || docker logs --tail "$n" caddy-edge 2>&1 | mask_secrets || true
+  else
+    warn "Compose-Datei fehlt: $CADDY_COMPOSE_FILE - nutze 'docker logs caddy-edge'."
+    docker logs --tail "$n" caddy-edge 2>&1 | mask_secrets || true
+  fi
 }
 
 # IPv6-Statusuebersicht (extern Client -> VPS/Caddy).
@@ -2669,7 +2760,7 @@ restart_services() {
   need_root; load_env
   section "Dienste neu starten"
   if ! yesno "Caddy, WireGuard und Fail2ban neu starten?" "n"; then warn "Abgebrochen."; return; fi
-  if [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then (cd "$CADDY_DIR" && docker compose restart >/dev/null 2>&1) && ok "Caddy neu gestartet." || warn "Caddy-Neustart fehlgeschlagen."; fi
+  if caddy_compose_file_exists; then caddy_compose restart >/dev/null 2>&1 && ok "Caddy neu gestartet." || warn "Caddy-Neustart fehlgeschlagen."; else warn "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE (sudo homeedge caddy-rebuild)"; fi
   restart_wg
   systemctl restart fail2ban 2>/dev/null && ok "Fail2ban neu gestartet." || warn "Fail2ban nicht neu gestartet."
 }
@@ -2709,6 +2800,10 @@ diag_report() {
     echo; echo "## Domains/DNS"; domains_status
     echo; echo "## Offene Ports (ss -tulpn)"; ss -tulpn 2>/dev/null
     echo; echo "## Docker"; docker ps -a 2>/dev/null
+    echo; echo "## Caddy Stack"
+    echo "Status: $(caddy_stack_state)"
+    echo "Verzeichnis ${CADDY_DIR}:"; ls -la "$CADDY_DIR" 2>/dev/null || echo "  (fehlt)"
+    echo "docker compose config:"; caddy_compose config >/dev/null 2>&1 && echo "  OK" || echo "  ungueltig/fehlt"
     echo; echo "## WireGuard"; wg show 2>/dev/null
     echo; echo "## WireGuard Konfig (/etc/wireguard)"; ls -l /etc/wireguard 2>/dev/null; grep -RnE '^(Address|ListenPort|MTU|AllowedIPs|PersistentKeepalive)' /etc/wireguard 2>/dev/null
     echo; echo "## Routen"; ip route 2>/dev/null
@@ -2717,7 +2812,7 @@ diag_report() {
     echo; echo "## Caddyfile"; [[ -f "${CADDY_DIR}/Caddyfile" ]] && cat "${CADDY_DIR}/Caddyfile"
     echo; echo "## Zertifikate (lokaler SNI-Check)"; check_certs 2>/dev/null
     echo; echo "## Speicher/Disk"; free -h 2>/dev/null; echo; df -h / 2>/dev/null
-    echo; echo "## Caddy Logs (tail)"; docker logs --tail 80 caddy-edge 2>/dev/null
+    echo; echo "## Caddy Logs (tail)"; if caddy_compose_file_exists; then caddy_compose logs --tail 80 2>/dev/null; else docker logs --tail 80 caddy-edge 2>/dev/null; fi
   } 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | mask_secrets > "$f"
   chmod 600 "$f"
   ok "Diagnosebericht gespeichert: $f (Secrets maskiert)."
@@ -2869,26 +2964,30 @@ sm_caddy() {
     menu_item 1 "Caddy Status"
     menu_item 2 "Caddy reload (Caddyfile neu erzeugen)"
     menu_item 3 "Caddy restart / neu bauen"
-    menu_item 4 "Zertifikate anzeigen"
-    menu_item 5 "Cloudflare API Token aendern"
-    menu_item 6 "Cloudflare Token testen"
-    menu_item 7 "DNS Challenge pruefen"
-    menu_item 8 "HTTP/3 aktivieren/deaktivieren"
-    menu_item 9 "IPv6 extern aktivieren/deaktivieren"
-    menu_item 10 "IPv6 Status anzeigen"
+    menu_item 4 "Caddy Stack neu erstellen (caddy-rebuild)"
+    menu_item 5 "Caddy Logs anzeigen"
+    menu_item 6 "Zertifikate anzeigen"
+    menu_item 7 "Cloudflare API Token aendern"
+    menu_item 8 "Cloudflare Token testen"
+    menu_item 9 "DNS Challenge pruefen"
+    menu_item 10 "HTTP/3 aktivieren/deaktivieren"
+    menu_item 11 "IPv6 extern aktivieren/deaktivieren"
+    menu_item 12 "IPv6 Status anzeigen"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
       1) caddy_status; pause ;;
       2) reload_caddy; pause ;;
       3) restart_caddy; pause ;;
-      4) check_certs; pause ;;
-      5) change_cloudflare_token; pause ;;
-      6) verify_current_token; pause ;;
-      7) dns_challenge_test; pause ;;
-      8) security_http3_toggle; pause ;;
-      9) ipv6_toggle; pause ;;
-      10) ipv6_status; pause ;;
+      4) caddy_rebuild; pause ;;
+      5) caddy_logs; pause ;;
+      6) check_certs; pause ;;
+      7) change_cloudflare_token; pause ;;
+      8) verify_current_token; pause ;;
+      9) dns_challenge_test; pause ;;
+      10) security_http3_toggle; pause ;;
+      11) ipv6_toggle; pause ;;
+      12) ipv6_status; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -3152,10 +3251,12 @@ case "${1:-menu}" in
   list-services) list_services ;;
   reload) reload_caddy ;;
   restart) restart_caddy ;;
+  caddy-rebuild|rebuild-caddy) need_root; caddy_rebuild ;;
+  caddy-logs|caddy-log) caddy_logs "${2:-120}" ;;
   test-backends) test_backends ;;
   logs) show_logs ;;
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac
