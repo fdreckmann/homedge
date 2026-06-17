@@ -27,6 +27,14 @@ if [[ ! -d "$KEY_DIR" || -z "$(ls -A "$KEY_DIR" 2>/dev/null)" ]]; then
   [[ -d /etc/edgectl/keys ]] && cp -a /etc/edgectl/keys/. "$KEY_DIR"/ 2>/dev/null || true
 fi
 
+# services.tsv beim ersten Start sauber initialisieren. Eine fehlende oder leere
+# Datei bedeutet "noch keine Dienste" und ist im Erstsetup voellig ok - sie darf
+# WireGuard-/Setup-Funktionen nicht blockieren.
+if [[ ! -f "$SERVICES_FILE" ]]; then
+  touch "$SERVICES_FILE" 2>/dev/null || true
+  chmod 600 "$SERVICES_FILE" 2>/dev/null || true
+fi
+
 # ------------------------------------------------------------
 # UI helpers
 # ------------------------------------------------------------
@@ -1156,6 +1164,39 @@ repair_build() {
   printf '%s\n' "${out[@]}"
 }
 
+# Migriert alte 4-Spalten-Eintraege (ohne Profil) auf das aktuelle 5-Spalten-
+# Format, indem das Profil anhand des Ports ergaenzt wird. Nur eindeutig saubere
+# 4-Spalten-Zeilen werden migriert; alles andere bleibt unveraendert und wird
+# der regulaeren Validierung/Reparatur ueberlassen. Idempotent.
+# 0 = migriert oder nichts zu tun, 1 = nicht eindeutig migrierbar.
+migrate_services_4to5() {
+  local f="${1:-$SERVICES_FILE}"
+  [[ -f "$f" && -s "$f" ]] || return 0
+  validate_services_file "$f" >/dev/null 2>&1 && return 0
+  local tmp changed=0 line nf d s i p
+  tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    nf=$(awk -F'\t' '{print NF}' <<<"$line")
+    if [[ "$nf" -eq 4 ]]; then
+      IFS=$'\t' read -r d s i p <<<"$line"
+      if valid_domain "$d" && valid_scheme "$s" && valid_backend "$i" && valid_port "$p"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$s" "$i" "$p" "$(profile_suggest "$p")" >> "$tmp"
+        changed=1
+        continue
+      fi
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$f"
+  if (( changed )) && validate_services_file "$tmp" >/dev/null 2>&1; then
+    cat "$tmp" > "$f"; chmod 600 "$f" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 # Analysiert/repariert services.tsv (Backup der defekten Datei vorher).
 repair_services() {
   need_root; load_env
@@ -2239,8 +2280,11 @@ homeedge_migrate() {
   save_env
   ok "Konfiguration repariert: Token bereinigt, fehlende Werte ergaenzt."
   echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  caddy-auth=${F2B_CADDY_MAXRETRY}/${F2B_CADDY_FINDTIME}/${F2B_CADDY_BANTIME}"
-  # services.tsv pruefen und ggf. nicht-interaktiv reparieren (4->5 Spalten,
-  # verklebte Zeilen, fehlendes Newline) bevor die Caddyfile erzeugt wird.
+  # Alte 4-Spalten-Eintraege (ohne Profil) vor der Validierung migrieren, damit
+  # saubere Legacy-Dateien nicht faelschlich als "defekt" gemeldet werden.
+  migrate_services_4to5 || true
+  # services.tsv pruefen und ggf. nicht-interaktiv reparieren (verklebte Zeilen,
+  # fehlendes Newline, mehrdeutige Reste) bevor die Caddyfile erzeugt wird.
   if ! validate_services_file >/dev/null 2>&1; then
     warn "services.tsv defekt - versuche automatische Reparatur..."
     repair_services --non-interactive || warn "services.tsv konnte nicht automatisch repariert werden."
