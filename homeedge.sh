@@ -12,6 +12,9 @@ CADDY_DIR="/opt/caddy-edge"
 # nie auf das aktuelle Arbeitsverzeichnis verlassen (sonst "no configuration
 # file provided: not found", wenn man nicht in /opt/caddy-edge steht).
 CADDY_COMPOSE_FILE="${CADDY_DIR}/docker-compose.yml"
+# Log-Verzeichnis fuer HomeEdge (z. B. echter caddy-validate-Output).
+HOMEEDGE_LOG_DIR="/var/log/homeedge"
+CADDY_VALIDATE_LOG="${HOMEEDGE_LOG_DIR}/caddy-validate.log"
 SERVICES_FILE="${CFG_DIR}/services.tsv"
 ENV_FILE="${CFG_DIR}/homeedge.env"
 KEY_DIR="${CFG_DIR}/keys"
@@ -580,13 +583,33 @@ validate_caddyfile() {
 
 # Validiert eine beliebige Caddyfile (Host-Pfad) in einem Wegwerf-Container, OHNE
 # die produktive Caddyfile anzufassen (Bug P2: erst Temp validieren, dann ersetzen).
+# Schreibt den echten (maskierten) caddy-validate-Output nach CADDY_VALIDATE_LOG
+# und in die globale Variable CADDY_VALIDATE_OUTPUT. 0 = gueltig.
+CADDY_VALIDATE_OUTPUT=""
 _validate_caddyfile_path() {
-  local f="$1"
-  [[ -f "$f" ]] || return 1
-  caddy_compose_file_exists || return 1
-  caddy_compose build >/dev/null 2>&1 || return 1
-  caddy_compose run --rm --no-deps -T -v "${f}:/tmp/Caddyfile.check:ro" \
-    --entrypoint caddy caddy validate --config /tmp/Caddyfile.check >/dev/null 2>&1
+  local f="$1" rc
+  CADDY_VALIDATE_OUTPUT=""
+  [[ -f "$f" ]] || { CADDY_VALIDATE_OUTPUT="Datei nicht gefunden: $f"; return 1; }
+  caddy_compose_file_exists || { CADDY_VALIDATE_OUTPUT="Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; return 1; }
+  mkdir -p "$HOMEEDGE_LOG_DIR" 2>/dev/null || true
+  # Image (mit caddy-dns/cloudflare) sicherstellen, bevor validiert wird.
+  if ! caddy_compose build >/dev/null 2>&1; then
+    CADDY_VALIDATE_OUTPUT="docker compose build fehlgeschlagen (Caddy-Image konnte nicht gebaut werden)."
+    { echo "[$(date -Is)] ${CADDY_VALIDATE_OUTPUT}"; echo "----"; } >> "$CADDY_VALIDATE_LOG" 2>/dev/null || true
+    return 1
+  fi
+  # WICHTIG: --adapter caddyfile ERZWINGEN. Heisst die Datei nicht exakt
+  # "Caddyfile", interpretiert Caddy sie sonst als JSON und meldet faelschlich
+  # "ungueltig" (Ursache fuer den Fresh-Install-Fehler).
+  CADDY_VALIDATE_OUTPUT="$(caddy_compose run --rm --no-deps -T -v "${f}:/tmp/Caddyfile.check:ro" \
+    --entrypoint caddy caddy validate --adapter caddyfile --config /tmp/Caddyfile.check 2>&1)"
+  rc=$?
+  {
+    echo "[$(date -Is)] caddy validate (rc=${rc}) fuer ${f}"
+    printf '%s\n' "$CADDY_VALIDATE_OUTPUT"
+    echo "----"
+  } 2>/dev/null | mask_secrets >> "$CADDY_VALIDATE_LOG" 2>/dev/null || true
+  return $rc
 }
 
 # Prueft, ob fuer eine Domain lokal (per SNI auf 127.0.0.1) ein Zertifikat ausgeliefert wird.
@@ -651,14 +674,27 @@ _caddy_prepare_config() {
   if (( missing )); then rm -f "$tmp"; err "Abbruch: Caddyfile unvollstaendig, nichts geaendert."; return 1; fi
   # Temp-Caddyfile VOR dem produktiven Ersetzen validieren. Nur bei OK ersetzen.
   if ! _validate_caddyfile_path "$tmp"; then
+    # Fehlerhafte Datei zur Analyse aufheben (Bug P1: echten Fehler sichtbar machen).
+    cp -a "$tmp" "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null || true
     rm -f "$tmp"
     err "Neue Caddyfile ist ungueltig - die produktive Caddyfile bleibt unveraendert."
+    err "Caddy validate:"
+    printf '%s\n' "${CADDY_VALIDATE_OUTPUT:-(kein Output)}" | mask_secrets | sed 's/^/    /'
+    info "Fehlerhafte Datei gespeichert: ${CADDY_DIR}/Caddyfile.failed"
+    info "Log: ${CADDY_VALIDATE_LOG}"
+    # Haeufige Ursache: Cloudflare-DNS-Modul fehlt im Caddy-Image.
+    if grep -qiE 'cloudflare|getting dns provider|unknown directive|unrecognized directive|dns' <<<"${CADDY_VALIDATE_OUTPUT:-}"; then
+      err "Moeglich: Caddy Cloudflare DNS Modul fehlt im Image."
+      info "Caddy Image neu bauen: sudo homeedge caddy-rebuild"
+    fi
     return 1
   fi
   ok "Config validiert"
   # Gueltig: produktiv ersetzen. (Es liegt also nie eine ungueltige Caddyfile
   # aktiv; gibt es noch keine alte, bleibt bei Fehler gar keine kaputte zurueck.)
   mv "$tmp" "$cf"
+  # Erfolgreich -> alten Fehlerstand aufraeumen, damit health/verify nicht weiter warnen.
+  rm -f "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null || true
   ok "Caddyfile generiert (alle Dienste enthalten)"
   return 0
 }
@@ -693,18 +729,44 @@ restart_caddy() {
   wait_for_certs
 }
 
+# Prueft, ob das gebaute Caddy-Image das caddy-dns/cloudflare-Modul enthaelt.
+caddy_has_cloudflare_module() {
+  caddy_compose_file_exists || return 1
+  caddy_compose run --rm --no-deps -T --entrypoint caddy caddy list-modules 2>/dev/null \
+    | grep -q 'dns.providers.cloudflare'
+}
+
 # Erzwingt das Neuschreiben des kompletten Caddy-Stacks und baut/startet ihn neu.
-# Fuer die "Caddy Stack fehlt"-Reparatur (sudo homeedge caddy-rebuild).
+# Fuer die "Caddy Stack fehlt/kaputt"-Reparatur (sudo homeedge caddy-rebuild).
 caddy_rebuild() {
   need_root; load_env
   section "Caddy Stack neu erstellen / neu bauen"
+  require_valid_services || { err "services.tsv ungueltig - bitte zuerst: sudo homeedge repair-services"; return 1; }
   # Stack-Dateien (Dockerfile, docker-compose.yml, .env, Verzeichnisse) sicher
   # anlegen, BEVOR validiert/gebaut wird - auch wenn vorher gar nichts da war.
   write_caddy_stack
   mkdir -p "${CADDY_DIR}/data" "${CADDY_DIR}/config" "${CADDY_DIR}/logs"
   caddy_compose_file_exists || { err "Compose-Datei konnte nicht geschrieben werden: $CADDY_COMPOSE_FILE"; return 1; }
-  ok "Caddy-Stack-Dateien geschrieben (Dockerfile, docker-compose.yml, .env)"
-  restart_caddy
+  ok "Caddy-Stack-Dateien geschrieben (Dockerfile, docker-compose.yml, .env, data/config/logs)"
+  # Image bauen (mit caddy-dns/cloudflare) und Modul verifizieren.
+  if ! caddy_compose build >/dev/null 2>&1; then err "Caddy-Image-Build fehlgeschlagen."; return 1; fi
+  if caddy_has_cloudflare_module; then
+    ok "Caddy Cloudflare DNS Modul im Image vorhanden."
+  else
+    err "Caddy Cloudflare DNS Modul fehlt im Image."
+    info "Bitte Image mit --pull neu bauen oder Netzwerk/Build pruefen."
+    return 1
+  fi
+  # Caddyfile generieren/validieren + Container bauen/starten (mit Caddyfile.failed bei Fehler).
+  restart_caddy || return 1
+  # Lokaler SNI-Test je Domain (Abschlusskontrolle).
+  if [[ -s "$SERVICES_FILE" ]]; then
+    local d _s _i _p _pr
+    while IFS=$'\t' read -r d _s _i _p _pr || [[ -n "$d" ]]; do
+      [[ -z "$d" ]] && continue
+      if cert_ready "$d"; then ok "SNI/TLS lokal ok: ${d}"; else warn "Zertifikat fuer ${d} noch nicht aktiv (DNS-01 kann dauern): sudo homeedge test-domain ${d}"; fi
+    done < "$SERVICES_FILE"
+  fi
 }
 
 install_fail2ban() {
@@ -2036,19 +2098,24 @@ apply_all() {
 
   # --- B) Apply ---
   section "apply-all: Apply"
-  local rc=0
+  local rc=0 caddy_ok=1
   generate_keys || rc=1
   write_wg_config || rc=1
   # Dienst-Werte sind optional (haengen an services.tsv) - kein Apply-Blocker.
   write_unifi_values || true
-  reload_caddy || rc=1
+  if reload_caddy; then ok "Caddy angewendet"; else err "Caddy Apply fehlgeschlagen"; caddy_ok=0; rc=1; fi
   install_fail2ban || rc=1
   # WG ist evtl. noch nicht aktivierbar (UniFi PublicKey fehlt) - nicht fatal.
   restart_wg || true
   # UFW muss am Ende wirklich AKTIV sein (mit SSH-Lockout-Schutz), sonst Fehler.
   ufw_ensure_active || rc=1
   if (( rc != 0 )); then
-    err "apply-all: mindestens ein Apply-Schritt ist fehlgeschlagen. Details: sudo homeedge health"
+    echo
+    err "apply-all nicht vollstaendig erfolgreich."
+    (( caddy_ok == 0 )) && err "Caddy konnte nicht angewendet werden - Details: sudo homeedge caddy-logs ; sudo homeedge health"
+    info "Reparatur: sudo homeedge caddy-rebuild ; sudo homeedge health"
+  else
+    ok "apply-all vollstaendig erfolgreich."
   fi
   return $rc
 }
@@ -2080,7 +2147,17 @@ verify_setup() {
   local stack; stack="$(caddy_stack_state)"
   case "$stack" in
     dir_missing)       err "Caddy Verzeichnis fehlt: $CADDY_DIR"; problems+=("Caddy Stack fehlt  ->  sudo homeedge apply-all  oder  sudo homeedge caddy-rebuild"); fail=1 ;;
-    caddyfile_missing) err "Caddyfile fehlt: ${CADDY_DIR}/Caddyfile"; problems+=("Caddyfile fehlt  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
+    caddyfile_missing)
+      if [[ -f "${CADDY_DIR}/Caddyfile.failed" ]]; then
+        err "Caddyfile wurde nicht aktiviert, weil die neu generierte Caddyfile ungueltig war."
+        info "Details: ${CADDY_VALIDATE_LOG}"
+        info "Fehlerhafte Datei: ${CADDY_DIR}/Caddyfile.failed"
+        problems+=("Caddyfile ungueltig (siehe ${CADDY_VALIDATE_LOG})  ->  sudo homeedge caddy-rebuild ; sudo homeedge diagnose")
+      else
+        err "Caddyfile fehlt: ${CADDY_DIR}/Caddyfile"
+        problems+=("Caddyfile fehlt  ->  sudo homeedge caddy-rebuild")
+      fi
+      fail=1 ;;
     env_missing)       err "Caddy .env fehlt: ${CADDY_DIR}/.env"; problems+=(".env fehlt  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
     compose_missing)   err "Caddy Docker Compose Datei fehlt: $CADDY_COMPOSE_FILE"; problems+=("Compose-Datei fehlt  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
     compose_invalid)   err "docker compose config ungueltig (${CADDY_COMPOSE_FILE})"; problems+=("Compose ungueltig  ->  sudo homeedge caddy-rebuild"); fail=1 ;;
@@ -2132,7 +2209,12 @@ verify_setup() {
   # zustand -> harter Fehler (Bug P2: Zertifikatsstatus ernst nehmen).
   if [[ -s "$SERVICES_FILE" ]] && validate_services_file >/dev/null 2>&1; then
     local domain scheme ip port profile a expect="${VPS_PUBLIC_HOST:-}" deadline pending
-    if command -v openssl >/dev/null 2>&1; then
+    local caddy_up=0; [[ "$stack" == "running" ]] && caddy_up=1
+    # Fall A: ohne laufenden Caddy/ohne Caddyfile ist ein SNI-Test nicht moeglich.
+    if (( caddy_up == 0 )); then
+      err "Lokaler SNI-Test nicht moeglich, weil Caddy nicht laeuft oder Caddyfile fehlt."
+      info "Zuerst Caddy reparieren: sudo homeedge caddy-rebuild"
+    elif command -v openssl >/dev/null 2>&1; then
       # Kurze Schonfrist (reload hat bereits bis 120s gewartet).
       deadline=$((SECONDS+45))
       while :; do
@@ -2149,11 +2231,14 @@ verify_setup() {
     while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
       [[ -z "$domain" ]] && continue
       # Lokaler SNI/TLS-Test: curl --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
-      if cert_ready "$domain"; then
+      if (( caddy_up == 0 )); then
+        : # Fall A bereits oben gemeldet (Stack-Fehler ist der harte Fehler).
+      elif cert_ready "$domain"; then
         ok "SNI/TLS lokal ok (Zertifikat aktiv): ${domain}"
       else
-        err "Zertifikat/HTTPS fuer ${domain} nicht verfuegbar (lokaler SNI-Test fehlgeschlagen)."
-        problems+=("Zertifikat fehlt fuer ${domain}  ->  Cloudflare Token pruefen (sudo homeedge set-token), dann: sudo homeedge reload ; Test: sudo homeedge test-domain ${domain}")
+        # Fall B: Caddy laeuft, aber Zertifikat/TLS fehlt -> Token/DNS-01 pruefen.
+        err "Lokaler SNI-Test fehlgeschlagen fuer ${domain}: Caddy laeuft, aber kein Zertifikat/TLS."
+        problems+=("Zertifikat fehlt fuer ${domain}  ->  Cloudflare Token / DNS-01 pruefen (sudo homeedge set-token), dann: sudo homeedge reload ; Test: sudo homeedge test-domain ${domain}")
         fail=1
       fi
       # DNS-Bewertung (nur DNS-Ziel ist migrations-tolerant, nicht das Zertifikat)
@@ -2288,6 +2373,13 @@ health_check() {
         _health_line red "Caddy Konfig" "ungueltig oder nicht pruefbar"
       fi ;;
   esac
+
+  # Hinweis auf eine zuletzt fehlgeschlagene Caddyfile-Generierung (Bug P2).
+  if [[ -f "${CADDY_DIR}/Caddyfile.failed" ]]; then
+    _health_line red "Caddyfile (letzte Generierung)" "war ungueltig"
+    printf '          %s\n' "Datei: ${CADDY_DIR}/Caddyfile.failed"
+    printf '          %s\n' "Log:   ${CADDY_VALIDATE_LOG}"
+  fi
 
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
     _health_line green "Fail2ban" "aktiv"
@@ -2964,7 +3056,19 @@ diag_report() {
     echo; echo "## Routen"; ip route 2>/dev/null
     echo; echo "## UFW"; ufw status verbose 2>/dev/null
     echo; echo "## Fail2ban"; fail2ban-client status 2>/dev/null; for j in sshd caddy-auth; do echo "- jail $j:"; fail2ban-client status "$j" 2>/dev/null; done
-    echo; echo "## Caddyfile"; [[ -f "${CADDY_DIR}/Caddyfile" ]] && cat "${CADDY_DIR}/Caddyfile"
+    echo; echo "## Caddyfile"; [[ -f "${CADDY_DIR}/Caddyfile" ]] && cat "${CADDY_DIR}/Caddyfile" || echo "(keine aktive Caddyfile)"
+    echo; echo "## Caddyfile.failed (letzte ungueltige Generierung, falls vorhanden)"
+    if [[ -f "${CADDY_DIR}/Caddyfile.failed" ]]; then
+      echo "Datei: ${CADDY_DIR}/Caddyfile.failed"
+      echo "--- erste/letzte Zeilen (Secrets maskiert) ---"
+      head -n 20 "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null
+      echo "..."
+      tail -n 10 "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null
+    else
+      echo "(keine)"
+    fi
+    echo; echo "## caddy-validate Log (tail)"; [[ -f "$CADDY_VALIDATE_LOG" ]] && tail -n 40 "$CADDY_VALIDATE_LOG" 2>/dev/null || echo "(kein Log: ${CADDY_VALIDATE_LOG})"
+    echo; echo "## Caddy Cloudflare-DNS-Modul"; if docker exec caddy-edge caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then echo "vorhanden"; else echo "FEHLT oder Container laeuft nicht (sudo homeedge caddy-rebuild)"; fi
     echo; echo "## Zertifikate (lokaler SNI-Check)"; check_certs 2>/dev/null
     echo; echo "## Speicher/Disk"; free -h 2>/dev/null; echo; df -h / 2>/dev/null
     echo; echo "## Caddy Logs (tail)"; if caddy_compose_file_exists; then caddy_compose logs --tail 80 2>/dev/null; else docker logs --tail 80 caddy-edge 2>/dev/null; fi
