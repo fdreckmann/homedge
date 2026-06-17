@@ -240,7 +240,7 @@ stop_wg_if_exists() {
 }
 
 write_unifi_values() {
-  load_env; generate_keys
+  load_env; require_valid_services || return 1; generate_keys
   local psk="<nicht verwendet>"; [[ "${USE_PSK}" == "1" ]] && psk="$(cat "${KEY_DIR}/preshared.key")"
   cat > "${EDGE_DIR}/unifi-wireguard-werte.txt" <<EOVAL
 ============================================================
@@ -291,7 +291,7 @@ set_wg_key() {
   wg show || true
 }
 
-wg_values() { write_unifi_values; cat "${EDGE_DIR}/unifi-wireguard-werte.txt"; }
+wg_values() { write_unifi_values || return 1; cat "${EDGE_DIR}/unifi-wireguard-werte.txt"; }
 
 show_wg_config() {
   load_env
@@ -573,6 +573,7 @@ _caddy_prepare_config() {
 
 reload_caddy() {
   section "Caddy neu laden"
+  require_valid_services || return 1
   _caddy_prepare_config || return 1
   cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
   if caddy_is_running; then
@@ -972,13 +973,7 @@ show_values() {
 
 list_services() {
   if [[ ! -f "$SERVICES_FILE" || ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return; fi
-  if ! validate_services_file >/dev/null 2>&1; then
-    err "services.tsv ist ungueltig:"
-    validate_services_file || true
-    echo
-    err "Bitte ausfuehren: sudo homeedge repair-services"
-    return 1
-  fi
+  require_valid_services || return 1
   nl -w2 -s'. ' "$SERVICES_FILE" | sed $'s/\t/ | /g'
 }
 
@@ -996,6 +991,59 @@ ask_profile() {
 # ------------------------------------------------------------
 # Profil-Vorschlag anhand Port.
 profile_suggest() { case "$1" in 8096) echo jellyfin ;; 5055) echo jellyseerr ;; *) echo standard ;; esac; }
+
+# ------------------------------------------------------------
+# Strikte Feld-Validierung (Bug P1: Domain/Backend/Port/Scheme/Profil)
+# Verhindert, dass aus Eingaben eine kaputte/unsichere Caddyfile entsteht.
+# ------------------------------------------------------------
+# Enthaelt der String ein verbotenes Zeichen?  { } ; " ' ` $ \ Whitespace/Tab
+_has_forbidden_chars() {
+  case "$1" in
+    *'{'*|*'}'*|*';'*|*'"'*|*"'"*|*'`'*|*'$'*|*'\'*|*' '*|*$'\t'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Gueltige Domain: optionaler Wildcard-Prefix (*.) + FQDN mit mindestens einem Punkt.
+# Keine Sonderzeichen, kein Slash, kein Doppelpunkt, keine Leerzeichen.
+valid_domain() {
+  local d="${1:-}" re
+  [[ -n "$d" ]] || return 1
+  _has_forbidden_chars "$d" && return 1
+  case "$d" in */*|*:*) return 1 ;; esac
+  re='^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+  [[ "$d" =~ $re ]]
+}
+
+# Gueltiges Backend: IPv4 oder Hostname (ein/mehrere Labels). IPv6 erstmal NICHT.
+# Keine Sonderzeichen, kein Slash, kein Doppelpunkt, keine Leerzeichen.
+valid_backend() {
+  local b="${1:-}" re o
+  [[ -n "$b" ]] || return 1
+  _has_forbidden_chars "$b" && return 1
+  case "$b" in */*|*:*) return 1 ;; esac
+  if [[ "$b" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    for o in ${b//./ }; do (( o >= 0 && o <= 255 )) || return 1; done
+    return 0
+  fi
+  re='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+  [[ "$b" =~ $re ]]
+}
+
+valid_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_scheme() { [[ "${1:-}" == "http" || "${1:-}" == "https" ]]; }
+valid_profile() { case "${1:-}" in standard|jellyfin|jellyseerr) return 0 ;; *) return 1 ;; esac; }
+
+# Bricht ab, wenn services.tsv ungueltig ist. Fuer lesende Funktionen (Bug P2).
+require_valid_services() {
+  if ! validate_services_file >/dev/null 2>&1; then
+    err "services.tsv ist ungueltig."
+    printf '%s\n' "Bitte ausfuehren:"
+    printf '%s\n' "sudo homeedge repair-services"
+    return 1
+  fi
+  return 0
+}
 
 # Haengt einen Dienst sicher an: stellt erst Trailing-Newline sicher, dann genau
 # 5 Felder. Verhindert das Verkleben mit der letzten Zeile.
@@ -1020,18 +1068,14 @@ validate_services_file() {
     nf=$(awk -F'\t' '{print NF}' <<<"$line")
     if [[ "$nf" -ne 5 ]]; then err "Zeile ${ln}: ${nf} Felder statt 5 (verklebt?): ${line}"; rc=1; continue; fi
     IFS=$'\t' read -r d s i p pr <<<"$line"
-    [[ -n "$d" && ! "$d" =~ [[:space:]] ]] || { err "Zeile ${ln}: ungueltige Domain '${d}'"; rc=1; }
+    valid_domain "$d" || { err "Zeile ${ln}: ungueltige Domain '${d}' (erlaubt: FQDN oder *.domain, keine Sonderzeichen)"; rc=1; }
     if [[ -n "$d" ]]; then
       if [[ -n "${seen[$d]:-}" ]]; then err "Zeile ${ln}: doppelte Domain '${d}' (auch Zeile ${seen[$d]})"; rc=1; else seen[$d]="$ln"; fi
     fi
-    [[ "$s" == "http" || "$s" == "https" ]] || { err "Zeile ${ln}: scheme '${s}' (erwartet http/https)"; rc=1; }
-    [[ -n "$i" && ! "$i" =~ [[:space:]] ]] || { err "Zeile ${ln}: ungueltige Backend-Adresse '${i}'"; rc=1; }
-    if [[ "$p" =~ ^[0-9]+$ ]]; then
-      (( p >= 1 && p <= 65535 )) || { err "Zeile ${ln}: Port '${p}' ausserhalb 1-65535"; rc=1; }
-    else
-      err "Zeile ${ln}: Port '${p}' nicht numerisch (verklebt?)"; rc=1
-    fi
-    case "$pr" in standard|jellyfin|jellyseerr) ;; *) err "Zeile ${ln}: Profil '${pr}' (erwartet standard/jellyfin/jellyseerr)"; rc=1 ;; esac
+    valid_scheme "$s" || { err "Zeile ${ln}: scheme '${s}' (erwartet http/https)"; rc=1; }
+    valid_backend "$i" || { err "Zeile ${ln}: ungueltige Backend-Adresse '${i}' (erlaubt: IPv4 oder Hostname, keine Sonderzeichen)"; rc=1; }
+    valid_port "$p" || { err "Zeile ${ln}: Port '${p}' ungueltig (numerisch, 1-65535)"; rc=1; }
+    valid_profile "$pr" || { err "Zeile ${ln}: Profil '${pr}' (erwartet standard/jellyfin/jellyseerr)"; rc=1; }
   done < "$f"
   return $rc
 }
@@ -1041,6 +1085,37 @@ _services_commit_check() {
   if validate_services_file; then rm -f "$1"; return 0; fi
   err "services.tsv ungueltig - stelle vorherigen Stand wieder her."
   [[ -f "$1" ]] && mv "$1" "$SERVICES_FILE"
+  return 1
+}
+
+# Transaktionale Uebernahme einer Dienst-Aenderung (Bug P2).
+# Voraussetzung: die neue services.tsv ist bereits geschrieben, $1 ist das
+# Backup der alten services.tsv.
+# Ablauf: 1) neue services.tsv validieren  2) Caddyfile generieren+validieren
+#         3) Caddy reload  4) caddy_is_running pruefen.
+# Bei jedem Fehler wird der ALTE Stand (services.tsv UND Caddyfile) wiederher-
+# gestellt und Caddy mit dem alten Stand neu geladen. Kein kaputter Zwischen-
+# stand bleibt zurueck. 0 = uebernommen, 1 = zurueckgerollt.
+_service_change_commit() {
+  local bak="$1"
+  # 1) Neue services.tsv streng validieren.
+  if ! validate_services_file; then
+    err "Aenderung ungueltig - alter Stand wird wiederhergestellt."
+    [[ -f "$bak" ]] && mv "$bak" "$SERVICES_FILE"
+    return 1
+  fi
+  # 2-4) Caddyfile generieren+validieren, reload, Laufzeitpruefung.
+  #      reload_caddy -> _caddy_prepare_config generiert in eine temp. Datei,
+  #      validiert und rollt das Caddyfile bei Fehler selbst zurueck.
+  if reload_caddy; then
+    rm -f "$bak"
+    return 0
+  fi
+  # Fehler: services.tsv auf alten Stand zuruecksetzen und Caddy mit altem
+  # (funktionierendem) Stand neu laden, damit nichts Halbfertiges aktiv bleibt.
+  err "Caddy-Reload fehlgeschlagen - alter Stand (services.tsv + Caddyfile) wird wiederhergestellt."
+  [[ -f "$bak" ]] && mv "$bak" "$SERVICES_FILE"
+  reload_caddy >/dev/null 2>&1 || true
   return 1
 }
 
@@ -1106,11 +1181,20 @@ repair_services() {
 }
 
 validate_service() {
-  local domain="$1" scheme="$2" ip="$3" port="$4"
-  if [[ -z "$domain" || "$domain" =~ [[:space:]] ]]; then err "Ungueltige Domain (leer oder enthaelt Leerzeichen)."; return 1; fi
-  if [[ "$scheme" != "http" && "$scheme" != "https" ]]; then err "Scheme muss 'http' oder 'https' sein."; return 1; fi
-  if [[ -z "$ip" || "$ip" =~ [[:space:]] ]]; then err "Ungueltige Backend-Adresse (leer oder enthaelt Leerzeichen)."; return 1; fi
-  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then err "Ungueltiger Port: '$port' (erwartet 1-65535)."; return 1; fi
+  local domain="$1" scheme="$2" ip="$3" port="$4" profile="${5:-standard}"
+  if ! valid_domain "$domain"; then
+    err "Ungueltige Domain: '${domain}'. Erlaubt sind FQDNs wie jft.smatitec.de oder Wildcards wie *.smatitec.de."
+    err "Nicht erlaubt: Leerzeichen und Sonderzeichen ( { } ; \" ' \` \$ \\ / : )."
+    return 1
+  fi
+  if ! valid_scheme "$scheme"; then err "Scheme muss 'http' oder 'https' sein."; return 1; fi
+  if ! valid_backend "$ip"; then
+    err "Ungueltige Backend-Adresse: '${ip}'. Erlaubt sind IPv4 (z.B. 192.168.10.99) oder Hostnamen."
+    err "Nicht erlaubt: Sonderzeichen ( { } ; \" ' \` \$ \\ ), Leerzeichen, IPv6 oder Doppelpunkt."
+    return 1
+  fi
+  if ! valid_port "$port"; then err "Ungueltiger Port: '$port' (numerisch, 1-65535)."; return 1; fi
+  if ! valid_profile "$profile"; then err "Ungueltiges Profil: '$profile' (erwartet standard/jellyfin/jellyseerr)."; return 1; fi
   return 0
 }
 
@@ -1120,12 +1204,20 @@ add_service() {
   local domain scheme ip port profile
   domain="$(ask "Domain, z.B. jellyfin.example.de")"; scheme="$(ask "Backend Scheme http/https" "http")"; ip="$(ask "Backend IP im Heimnetz")"; port="$(ask "Backend Port")"
   validate_service "$domain" "$scheme" "$ip" "$port" || return 1
+  # Doppelte Domain frueh und klar ablehnen (verklebte Datei verhindern).
+  if [[ -s "$SERVICES_FILE" ]] && cut -f1 "$SERVICES_FILE" | grep -qxF "$domain"; then
+    err "Domain '${domain}' ist bereits vorhanden. Abbruch."
+    return 1
+  fi
   profile="$(ask_profile standard)"
   maybe_backup_before_change
   local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
   append_service "$domain" "$scheme" "$ip" "$port" "$profile"
-  _services_commit_check "$_bak" || return 1
-  write_unifi_values; reload_caddy
+  if ! _service_change_commit "$_bak"; then
+    err "Dienst NICHT hinzugefuegt - alter Stand ist wiederhergestellt."
+    return 1
+  fi
+  write_unifi_values || true
   ok "Dienst hinzugefuegt."
   warn "UniFi Firewall erlauben: ${VPS_WG_IP} -> ${ip}:${port}/tcp"
 }
@@ -1143,8 +1235,11 @@ edit_service() {
   maybe_backup_before_change
   local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
   lines[$idx]="${domain}"$'\t'"${scheme}"$'\t'"${ip}"$'\t'"${port}"$'\t'"${profile}"; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
-  _services_commit_check "$_bak" || return 1
-  write_unifi_values; reload_caddy; ok "Dienst aktualisiert."
+  if ! _service_change_commit "$_bak"; then
+    err "Dienst NICHT geaendert - alter Stand ist wiederhergestellt."
+    return 1
+  fi
+  write_unifi_values || true; ok "Dienst aktualisiert."
 }
 
 delete_service() {
@@ -1155,8 +1250,11 @@ delete_service() {
   maybe_backup_before_change
   local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
   unset 'lines[$idx]'; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
-  _services_commit_check "$_bak" || return 1
-  write_unifi_values; reload_caddy; ok "Dienst geloescht."
+  if ! _service_change_commit "$_bak"; then
+    err "Dienst NICHT geloescht - alter Stand ist wiederhergestellt."
+    return 1
+  fi
+  write_unifi_values || true; ok "Dienst geloescht."
 }
 
 edit_settings() {
@@ -1183,6 +1281,7 @@ edit_settings() {
 
 test_backends() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
+  require_valid_services || return 1
   section "Backend-Test"
   while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "${domain:-}" ]] && continue; printf '%b\n' "${C_BOLD}${domain}${C_RESET} -> ${scheme}://${ip}:${port}"
@@ -1207,6 +1306,7 @@ domains_status() {
   load_env
   section "Domains / DNS-Status"
   if [[ ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return 0; fi
+  require_valid_services || return 1
   local expect="${VPS_PUBLIC_HOST:-}" expect6; expect6="$(vps_ipv6)"
   echo "Erwartete VPS-IPv4/Host: ${expect:-unbekannt}"
   echo "Erwartete VPS-IPv6:      ${expect6:-(keine)}   (ENABLE_IPV6=${ENABLE_IPV6:-0})"
@@ -1282,33 +1382,73 @@ validate_token_files() {
   return $rc
 }
 
-# Sicherer, dedizierter Menuepunkt: Cloudflare API Token aendern (Bug 9).
+# Sicherer, dedizierter Menuepunkt: Cloudflare API Token aendern (Bug P3).
+# Transaktional mit Rollback: ein falscher Token darf den alten, funktionierenden
+# Stand niemals zerstoeren. Token wird nie unmaskiert ausgegeben.
 change_cloudflare_token() {
   need_root; load_env
   section "Cloudflare API Token aendern"
   maybe_backup_before_change
+
+  # 1) Alten Token + alte .env-Dateien sichern.
+  local oldtok="${CLOUDFLARE_API_TOKEN:-}"
+  local bak_env bak_caddyenv
+  bak_env="$(mktemp)"; bak_caddyenv="$(mktemp)"
+  [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$bak_env" 2>/dev/null || true
+  [[ -f "${CADDY_DIR}/.env" ]] && cp -a "${CADDY_DIR}/.env" "$bak_caddyenv" 2>/dev/null || true
+
+  # Aufraeumen der temporaeren Backups bei jedem Ruecksprung.
+  _cf_cleanup() { rm -f "$bak_env" "$bak_caddyenv"; }
+
+  # 2) Neuen Token verdeckt einlesen, 3) bereinigen (kein CR/LF/Whitespace).
   local newtok
   newtok="$(sanitize_token "$(ask_secret "Neuer Cloudflare API Token")")"
-  if [[ -z "$newtok" ]]; then err "Kein Token eingegeben. Abbruch, nichts geaendert."; return 1; fi
+  if [[ -z "$newtok" ]]; then err "Kein Token eingegeben. Abbruch, nichts geaendert."; _cf_cleanup; return 1; fi
+
+  # 4) Token optional gegen die Cloudflare Verify-API testen.
   if yesno "Token online gegen Cloudflare pruefen?" "y"; then
     if verify_cloudflare_token "$newtok"; then
       ok "Token von Cloudflare bestaetigt."
     else
       warn "Token konnte nicht bestaetigt werden (Netzwerk/Rechte/Format?)."
-      if ! yesno "Trotzdem speichern?" "n"; then warn "Abgebrochen, nichts geaendert."; return 1; fi
+      if ! yesno "Trotzdem speichern?" "n"; then warn "Abgebrochen, nichts geaendert."; _cf_cleanup; return 1; fi
     fi
   fi
+
+  # 5) Neuen Token in beide .env-Dateien schreiben.
   CLOUDFLARE_API_TOKEN="$newtok"
   save_env
   write_caddy_stack
-  if validate_token_files; then
-    ok "Token gespeichert (einzeilig) in ${ENV_FILE} und ${CADDY_DIR}/.env"
-  else
-    err "Token-Dateien fehlerhaft - bitte pruefen."
+
+  # 6+7) validieren, reload, Laufzeitpruefung. Bei jedem Fehler -> Rollback.
+  local failed=0 reason=""
+  if ! validate_token_files; then failed=1; reason="Token-Dateien fehlerhaft"; fi
+  if (( ! failed )) && ! reload_caddy; then failed=1; reason="Caddy-Reload mit neuem Token fehlgeschlagen"; fi
+  if (( ! failed )) && ! caddy_is_running; then failed=1; reason="Caddy laeuft nach Reload nicht"; fi
+
+  # 8) Fehler -> alten Token + alte .env-Dateien wiederherstellen, Caddy mit
+  #    altem Token wieder starten.
+  if (( failed )); then
+    err "${reason}."
+    err "Rollback: alter Cloudflare Token wird wiederhergestellt."
+    CLOUDFLARE_API_TOKEN="$oldtok"
+    [[ -s "$bak_env" ]] && cp -a "$bak_env" "$ENV_FILE" 2>/dev/null || save_env
+    [[ -s "$bak_caddyenv" ]] && cp -a "$bak_caddyenv" "${CADDY_DIR}/.env" 2>/dev/null || write_caddy_stack
+    reload_caddy >/dev/null 2>&1 || restart_caddy >/dev/null 2>&1 || true
+    if caddy_is_running; then
+      ok "Alter funktionierender Stand wiederhergestellt, Caddy laeuft."
+    else
+      err "Caddy laeuft nach Rollback nicht - bitte manuell pruefen: sudo homeedge restart"
+    fi
+    _cf_cleanup
+    err "Token nicht uebernommen. (Anzeige maskiert: cfut_***MASKED***)"
     return 1
   fi
-  reload_caddy
-  ok "Cloudflare Token aktualisiert. (Anzeige maskiert: cfut_***)"
+
+  # 9) Erfolg.
+  _cf_cleanup
+  ok "Token gespeichert (einzeilig) in ${ENV_FILE} und ${CADDY_DIR}/.env"
+  ok "Cloudflare Token aktualisiert und Caddy laeuft. (Anzeige maskiert: cfut_***MASKED***)"
 }
 
 show_logs() {
@@ -1718,6 +1858,7 @@ check_certs() {
     warn "Keine Dienste vorhanden."
     return
   fi
+  require_valid_services || return 1
 
   if ! caddy_is_running; then
     err "Caddy laeuft nicht. Zertifikate koennen nicht sauber getestet werden."
@@ -1733,6 +1874,7 @@ check_certs() {
 health_check() {
   need_root
   load_env
+  require_valid_services || return 1
   HEALTH_RED=0; HEALTH_YELLOW=0; HEALTH_GREEN=0
 
   section "Ampel-Check: Aktivitaet / Sicherheit / Zertifikate"
@@ -2367,6 +2509,15 @@ ufw_logs() {
 diag_report() {
   need_root; load_env
   section "Diagnosebericht erstellen"
+  # services.tsv vorab pruefen (Bug P2). Fuer die Diagnose NICHT abbrechen, da
+  # der Bericht gerade bei defekter Konfig nuetzlich ist - aber klar markieren.
+  local svc_state="ok"
+  if ! validate_services_file >/dev/null 2>&1; then
+    err "services.tsv ist ungueltig."
+    printf '%s\n' "Bitte ausfuehren:"
+    printf '%s\n' "sudo homeedge repair-services"
+    svc_state="UNGUELTIG (sudo homeedge repair-services)"
+  fi
   local f="${EDGE_DIR}/diagnose-$(date +%Y%m%d-%H%M%S).txt"
   {
     echo "HomeEdge Diagnose $(date -Is)"
@@ -2374,6 +2525,7 @@ diag_report() {
     echo "Host: $(hostname)   Kernel: $(uname -r)"
     [[ -r /etc/os-release ]] && { . /etc/os-release 2>/dev/null; echo "OS: ${PRETTY_NAME:-unbekannt}"; }
     echo "Update-Repo: ${HOMEEDGE_REPO}@${HOMEEDGE_BRANCH}"
+    echo "services.tsv: ${svc_state}"
     echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  BACKUP_BEHAVIOR=${BACKUP_BEHAVIOR}  EXPERT_MODE=${EXPERT_MODE}"
     echo
     echo "## Werte"; show_values
