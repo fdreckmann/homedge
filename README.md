@@ -121,7 +121,7 @@ Im Menue unter `Wartung / Updates`:
 - Empfehlung: nicht blind von `main`, sondern bevorzugt getaggte Releases nutzen.
 - Nach dem Update laeuft automatisch eine Migration (`sudo homeedge migrate`):
   Cloudflare-Token wird bereinigt (immer einzeilig), fehlende Werte werden
-  ergaenzt (`ENABLE_HTTP3=0`, `WG_MTU=1280`, Fail2ban-Schwellenwerte), die
+  ergaenzt (`ENABLE_HTTP3=0`, `WG_MTU=` leer/automatisch, Fail2ban-Schwellenwerte), die
   Caddyfile neu erzeugt/validiert und ein Healthcheck ausgefuehrt. Bestehende
   Dienste, Zertifikate und WireGuard-Keys bleiben erhalten.
 - Die "Nur HomeEdge aktualisieren"-Skripte (`Update-HomeEdgeOnly.sh/.ps1`)
@@ -158,8 +158,11 @@ Backend-Zugriff ins Heimnetz bleibt IPv4 ueber WireGuard.
 
 ## WireGuard MTU
 
-- Standard `WG_MTU=1280`, wird in `/etc/wireguard/<if>.conf` geschrieben.
-- Aendern ueber `WireGuard Tunnel -> MTU anzeigen/aendern` (oder `sudo homeedge mtu`).
+- Standard `WG_MTU=` leer = automatisch: es wird KEINE `MTU`-Zeile in
+  `/etc/wireguard/<if>.conf` geschrieben, WireGuard/Linux nutzt den Default.
+  `1280` ist nur ein optionaler Troubleshooting-Wert.
+- Aendern ueber `WireGuard Tunnel -> MTU anzeigen/aendern` (oder `sudo homeedge mtu`):
+  automatisch (leer), manuell (numerisch 1200-1420) oder Empfehlung anzeigen.
 - Hinweis: MTU ggf. auch auf UniFi-Seite setzen, falls dort ein MTU-Feld existiert.
 
 ## Backup / Restore

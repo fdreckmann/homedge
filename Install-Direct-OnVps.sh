@@ -59,6 +59,49 @@ ask_secret() {
 b64() { printf '%s' "${1:-}" | base64 | tr -d '\n'; }
 b64_file() { base64 < "$1" | tr -d '\n'; }
 
+# --- Eingabevalidierung (frueh, vor dem Bootstrap) ---
+_has_forbidden_chars() {
+  case "$1" in
+    *'{'*|*'}'*|*';'*|*'"'*|*"'"*|*'`'*|*'$'*|*'\'*|*' '*|*$'\t'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+valid_domain_in() {
+  local d="${1:-}" re
+  [[ -n "$d" ]] || return 1
+  _has_forbidden_chars "$d" && return 1
+  case "$d" in */*|*:*) return 1 ;; esac
+  re='^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+  [[ "$d" =~ $re ]]
+}
+valid_backend_in() {
+  local b="${1:-}" re o
+  [[ -n "$b" ]] || return 1
+  _has_forbidden_chars "$b" && return 1
+  case "$b" in */*|*:*) return 1 ;; esac
+  if [[ "$b" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    for o in ${b//./ }; do (( o >= 0 && o <= 255 )) || return 1; done
+    return 0
+  fi
+  re='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+  [[ "$b" =~ $re ]]
+}
+valid_port_in() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+validate_services_tsv_str() {
+  local tsv="$1" ln=0 d s i p pr rc=0
+  [[ -z "$tsv" ]] && return 0
+  while IFS=$'\t' read -r d s i p pr || [[ -n "$d" ]]; do
+    [[ -z "$d" ]] && continue
+    ln=$((ln+1))
+    valid_domain_in "$d"  || { echo "  Dienst ${ln}: ungueltige Domain '${d}'"; rc=1; }
+    [[ "$s" == http || "$s" == https ]] || { echo "  Dienst ${ln}: Scheme '${s}' (http/https)"; rc=1; }
+    valid_backend_in "$i" || { echo "  Dienst ${ln}: ungueltiges Backend '${i}'"; rc=1; }
+    valid_port_in "$p"    || { echo "  Dienst ${ln}: Port '${p}' (1-65535)"; rc=1; }
+    case "$pr" in standard|jellyfin|jellyseerr) ;; *) echo "  Dienst ${ln}: Profil '${pr}'"; rc=1 ;; esac
+  done <<< "$tsv"
+  return $rc
+}
+
 cfg_get() {
   local name="$1"
   local default="${2:-}"
@@ -128,7 +171,7 @@ ExtIf=$(printf '%q' "$ExtIf")
 SshPortFinal=$(printf '%q' "$SshPortFinal")
 WgIf=$(printf '%q' "$WgIf")
 WgPort=$(printf '%q' "$WgPort")
-WgMtu=$(printf '%q' "${WgMtu:-1280}")
+WgMtu=$(printf '%q' "${WgMtu:-}")
 VpsWgAddr=$(printf '%q' "$VpsWgAddr")
 ClientWgAddr=$(printf '%q' "$ClientWgAddr")
 HomeSubnet=$(printf '%q' "$HomeSubnet")
@@ -194,8 +237,13 @@ fi
 SshPortFinal="$(ask "SSH Port auf dem VPS" "$(cfg_get SshPortFinal 22)")"
 WgIf="$(ask "WireGuard Interface Name" "$(cfg_get WgIf unifi)")"
 WgPort="$(ask "WireGuard UDP Port" "$(cfg_get WgPort 51821)")"
-WgMtu="$(ask "WireGuard MTU" "$(cfg_get WgMtu 1280)")"
-[[ "$WgMtu" =~ ^[0-9]+$ ]] || WgMtu=1280
+WgMtu="$(ask "WireGuard MTU (leer = automatisch/WireGuard-Default, empfohlen)" "$(cfg_get WgMtu "")")"
+# Leer = automatisch (keine MTU-Zeile). Wenn gesetzt: numerisch 1200-1420, sonst leeren.
+if [[ -n "$WgMtu" ]]; then
+  if ! [[ "$WgMtu" =~ ^[0-9]+$ ]] || (( WgMtu < 1200 || WgMtu > 1420 )); then
+    echo "Ungueltige MTU '$WgMtu' - nutze automatisch (leer)."; WgMtu=""
+  fi
+fi
 VpsWgAddr="$(ask "VPS WireGuard Adresse mit CIDR" "$(cfg_get VpsWgAddr 10.0.1.1/24)")"
 ClientWgAddr="$(ask "UniFi/Client WireGuard Adresse mit CIDR" "$(cfg_get ClientWgAddr 10.0.1.2/32)")"
 HomeSubnet="$(ask "Backend-Netze hinter UniFi, komma-getrennt" "$(cfg_get HomeSubnet 192.168.10.0/24)")"
@@ -241,10 +289,10 @@ else
   for ((i=1; i<=ServiceCount; i++)); do
     echo
     echo "Dienst $i"
-    d="$(ask "Domain")"
-    s="$(ask "Backend Scheme http/https" "http")"
-    ip="$(ask "Backend IP im Heimnetz")"
-    p="$(ask "Backend Port")"
+    while :; do d="$(ask "Domain")"; valid_domain_in "$d" && break; echo "Ungueltige Domain. Erlaubt: FQDN (jft.example.de) oder *.example.de, keine Sonderzeichen/Leerzeichen."; done
+    while :; do s="$(ask "Backend Scheme http/https" "http")"; [[ "$s" == http || "$s" == https ]] && break; echo "Scheme muss http oder https sein."; done
+    while :; do ip="$(ask "Backend IP im Heimnetz")"; valid_backend_in "$ip" && break; echo "Ungueltiges Backend. Erlaubt: IPv4 (192.168.10.99) oder Hostname, keine Sonderzeichen."; done
+    while :; do p="$(ask "Backend Port")"; valid_port_in "$p" && break; echo "Port muss numerisch und 1-65535 sein."; done
     echo "Backend-Profil: 1) Standard  2) Jellyfin  3) Jellyseerr"
     pr="$(ask "Profil" "1")"
     case "$pr" in 2) pr=jellyfin;; 3) pr=jellyseerr;; *) pr=standard;; esac
@@ -318,6 +366,15 @@ Ab jetzt werden Pakete installiert und folgende Komponenten konfiguriert:
 Bitte pruefe die Zusammenfassung oben genau.
 EOF
 
+# Dienste FRUEH validieren, bevor der Bootstrap laeuft (Bug P2).
+if ! VALIDATION_ERRORS="$(validate_services_tsv_str "$ServicesTsv")"; then
+  echo
+  echo "FEHLER: Ungueltige Dienste-Konfiguration. Installation NICHT gestartet:"
+  echo "$VALIDATION_ERRORS"
+  echo "Bitte korrigieren (Domain/Scheme/Backend/Port/Profil) und erneut starten."
+  exit 1
+fi
+
 if ! yesno "Konfiguration uebernehmen und Installation jetzt starten?" "n"; then
   save_config "${SaveToken:-0}"
   echo
@@ -334,7 +391,7 @@ replace_token "__VPS_PUBLIC_HOST_B64__" "$(b64 "$VpsPublicHost")"
 replace_token "__SSH_PORT_B64__" "$(b64 "$SshPortFinal")"
 replace_token "__WG_IF_B64__" "$(b64 "$WgIf")"
 replace_token "__WG_PORT_B64__" "$(b64 "$WgPort")"
-replace_token "__WG_MTU_B64__" "$(b64 "${WgMtu:-1280}")"
+replace_token "__WG_MTU_B64__" "$(b64 "${WgMtu:-}")"
 replace_token "__VPS_WG_ADDR_B64__" "$(b64 "$VpsWgAddr")"
 replace_token "__CLIENT_WG_ADDR_B64__" "$(b64 "$ClientWgAddr")"
 replace_token "__HOME_SUBNET_B64__" "$(b64 "$HomeSubnet")"
@@ -353,7 +410,13 @@ replace_token "__HOMEEDGE_B64__" "$HOMEEDGE_B64"
 
 printf '%s' "$BOOTSTRAP" > /tmp/edge-bootstrap-direct.sh
 chmod +x /tmp/edge-bootstrap-direct.sh
-bash -lc '/tmp/edge-bootstrap-direct.sh 2>&1 | tee /root/edge-install.log'
-
-echo
-echo "Fertig. Menue starten mit: sudo homeedge menu"
+# pipefail, damit ein fehlschlagender Bootstrap nicht von tee verschluckt wird.
+if bash -lc 'set -o pipefail; /tmp/edge-bootstrap-direct.sh 2>&1 | tee /root/edge-install.log'; then
+  echo
+  echo "Fertig. Menue starten mit: sudo homeedge menu"
+else
+  echo
+  echo "SETUP NICHT VOLLSTAENDIG. Siehe /root/edge-install.log"
+  echo "Reparieren: sudo homeedge health ; sudo homeedge apply-all"
+  exit 1
+fi
