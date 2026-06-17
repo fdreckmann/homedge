@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.9-homeedge"
+APP_VERSION="0.9.11-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -54,8 +54,23 @@ ask() { local p="$1" d="${2:-}" v; if [[ -n "$d" ]]; then read -rp "$p [$d]: " v
 ask_secret() { local p="$1" v; read -rsp "$p: " v; echo >&2; printf '%s' "$v"; }
 # Entfernt CR/LF und Whitespace aus Secrets (Tokens duerfen nie mehrzeilig sein).
 sanitize_token() { printf '%s' "${1:-}" | tr -d '\r\n[:space:]'; }
-# Maskiert Cloudflare-Tokens in beliebigen Ausgaben/Logs.
-mask_secrets() { sed -E 's/cfut_[A-Za-z0-9_]+/cfut_***MASKED***/g; s/(CLOUDFLARE_API_TOKEN[=:][[:space:]]*).*/\1***MASKED***/g'; }
+# Maskiert Secrets in beliebigen Ausgaben/Logs (Tokens, API-Keys, WG-Keys).
+mask_secrets() {
+  sed -E \
+    -e 's/cfut_[A-Za-z0-9_-]+/cfut_***MASKED***/g' \
+    -e 's/(CLOUDFLARE_API_TOKEN[=:][[:space:]]*)[^[:space:]]*/\1***MASKED***/g' \
+    -e 's/(api_key=)[^&[:space:]"]*/\1MASKED/Ig' \
+    -e 's/(X-Emby-Token[":= ]+)[A-Za-z0-9]+/\1MASKED/Ig' \
+    -e 's/(X-MediaBrowser-Token[":= ]+)[A-Za-z0-9]+/\1MASKED/Ig' \
+    -e 's/(AccessToken[":= ]+)[A-Za-z0-9]+/\1MASKED/Ig' \
+    -e 's/(PrivateKey[[:space:]]*=[[:space:]]*).*/\1***MASKED***/g' \
+    -e 's/(PresharedKey[[:space:]]*=[[:space:]]*).*/\1***MASKED***/g'
+}
+# Zentrale, robuste Laufzeitpruefung fuer den Caddy-Container.
+# running=true UND restarting=false -> OK; sonst (fehlt/Restarting) -> Fehler.
+caddy_is_running() {
+  [[ "$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' caddy-edge 2>/dev/null)" == "true false" ]]
+}
 # Robuster Check, ob lokal ein UDP-Port lauscht (ss-Filter statt Spalten-Parsing).
 udp_port_open() { local p="$1"; ss -H -lun "sport = :${p}" 2>/dev/null | grep -q . ; }
 udp443_open() { udp_port_open 443; }
@@ -101,7 +116,7 @@ load_env() {
   ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
   HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
   EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
-  WG_MTU="${WG_MTU:-1280}"
+  WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   if [[ -f "$ENV_FILE" ]]; then
     # Beschaedigten/mehrzeiligen Token VOR dem Sourcen reparieren.
@@ -116,7 +131,7 @@ load_env() {
     ENABLE_HTTP3="${ENABLE_HTTP3:-0}"; HOMEEDGE_UPDATE_URL="${HOMEEDGE_UPDATE_URL:-}"
     HOMEEDGE_REPO="${HOMEEDGE_REPO:-fdreckmann/homedge}"; HOMEEDGE_BRANCH="${HOMEEDGE_BRANCH:-main}"
     EXPERT_MODE="${EXPERT_MODE:-0}"; BACKUP_BEHAVIOR="${BACKUP_BEHAVIOR:-ask}"
-    WG_MTU="${WG_MTU:-1280}"
+    WG_MTU="${WG_MTU:-1280}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
     F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   fi
 }
@@ -148,6 +163,7 @@ HOMEEDGE_BRANCH=$(q "${HOMEEDGE_BRANCH:-main}")
 EXPERT_MODE=$(q "${EXPERT_MODE:-0}")
 BACKUP_BEHAVIOR=$(q "${BACKUP_BEHAVIOR:-ask}")
 WG_MTU=$(q "${WG_MTU:-1280}")
+ENABLE_IPV6=$(q "${ENABLE_IPV6:-0}")
 F2B_CADDY_MAXRETRY=$(q "${F2B_CADDY_MAXRETRY:-20}")
 F2B_CADDY_FINDTIME=$(q "${F2B_CADDY_FINDTIME:-10m}")
 F2B_CADDY_BANTIME=$(q "${F2B_CADDY_BANTIME:-15m}")
@@ -477,7 +493,7 @@ generate_caddyfile() { generate_caddyfile_to "${CADDY_DIR}/Caddyfile"; }
 # bei Bedarf das Image und validiert in einem Wegwerf-Container.
 validate_caddyfile() {
   cd "$CADDY_DIR" || return 1
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+  if caddy_is_running; then
     docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
   else
     docker compose build >/dev/null 2>&1 || return 1
@@ -559,12 +575,12 @@ reload_caddy() {
   section "Caddy neu laden"
   _caddy_prepare_config || return 1
   cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+  if caddy_is_running; then
     docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || docker compose up -d >/dev/null 2>&1
   else
     docker compose build >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
+  if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
   wait_for_certs
   echo
   info "Test einer Domain: sudo homeedge test-domain DEINE.DOMAIN"
@@ -580,7 +596,7 @@ restart_caddy() {
   else
     err "Caddy-Build/Start fehlgeschlagen."; return 1
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
+  if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; return 1; fi
   wait_for_certs
 }
 
@@ -845,51 +861,91 @@ f2b_just_restart() {
 }
 
 
+# ------------------------------------------------------------
+# IPv6-Helfer (nur externer Zugriff Client -> VPS/Caddy)
+# ------------------------------------------------------------
+# Erste globale IPv6-Adresse des VPS (leer wenn keine). errexit-sicher.
+vps_ipv6() {
+  command -v ip >/dev/null 2>&1 || return 0
+  ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2; exit}' | cut -d/ -f1 2>/dev/null || true
+}
+vps_has_global_ipv6() { [[ -n "$(vps_ipv6)" ]]; }
+ufw_ipv6_enabled() { [[ -f /etc/default/ufw ]] && grep -qiE '^IPV6=yes' /etc/default/ufw; }
+# Lauscht Caddy lokal auf IPv6 :443?
+caddy_listens_ipv6_443() { command -v ss >/dev/null 2>&1 || return 1; ss -H -ltn 'sport = :443' 2>/dev/null | grep -qE '\[?::'; }
+# Stellt sicher, dass UFW IPv6 verwaltet (IPV6=yes), damit v6 kontrolliert (default deny) ist.
+ensure_ufw_ipv6_yes() {
+  [[ -f /etc/default/ufw ]] || return 0
+  if grep -qE '^IPV6=' /etc/default/ufw; then
+    grep -qiE '^IPV6=yes' /etc/default/ufw || sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+  else
+    echo 'IPV6=yes' >> /etc/default/ufw
+  fi
+}
+
+# Setzt die Service-Regeln (kein reset). SSH/WG dual-stack (Lockout-Schutz),
+# 443 familienspezifisch: v4 immer, v6 nur bei ENABLE_IPV6=1; 443/udp nur bei HTTP/3.
+_ufw_rules_apply() {
+  local cur; cur="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
+  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
+  [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]] && ufw allow "${cur}/tcp" >/dev/null 2>&1 || true
+  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
+  # alte dual-stack 443-Regeln entfernen, dann familienspezifisch setzen
+  ufw delete allow "443/tcp" >/dev/null 2>&1 || true
+  ufw delete allow "443/udp" >/dev/null 2>&1 || true
+  ufw allow proto tcp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto tcp to ::/0 port 443 >/dev/null 2>&1 || true
+  else ufw delete allow proto tcp to ::/0 port 443 >/dev/null 2>&1 || true; fi
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
+    ufw allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+    if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true
+    else ufw delete allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true; fi
+  else
+    ufw delete allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+    ufw delete allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true
+  fi
+}
+
+# Statusausgabe der UFW-Service-Lage.
+_ufw_status_report() {
+  ok "443/tcp erlaubt (IPv4)"
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "443/tcp (v6) erlaubt"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+  ok "WireGuard ${WG_PORT}/udp erlaubt"
+  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
+    if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "HTTP/3 aktiv, 443/udp und 443/udp (v6) erlaubt"; else ok "HTTP/3 aktiv, 443/udp erlaubt"; fi
+  else
+    ok "HTTP/3 aus, 443/udp geschlossen"
+  fi
+}
+
 apply_firewall() {
   load_env
   section "Firewall neu anwenden"
   local cur_ssh_port; cur_ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
   echo "UFW wird gesetzt: SSH ${SSH_PORT}/tcp, HTTPS 443/tcp, WireGuard ${WG_PORT}/udp"
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then echo "HTTP/3 aktiv -> zusaetzlich 443/udp"; else echo "HTTP/3 aus -> 443/udp bleibt geschlossen"; fi
+  echo "IPv6 extern: $([[ "${ENABLE_IPV6:-0}" == "1" ]] && echo "an (443/tcp v6)" || echo "aus")  HTTP/3: $([[ "${ENABLE_HTTP3:-0}" == "1" ]] && echo an || echo aus)"
   if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]]; then
     info "Aktive SSH-Sitzung laeuft auf Port ${cur_ssh_port}/tcp - dieser bleibt zusaetzlich offen (Schutz vor Aussperren)."
   fi
   warn "Achtung: falscher SSH-Port kann dich aussperren."
   read -rp "Firewall anwenden? [n]: " a; [[ "$a" =~ ^([YyJj]|yes|ja)$ ]] || return
   maybe_backup_before_change
+  ensure_ufw_ipv6_yes
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
-  ufw allow "${SSH_PORT}/tcp"; ufw allow "443/tcp"; ufw allow "${WG_PORT}/udp"
-  [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]] && ufw allow "${cur_ssh_port}/tcp"
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow "443/udp"; else ufw delete allow "443/udp" 2>/dev/null || true; fi
+  _ufw_rules_apply
   ufw --force enable
   echo
-  ok "443/tcp erlaubt"
-  ok "WireGuard ${WG_PORT}/udp erlaubt"
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ok "HTTP/3 aktiviert, 443/udp erlaubt"; else ok "HTTP/3 deaktiviert, 443/udp geschlossen"; fi
-}
-
-# Nicht-interaktive UFW-Synchronisierung passend zur Konfig (fuer Toggle/Migration).
-ufw_sync() {
-  load_env
-  command -v ufw >/dev/null 2>&1 || { warn "ufw nicht installiert."; return 0; }
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
-    ufw allow "443/udp" >/dev/null 2>&1 && ok "443/udp erlaubt (HTTP/3 aktiv)"
-  else
-    ufw delete allow "443/udp" >/dev/null 2>&1 && ok "443/udp entfernt (HTTP/3 aus)" || ok "443/udp war nicht offen"
-  fi
+  _ufw_status_report
 }
 
 # Nicht-interaktive, additive UFW-Angleichung an die Konfig (kein reset -> kein Lockout).
 ufw_apply_auto() {
   load_env
   command -v ufw >/dev/null 2>&1 || return 0
-  local cur; cur="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
-  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
-  [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]] && ufw allow "${cur}/tcp" >/dev/null 2>&1 || true
-  ufw allow "443/tcp" >/dev/null 2>&1 || true
-  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow "443/udp" >/dev/null 2>&1 || true; else ufw delete allow "443/udp" >/dev/null 2>&1 || true; fi
-  ok "UFW an Konfiguration angeglichen (HTTP/3=${ENABLE_HTTP3})."
+  ensure_ufw_ipv6_yes
+  _ufw_rules_apply
+  ufw reload >/dev/null 2>&1 || true
+  ok "UFW angeglichen (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
 }
 
 show_values() {
@@ -957,6 +1013,7 @@ validate_services_file() {
   local f="${1:-$SERVICES_FILE}"
   [[ -f "$f" && -s "$f" ]] || return 0   # keine/leere Datei = keine Dienste = ok
   local rc=0 ln=0 line nf d s i p pr
+  local -A seen=()
   if [[ -n "$(tail -c1 "$f")" ]]; then err "services.tsv endet nicht mit Newline (Zeilen koennen verkleben)."; rc=1; fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     ln=$((ln+1)); [[ -z "$line" ]] && continue
@@ -964,9 +1021,16 @@ validate_services_file() {
     if [[ "$nf" -ne 5 ]]; then err "Zeile ${ln}: ${nf} Felder statt 5 (verklebt?): ${line}"; rc=1; continue; fi
     IFS=$'\t' read -r d s i p pr <<<"$line"
     [[ -n "$d" && ! "$d" =~ [[:space:]] ]] || { err "Zeile ${ln}: ungueltige Domain '${d}'"; rc=1; }
+    if [[ -n "$d" ]]; then
+      if [[ -n "${seen[$d]:-}" ]]; then err "Zeile ${ln}: doppelte Domain '${d}' (auch Zeile ${seen[$d]})"; rc=1; else seen[$d]="$ln"; fi
+    fi
     [[ "$s" == "http" || "$s" == "https" ]] || { err "Zeile ${ln}: scheme '${s}' (erwartet http/https)"; rc=1; }
     [[ -n "$i" && ! "$i" =~ [[:space:]] ]] || { err "Zeile ${ln}: ungueltige Backend-Adresse '${i}'"; rc=1; }
-    [[ "$p" =~ ^[0-9]+$ ]] || { err "Zeile ${ln}: Port '${p}' nicht numerisch (verklebt?)"; rc=1; }
+    if [[ "$p" =~ ^[0-9]+$ ]]; then
+      (( p >= 1 && p <= 65535 )) || { err "Zeile ${ln}: Port '${p}' ausserhalb 1-65535"; rc=1; }
+    else
+      err "Zeile ${ln}: Port '${p}' nicht numerisch (verklebt?)"; rc=1
+    fi
     case "$pr" in standard|jellyfin|jellyseerr) ;; *) err "Zeile ${ln}: Profil '${pr}' (erwartet standard/jellyfin/jellyseerr)"; rc=1 ;; esac
   done < "$f"
   return $rc
@@ -1011,6 +1075,8 @@ repair_build() {
 # Analysiert/repariert services.tsv (Backup der defekten Datei vorher).
 repair_services() {
   need_root; load_env
+  local noninteractive=0
+  [[ "${1:-}" == "--non-interactive" || "${1:-}" == "--yes" ]] && noninteractive=1
   section "services.tsv reparieren"
   [[ -f "$SERVICES_FILE" ]] || { warn "Keine services.tsv vorhanden."; return 0; }
   if validate_services_file >/dev/null 2>&1; then ok "services.tsv ist bereits gueltig."; return 0; fi
@@ -1023,7 +1089,7 @@ repair_services() {
     echo "Vorschlag fuer reparierte services.tsv:"
     nl -w2 -s'. ' "$tmp" | sed $'s/\t/ | /g'
     echo
-    if yesno "Diese reparierte Version uebernehmen?" "y"; then
+    if (( noninteractive )) || yesno "Diese reparierte Version uebernehmen?" "y"; then
       cat "$tmp" > "$SERVICES_FILE"; rm -f "$tmp"
       ok "services.tsv repariert."
       validate_services_file && ok "Validierung erfolgreich."
@@ -1129,6 +1195,7 @@ status_all() {
   show_values || true
   domains_status || true
   section "WireGuard"; wg show 2>/dev/null || true
+  ipv6_status || true
   section "Docker"; docker ps 2>/dev/null || true
   section "Caddy Logs"; docker logs --tail 30 caddy-edge 2>/dev/null | mask_secrets || true
   section "Fail2ban"; fail2ban-client status 2>/dev/null || true; fail2ban-client status sshd 2>/dev/null || true; fail2ban-client status caddy-auth 2>/dev/null || true
@@ -1140,9 +1207,10 @@ domains_status() {
   load_env
   section "Domains / DNS-Status"
   if [[ ! -s "$SERVICES_FILE" ]]; then warn "Keine Dienste vorhanden."; return 0; fi
-  local expect="${VPS_PUBLIC_HOST:-}"
-  echo "Erwartete VPS-IP/Host: ${expect:-unbekannt}"
-  local domain scheme ip port a aaaa
+  local expect="${VPS_PUBLIC_HOST:-}" expect6; expect6="$(vps_ipv6)"
+  echo "Erwartete VPS-IPv4/Host: ${expect:-unbekannt}"
+  echo "Erwartete VPS-IPv6:      ${expect6:-(keine)}   (ENABLE_IPV6=${ENABLE_IPV6:-0})"
+  local domain scheme ip port profile a aaaa
   while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     a="$(dig +short A "$domain" 2>/dev/null | tail -n1 || true)"
@@ -1150,19 +1218,27 @@ domains_status() {
     echo
     printf '%bDomain:%b   %s\n' "$C_BOLD" "$C_RESET" "$domain"
     printf '  Backend:  %s://%s:%s\n' "$scheme" "$ip" "$port"
-    printf '  Erwartet: %s\n' "${expect:-unbekannt}"
     printf '  A:        %s\n' "${a:-(keiner)}"
     printf '  AAAA:     %s\n' "${aaaa:-(keiner)}"
+    # IPv4-Bewertung
     if _is_ip "$expect"; then
-      if [[ -z "$a" ]]; then
-        warn "kein A-Record gefunden"
-      elif [[ "$a" == "$expect" ]]; then
-        ok "zeigt auf diesen VPS"
-      else
-        warn "zeigt nicht auf diesen VPS (moeglicherweise bewusst noch nicht migriert)"
-      fi
+      if [[ -z "$a" ]]; then warn "kein A-Record vorhanden"
+      elif [[ "$a" == "$expect" ]]; then ok "A zeigt auf VPS IPv4"
+      else warn "A zeigt nicht auf diesen VPS (moeglicherweise bewusst noch nicht migriert)"; fi
     else
       info "VPS als DNS-Name konfiguriert - A-Record-Vergleich uebersprungen"
+    fi
+    # IPv6-Bewertung
+    if [[ -z "$aaaa" ]]; then
+      info "kein AAAA-Record vorhanden"
+    elif [[ "${ENABLE_IPV6:-0}" != "1" ]]; then
+      warn "AAAA vorhanden, aber ENABLE_IPV6=0 (IPv6 extern nicht aktiviert)"
+    elif [[ -n "$expect6" && "$aaaa" == "$expect6" ]]; then
+      ok "AAAA zeigt auf VPS IPv6"
+    elif [[ -n "$expect6" ]]; then
+      warn "AAAA zeigt nicht auf diesen VPS (erwartet ${expect6})"
+    else
+      warn "AAAA vorhanden, aber VPS hat keine globale IPv6"
     fi
   done < "$SERVICES_FILE"
 }
@@ -1197,7 +1273,9 @@ validate_token_files() {
   local rc=0 f val cnt
   for f in "$ENV_FILE" "${CADDY_DIR}/.env"; do
     [[ -f "$f" ]] || continue
-    cnt="$(grep -c '^CLOUDFLARE_API_TOKEN=' "$f" 2>/dev/null || echo 0)"
+    # robust: awk zaehlt zuverlaessig genau eine Zahl (kein mehrzeiliges cnt).
+    cnt="$(awk '/^CLOUDFLARE_API_TOKEN=/{c++} END{print c+0}' "$f" 2>/dev/null)"
+    cnt="${cnt:-0}"
     val="$(grep -m1 '^CLOUDFLARE_API_TOKEN=' "$f" 2>/dev/null | cut -d= -f2- | tr -d "'\"")"
     if [[ "$cnt" -ne 1 || -z "$val" ]]; then err "Token in $f fehlerhaft (Zeilen: $cnt)."; rc=1; fi
   done
@@ -1242,7 +1320,7 @@ show_logs() {
   menu_item 0 "Zurueck"
   line
   local c; c="$(ask "Auswahl" "1")"
-  case "$c" in 1) docker logs -f --tail 100 caddy-edge ;; 2) tail -f "${CADDY_DIR}/logs/access.log" ;; 3) tail -f /var/log/fail2ban.log ;; 4) watch -n 2 wg show ;; 0) return ;; *) err "Ungueltig." ;; esac
+  case "$c" in 1) docker logs -f --tail 100 caddy-edge 2>&1 | mask_secrets ;; 2) tail -f "${CADDY_DIR}/logs/access.log" 2>/dev/null | mask_secrets ;; 3) { tail -f /var/log/fail2ban.log 2>/dev/null || journalctl -u fail2ban -f; } | mask_secrets ;; 4) watch -n 2 wg show ;; 0) return ;; *) err "Ungueltig." ;; esac
 }
 
 system_usage() {
@@ -1384,6 +1462,19 @@ backup_show_content() {
 # Gemeinsame, atomare Restore-Routine. $1 = Backup-Datei, $2 = mode (full|config).
 _do_restore() {
   local f="$1" mode="$2"
+  # 0) Pflichtdateien im Backup pruefen BEVOR irgendetwas veraendert wird.
+  local listing; listing="$(tar -tzf "$f" 2>/dev/null || true)"
+  local miss=0
+  grep -qE '(^|/)etc/homeedge/services\.tsv$' <<<"$listing" || { err "Backup enthaelt keine etc/homeedge/services.tsv"; miss=1; }
+  grep -qE '(^|/)etc/homeedge/homeedge\.env$' <<<"$listing" || { err "Backup enthaelt keine etc/homeedge/homeedge.env"; miss=1; }
+  if (( miss )); then
+    err "Backup ist unvollstaendig. Restore abgebrochen (nichts veraendert)."
+    return 1
+  fi
+  # Caddyfile/.env sind optional - werden bei Bedarf aus services.tsv/env neu erzeugt.
+  grep -qE '(^|/)opt/caddy-edge/Caddyfile$' <<<"$listing" || info "Kein Caddyfile im Backup - wird aus services.tsv neu generiert."
+  grep -qE '(^|/)opt/caddy-edge/\.env$' <<<"$listing" || info "Keine Caddy-.env im Backup - wird aus homeedge.env neu erzeugt."
+
   # 1) Pre-Restore-Backup des aktuellen Zustands.
   info "Erstelle Pre-Restore-Backup des aktuellen Zustands..."
   BACKUP_BEHAVIOR=auto backup_create >/dev/null 2>&1 || warn "Pre-Restore-Backup unvollstaendig (fahre fort)."
@@ -1628,7 +1719,7 @@ check_certs() {
     return
   fi
 
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+  if ! caddy_is_running; then
     err "Caddy laeuft nicht. Zertifikate koennen nicht sauber getestet werden."
     return 1
   fi
@@ -1651,7 +1742,7 @@ health_check() {
 
   if systemctl is-active --quiet docker 2>/dev/null; then _health_line green "Docker" "aktiv"; else _health_line red "Docker" "nicht aktiv"; fi
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+  if caddy_is_running; then
     _health_line green "Caddy Container" "laeuft"
     if (cd "$CADDY_DIR" && docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1); then
       _health_line green "Caddy Konfig" "valid"
@@ -1810,13 +1901,13 @@ security_http3_toggle() {
   if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
     warn "HTTP/3 ist aktuell aktiv (Caddy lauscht zusaetzlich auf UDP 443)."
     if yesno "HTTP/3 deaktivieren?" "y"; then
-      ENABLE_HTTP3="0"; save_env; reload_caddy; ufw_sync
+      ENABLE_HTTP3="0"; save_env; reload_caddy; ufw_apply_auto
       ok "HTTP/3 deaktiviert, 443/udp geschlossen."
     fi
   else
     info "HTTP/3 ist aktuell deaktiviert (nur HTTP/1.1 und HTTP/2)."
     if yesno "HTTP/3 aktivieren?" "n"; then
-      ENABLE_HTTP3="1"; save_env; reload_caddy; ufw_sync
+      ENABLE_HTTP3="1"; save_env; reload_caddy; ufw_apply_auto
       ok "HTTP/3 aktiviert, 443/udp erlaubt."
     fi
   fi
@@ -1835,7 +1926,7 @@ security_minimal_check() {
 
   if ufw status 2>/dev/null | grep -qi "Status: active\|Status: aktiv"; then ok "UFW aktiv"; else err "UFW nicht aktiv"; bad=$((bad+1)); fi
   if systemctl is-active --quiet fail2ban 2>/dev/null; then ok "Fail2ban aktiv"; else err "Fail2ban nicht aktiv"; bad=$((bad+1)); fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; bad=$((bad+1)); fi
+  if caddy_is_running; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; bad=$((bad+1)); fi
   if ip link show "$WG_IF" >/dev/null 2>&1; then ok "WireGuard Interface ${WG_IF} vorhanden"; else err "WireGuard Interface fehlt"; bad=$((bad+1)); fi
 
   if tcp_port_open "${SSH_PORT}"; then ok "SSH Port ${SSH_PORT}/tcp offen"; else warn "SSH Port ${SSH_PORT}/tcp nicht sichtbar"; warnc=$((warnc+1)); fi
@@ -1913,12 +2004,21 @@ system_update() {
 }
 
 caddy_update() {
+  need_root
   section "Caddy / Docker aktualisieren"
   if [[ ! -f "${CADDY_DIR}/docker-compose.yml" ]]; then err "Caddy Compose-Datei nicht gefunden."; return 1; fi
-  cd "$CADDY_DIR"
-  docker compose build --pull
-  docker compose up -d
-  ok "Caddy wurde neu gebaut/gestartet."
+  maybe_backup_before_change
+  # services.tsv pruefen + Caddyfile generieren/validieren (atomar, mit Rollback).
+  if ! _caddy_prepare_config; then err "Abbruch: Konfiguration ungueltig, kein Rebuild. Letzte Caddyfile bleibt."; return 1; fi
+  cd "$CADDY_DIR" || { err "CADDY_DIR fehlt."; return 1; }
+  if docker compose build --pull >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1; then
+    :
+  else
+    err "Caddy-Build/Start fehlgeschlagen. Vorherige Caddyfile bleibt erhalten - bei Bedarf Rollback ueber Backup."
+    return 1
+  fi
+  if caddy_is_running; then ok "Caddy neu gebaut und laeuft."; else err "Caddy laeuft nicht (Status Restarting/aus). Logs pruefen: homeedge logs"; return 1; fi
+  wait_for_certs
 }
 
 _repo_raw_url() {
@@ -1988,6 +2088,12 @@ homeedge_migrate() {
   save_env
   ok "Konfiguration repariert: Token bereinigt, fehlende Werte ergaenzt."
   echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  caddy-auth=${F2B_CADDY_MAXRETRY}/${F2B_CADDY_FINDTIME}/${F2B_CADDY_BANTIME}"
+  # services.tsv pruefen und ggf. nicht-interaktiv reparieren (4->5 Spalten,
+  # verklebte Zeilen, fehlendes Newline) bevor die Caddyfile erzeugt wird.
+  if ! validate_services_file >/dev/null 2>&1; then
+    warn "services.tsv defekt - versuche automatische Reparatur..."
+    repair_services --non-interactive || warn "services.tsv konnte nicht automatisch repariert werden."
+  fi
   # WireGuard-Konfig mit MTU neu schreiben (best effort, braucht wg).
   if command -v wg >/dev/null 2>&1; then write_wg_config 2>/dev/null && ok "WireGuard-Konfig (inkl. MTU) neu geschrieben." || warn "WireGuard-Konfig nicht aktualisiert."; fi
   # Caddyfile neu generieren + validieren (Services/Zertifikate bleiben erhalten).
@@ -2146,8 +2252,54 @@ caddy_status() {
   load_env
   section "Caddy / Docker Status"
   if systemctl is-active --quiet docker 2>/dev/null; then ok "Docker aktiv"; else err "Docker nicht aktiv"; fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; fi
+  if caddy_is_running; then ok "Caddy Container laeuft"; else err "Caddy Container laeuft nicht"; fi
   docker ps --filter name=caddy-edge --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || true
+  echo
+  if tcp_port_open 443; then ok "lauscht auf :443 (IPv4)"; else warn ":443 (IPv4) nicht sichtbar"; fi
+  if caddy_listens_ipv6_443; then ok "lauscht auf :443 (IPv6)"; else info ":443 (IPv6) nicht sichtbar"; fi
+  ss -tulpnH 2>/dev/null | grep ':443' | sed 's/^/  /' | mask_secrets || true
+}
+
+# IPv6-Statusuebersicht (extern Client -> VPS/Caddy).
+ipv6_status() {
+  load_env
+  section "IPv6 Status (extern)"
+  echo "ENABLE_IPV6: ${ENABLE_IPV6:-0}"
+  local v6; v6="$(vps_ipv6)"
+  [[ -n "$v6" ]] && ok "VPS hat globale IPv6: ${v6}" || warn "Keine globale IPv6-Adresse am VPS gefunden."
+  if ufw_ipv6_enabled; then ok "UFW IPv6 aktiv (/etc/default/ufw: IPV6=yes)"; else warn "UFW IPv6 nicht aktiv (IPV6=yes fehlt)"; fi
+  if caddy_listens_ipv6_443; then ok "Caddy lauscht auf IPv6 :443"; else info "Caddy lauscht (noch) nicht sichtbar auf IPv6 :443"; fi
+  echo "Lauschende :443 Sockets:"
+  ss -tulpnH 2>/dev/null | grep ':443' | sed 's/^/  /' | mask_secrets || true
+  echo
+  info "IPv6 betrifft nur den externen Zugriff auf VPS/Caddy. Backend bleibt IPv4 ueber WireGuard."
+}
+
+# IPv6 extern aktivieren/deaktivieren.
+ipv6_toggle() {
+  need_root; load_env
+  section "IPv6 extern aktivieren/deaktivieren"
+  echo "Hinweis: IPv6 betrifft nur den externen Zugriff auf den VPS/Caddy."
+  echo "Der Backend-Zugriff ins Heimnetz bleibt IPv4 ueber WireGuard."
+  echo "Aktuell: ENABLE_IPV6=${ENABLE_IPV6:-0}"
+  echo
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
+    if yesno "IPv6 extern deaktivieren?" "y"; then
+      maybe_backup_before_change
+      ENABLE_IPV6=0; save_env; ufw_apply_auto
+      ok "IPv6 extern deaktiviert (443/tcp v6 geschlossen)."
+    fi
+  else
+    if ! vps_has_global_ipv6; then warn "Dieser VPS hat keine globale IPv6-Adresse - IPv6 extern bringt aktuell nichts."; fi
+    if yesno "IPv6 extern aktivieren?" "n"; then
+      maybe_backup_before_change
+      ENABLE_IPV6=1; save_env; ufw_apply_auto
+      ok "IPv6 extern aktiviert (443/tcp v6 offen)."
+      warn "Fuer Erreichbarkeit AAAA-Records auf die VPS-IPv6 setzen: $(vps_ipv6)"
+    fi
+  fi
+  echo
+  ipv6_status
 }
 show_caddyfile() {
   section "Caddyfile"
@@ -2187,7 +2339,7 @@ dns_challenge_test() {
   load_env
   section "Cloudflare DNS-Challenge pruefen"
   echo "Caddy nutzt DNS-01 ueber das caddy-dns/cloudflare Modul."
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$'; then
+  if caddy_is_running; then
     if docker exec caddy-edge caddy list-modules 2>/dev/null | grep -q 'cloudflare'; then ok "Cloudflare DNS-Modul im Caddy-Build vorhanden."; else err "Cloudflare DNS-Modul fehlt - Caddy neu bauen (Wartung -> Docker/Caddy neu bauen)."; fi
   else
     warn "Caddy laeuft nicht - Modulpruefung uebersprungen."
@@ -2292,7 +2444,8 @@ sm_status() {
     menu_item 5 "WireGuard Status"
     menu_item 6 "Zertifikatsstatus"
     menu_item 7 "DNS Status pro Domain"
-    menu_item 8 "Server Auslastung"
+    menu_item 8 "IPv6 Status (extern)"
+    menu_item 9 "Server Auslastung"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2303,7 +2456,8 @@ sm_status() {
       5) load_env; wg_status; pause ;;
       6) check_certs; pause ;;
       7) domains_status; pause ;;
-      8) system_usage; pause ;;
+      8) ipv6_status; pause ;;
+      9) system_usage; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2381,6 +2535,8 @@ sm_caddy() {
     menu_item 6 "Cloudflare Token testen"
     menu_item 7 "DNS Challenge pruefen"
     menu_item 8 "HTTP/3 aktivieren/deaktivieren"
+    menu_item 9 "IPv6 extern aktivieren/deaktivieren"
+    menu_item 10 "IPv6 Status anzeigen"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -2392,6 +2548,8 @@ sm_caddy() {
       6) verify_current_token; pause ;;
       7) dns_challenge_test; pause ;;
       8) security_http3_toggle; pause ;;
+      9) ipv6_toggle; pause ;;
+      10) ipv6_status; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -2572,7 +2730,7 @@ menu() {
   while true; do
     load_env
     hmenu_head "Hauptmenue"
-    printf '  %bVPS%b %s   %bWG%b %s:%s   %bCaddy%b %s\n' "$C_CYAN" "$C_RESET" "${VPS_PUBLIC_HOST:-?}" "$C_CYAN" "$C_RESET" "$WG_IF" "$WG_PORT" "$C_CYAN" "$C_RESET" "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-edge$' && echo laeuft || echo "nicht aktiv")"
+    printf '  %bVPS%b %s   %bWG%b %s:%s   %bCaddy%b %s\n' "$C_CYAN" "$C_RESET" "${VPS_PUBLIC_HOST:-?}" "$C_CYAN" "$C_RESET" "$WG_IF" "$WG_PORT" "$C_CYAN" "$C_RESET" "$(caddy_is_running && echo laeuft || echo "nicht aktiv")"
     line
     menu_item 1 "Status / Ampel"
     menu_item 2 "Domains & Dienste"
@@ -2613,7 +2771,8 @@ case "${1:-menu}" in
   network|interfaces|net) sm_settings ;;
   backup|restore|backup-menu) sm_backup ;;
   restore-config) need_root; restore_config ;;
-  repair-services) need_root; repair_services ;;
+  repair-services) need_root; repair_services "${2:-}" ;;
+  validate-services) if validate_services_file; then ok "services.tsv valide."; else err "services.tsv ungueltig."; exit 1; fi ;;
   update|updates|wartung) sm_updates ;;
   migrate) need_root; homeedge_migrate "${2:-}" ;;
   mtu) need_root; edit_wg_mtu ;;
@@ -2634,6 +2793,8 @@ case "${1:-menu}" in
   certs|cert-check) check_certs ;;
   test-domain) test_domain "${2:-}" ;;
   domains|dns) domains_status ;;
+  ipv6) need_root; ipv6_toggle ;;
+  ipv6-status) ipv6_status ;;
   set-token|cf-token) need_root; change_cloudflare_token ;;
   wg-menu) sm_wg ;;
   wg-values) wg_values ;;

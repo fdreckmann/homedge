@@ -73,9 +73,11 @@ else
 fi
 
 echo "[3/10] IP Forwarding aktivieren..."
+# Nur IPv4-Forwarding noetig (Backend-Weg laeuft IPv4 ueber WireGuard).
+# IPv6-Forwarding wird NICHT pauschal aktiviert; IPv6 betrifft nur externen
+# Zugriff (Caddy) und braucht kein Forwarding.
 cat >/etc/sysctl.d/99-homeedge.conf <<EOF
 net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
 EOF
 sysctl --system >/dev/null || true
 
@@ -132,6 +134,7 @@ USE_PSK=$(printf '%q' "${USE_PSK}")
 CADDY_FAIL2BAN=$(printf '%q' "${CADDY_FAIL2BAN}")
 CLIENT_PUBLIC_KEY=$(printf '%q' "${CLIENT_PUBLIC_KEY}")
 ENABLE_HTTP3=$(printf '%q' "${ENABLE_HTTP3:-0}")
+ENABLE_IPV6=$(printf '%q' "${ENABLE_IPV6:-0}")
 HOMEEDGE_REPO=$(printf '%q' "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(printf '%q' "${HOMEEDGE_BRANCH:-main}")
 EOF
@@ -152,20 +155,28 @@ echo "[9/10] UFW Firewall aktivieren..."
 # Aktiven SSH-Port der laufenden Sitzung ermitteln, um Aussperren zu verhindern,
 # falls SSH_PORT abweicht (HomeEdge aendert den sshd-Port nicht selbst).
 CUR_SSH_PORT="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
+# IPv6 in UFW verwalten (default deny fuer v6), Service-Freigabe v6 nur bei ENABLE_IPV6=1.
+if [[ -f /etc/default/ufw ]]; then
+  if grep -qE '^IPV6=' /etc/default/ufw; then sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw; else echo 'IPV6=yes' >> /etc/default/ufw; fi
+fi
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow "${SSH_PORT}/tcp"
-ufw allow "443/tcp"
 ufw allow "${WG_PORT}/udp"
+[[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT}" ]] && ufw allow "${CUR_SSH_PORT}/tcp"
+# 443/tcp: IPv4 immer, IPv6 nur bei ENABLE_IPV6=1
+ufw allow proto tcp to 0.0.0.0/0 port 443
+if [[ "${ENABLE_IPV6}" == "1" ]]; then ufw allow proto tcp to ::/0 port 443; echo "IPv6 extern aktiv: 443/tcp (v6) freigegeben."; else echo "IPv6 extern aus: 443/tcp (v6) bleibt geschlossen."; fi
+# 443/udp nur bei HTTP/3
 if [[ "${ENABLE_HTTP3}" == "1" ]]; then
-  ufw allow "443/udp"
+  ufw allow proto udp to 0.0.0.0/0 port 443
+  [[ "${ENABLE_IPV6}" == "1" ]] && ufw allow proto udp to ::/0 port 443
   echo "HTTP/3 aktiv: 443/udp freigegeben."
 else
   echo "HTTP/3 aus: 443/udp bleibt geschlossen."
 fi
 if [[ -n "${CUR_SSH_PORT}" && "${CUR_SSH_PORT}" != "${SSH_PORT}" ]]; then
-  ufw allow "${CUR_SSH_PORT}/tcp"
   echo "Hinweis: Aktiver SSH-Port ${CUR_SSH_PORT}/tcp wurde zusaetzlich freigegeben (Schutz vor Aussperren)."
   echo "         HomeEdge aendert den sshd-Port nicht. SSH_PORT=${SSH_PORT} gilt nur fuer Firewall/Fail2ban."
 fi

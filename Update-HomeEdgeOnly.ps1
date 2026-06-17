@@ -43,11 +43,34 @@ if ($SshKeyPath -ne "") { $sshArgs += @("-i", $SshKeyPath) }
 $sshArgs += @("-p", $SshPort, "$SshUser@$SshHost")
 
 Write-Host ""
-Write-Host "Lade homeedge auf den VPS und ersetze /usr/local/bin/homeedge ..."
+Write-Host "Lade homeedge auf den VPS, ersetze /usr/local/bin/homeedge und fuehre Migration/Healthcheck aus ..."
 Write-Host ""
 
+# Remote-Ablauf: Binary ersetzen, Pre-Update-Backup, Migration, Validierung,
+# Healthcheck. Bei Fehler Rollback-Hinweis. (Hier-String ist literal.)
+$remote = @'
+sed -i 's/\r$//' /tmp/homeedge
+sudo bash -c '
+set -u
+TS=$(date +%Y%m%d-%H%M%S)
+FAIL=0
+[ -f /usr/local/bin/homeedge ] && cp -a /usr/local/bin/homeedge /usr/local/bin/homeedge.preupdate.$TS || true
+chmod +x /tmp/homeedge
+mv /tmp/homeedge /usr/local/bin/homeedge
+chown root:root /usr/local/bin/homeedge
+ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl
+echo "[OK] homeedge ersetzt: $(/usr/local/bin/homeedge --version 2>/dev/null)"
+/usr/local/bin/homeedge backup-create </dev/null >/dev/null 2>&1 && echo "[OK] Pre-Update-Backup erstellt" || echo "[WARN] Pre-Update-Backup uebersprungen"
+/usr/local/bin/homeedge migrate --no-backup || FAIL=1
+/usr/local/bin/homeedge validate-services || FAIL=1
+/usr/local/bin/homeedge health || true
+if [ $FAIL -ne 0 ]; then echo "[ERR] Update mit Fehlern. Rollback: cp /usr/local/bin/homeedge.preupdate.$TS /usr/local/bin/homeedge ; sudo homeedge restore-config"; exit 1; fi
+echo "[OK] Update abgeschlossen."
+'
+'@
+
 $Content = Get-Content $EdgectlPath -Raw
-$Content | & ssh @sshArgs "cat >/tmp/homeedge && sed -i 's/\r$//' /tmp/homeedge && chmod +x /tmp/homeedge && sudo mv /tmp/homeedge /usr/local/bin/homeedge && sudo chown root:root /usr/local/bin/homeedge && sudo chmod +x /usr/local/bin/homeedge && sudo ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl && sudo homeedge values"
+$Content | & ssh @sshArgs ("cat >/tmp/homeedge && " + $remote)
 
 Write-Host ""
 Write-Host "Fertig. Menue starten mit:"
