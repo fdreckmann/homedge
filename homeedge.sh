@@ -240,7 +240,7 @@ stop_wg_if_exists() {
 }
 
 write_unifi_values() {
-  load_env; require_valid_services || return 1; generate_keys
+  load_env; generate_keys
   local psk="<nicht verwendet>"; [[ "${USE_PSK}" == "1" ]] && psk="$(cat "${KEY_DIR}/preshared.key")"
   cat > "${EDGE_DIR}/unifi-wireguard-werte.txt" <<EOVAL
 ============================================================
@@ -259,8 +259,17 @@ Persistent Keepalive:       25
 UniFi Firewall-Regeln:
 Erlaube von ${VPS_WG_IP} zu deinen Backend-Diensten:
 EOVAL
-  if [[ -f "$SERVICES_FILE" ]]; then
-    while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do [[ -z "${domain:-}" ]] && continue; echo "  ${VPS_WG_IP} -> ${ip}:${port}/tcp  (${domain})" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"; done < "$SERVICES_FILE"
+  # Dienstbezogene Firewall-Hinweise sind OPTIONAL: WireGuard-Basiswerte oben
+  # haengen NICHT von services.tsv ab. Ist die Datei defekt, nur warnen statt
+  # das ganze WireGuard-Menue zu blockieren.
+  if [[ -s "$SERVICES_FILE" ]]; then
+    if validate_services_file >/dev/null 2>&1; then
+      while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do [[ -z "${domain:-}" ]] && continue; echo "  ${VPS_WG_IP} -> ${ip}:${port}/tcp  (${domain})" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"; done < "$SERVICES_FILE"
+    else
+      echo "  (services.tsv ist ungueltig - dienstbezogene Hinweise ausgelassen. Reparatur: sudo homeedge repair-services)" >> "${EDGE_DIR}/unifi-wireguard-werte.txt"
+      warn "services.tsv ist ungueltig. Dienstbezogene Hinweise werden nicht angezeigt." >&2
+      info "WireGuard-Basiswerte werden trotzdem angezeigt." >&2
+    fi
   fi
   cat >> "${EDGE_DIR}/unifi-wireguard-werte.txt" <<EOVAL
 
@@ -291,7 +300,7 @@ set_wg_key() {
   wg show || true
 }
 
-wg_values() { write_unifi_values || return 1; cat "${EDGE_DIR}/unifi-wireguard-werte.txt"; }
+wg_values() { write_unifi_values; cat "${EDGE_DIR}/unifi-wireguard-werte.txt"; }
 
 show_wg_config() {
   load_env
