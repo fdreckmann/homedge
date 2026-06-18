@@ -633,10 +633,12 @@ _validate_caddyfile_path() {
   [[ -f "${CADDY_DIR}/.env" ]] && envargs=(--env-file "${CADDY_DIR}/.env")
   # WICHTIG: NUR die generierte Datei mounten (kein Service-Volume) und
   # --adapter caddyfile erzwingen (sonst wird die Datei als JSON interpretiert).
+  # rc defensiv erfassen: eine Befehlssubstitutions-Zuweisung wuerde unter set -e
+  # sonst das Script beenden, statt sauber 1 zurueckzugeben.
+  rc=0
   CADDY_VALIDATE_OUTPUT="$(docker run --rm "${envargs[@]}" \
     -v "${f}:/etc/caddy/Caddyfile:ro" --entrypoint caddy "$CADDY_IMAGE" \
-    validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"
-  rc=$?
+    validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)" || rc=$?
   {
     echo "[$(date -Is)] caddy validate (rc=${rc}) fuer ${f}"
     printf '%s\n' "$CADDY_VALIDATE_OUTPUT"
@@ -651,6 +653,16 @@ cert_ready() {
   command -v openssl >/dev/null 2>&1 || return 0
   echo | timeout 8 openssl s_client -servername "$domain" -connect 127.0.0.1:443 2>/dev/null \
     | openssl x509 -noout -subject >/dev/null 2>&1
+}
+
+# Sucht in den letzten Caddy-Logs nach einem ECHTEN ACME-/Zertifikatsfehler fuer
+# die Domain (z. B. falscher Cloudflare Token). 0 = Fehler gefunden.
+caddy_acme_error_for_domain() {
+  local domain="$1" logs
+  command -v docker >/dev/null 2>&1 || return 1
+  logs="$(docker logs --since 30m --tail 800 caddy-edge 2>&1 || true)"
+  grep -iF "$domain" <<<"$logs" \
+    | grep -qiE 'could not get certificate|obtain(ing)? certificate.*(fail|error)|challenge failed|authorization (failed|error)|"level":"error"|invalid (api )?token|unauthorized|no solvers|acme.*error'
 }
 
 # Wartet nach einem Reload bis zu 120s, bis Zertifikate aktiv sind (DNS-01 dauert).
@@ -825,6 +837,12 @@ caddy_rebuild() {
 
 install_fail2ban() {
   load_env; mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  # SSH_PORT muss numerisch sein, sonst vergiftet ein kaputter Wert die sshd-Jail
+  # (fail2ban-client -t schlaegt fehl). Defensiver Fallback auf 22.
+  if ! [[ "${SSH_PORT:-}" =~ ^[0-9]+$ ]]; then
+    warn "SSH_PORT='${SSH_PORT:-}' ist nicht numerisch - nutze 22 fuer die Fail2ban sshd-Jail."
+    SSH_PORT=22
+  fi
   # Caddy-Access-Log muss existieren, bevor Fail2ban startet (sonst Jail-Fehler).
   mkdir -p "${CADDY_DIR}/logs"; touch "${CADDY_DIR}/logs/access.log"
 
@@ -873,7 +891,13 @@ EOF2
     rm -f /etc/fail2ban/jail.d/caddy-auth.local /etc/fail2ban/filter.d/caddy-auth.conf
     cp -a "${bdir}/caddy-auth.local" /etc/fail2ban/jail.d/ 2>/dev/null || true
     cp -a "${bdir}/caddy-auth.conf" /etc/fail2ban/filter.d/ 2>/dev/null || true
-    systemctl restart fail2ban 2>/dev/null || true
+    # Nur neu starten, wenn die wiederhergestellte Konfig den Test besteht.
+    if fail2ban-client -t >/dev/null 2>&1; then
+      systemctl restart fail2ban 2>/dev/null || true
+    else
+      err "Auch die wiederhergestellte Fail2ban-Konfig ist fehlerhaft - Fail2ban NICHT neu gestartet."
+      err "Bitte manuell pruefen: sudo fail2ban-client -t"
+    fi
     rm -rf "$bdir"
     return 1
   fi
@@ -1129,15 +1153,27 @@ _ufw_rules_apply() {
   fi
 }
 
-# Statusausgabe der UFW-Service-Lage.
+# Statusausgabe der UFW-Service-Lage. Liest die ECHTE "ufw status" (nicht nur die
+# ENV-Flags), damit ein evtl. nicht entfernter v6-443-Eintrag nicht faelschlich
+# als "geschlossen" gemeldet wird (UFW-Regel-Match beim delete kann abweichen).
 _ufw_status_report() {
+  local st v6tcp=0 v6udp=0
+  st="$(ufw status 2>/dev/null || true)"
+  grep -qE '443.*\(v6\)' <<<"$st" && v6tcp=1
+  # grobe Unterscheidung tcp/udp v6 anhand der Zeile
+  grep -qiE '443/udp.*\(v6\)|443/udp \(v6\)' <<<"$st" && v6udp=1
   ok "443/tcp erlaubt (IPv4)"
-  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "443/tcp (v6) erlaubt"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
+    if (( v6tcp )); then ok "443/tcp (v6) erlaubt"; else warn "443/tcp (v6) SOLL offen sein (ENABLE_IPV6=1), ist aber laut 'ufw status' nicht gelistet."; fi
+  else
+    if (( v6tcp )); then warn "443 (v6) ist laut 'ufw status' noch offen, obwohl ENABLE_IPV6=0 - bitte pruefen: sudo ufw status"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+  fi
   ok "WireGuard ${WG_PORT}/udp erlaubt"
   if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
     if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "HTTP/3 aktiv, 443/udp und 443/udp (v6) erlaubt"; else ok "HTTP/3 aktiv, 443/udp erlaubt"; fi
   else
     ok "HTTP/3 aus, 443/udp geschlossen"
+    (( v6udp )) && warn "443/udp (v6) ist laut 'ufw status' noch offen, obwohl HTTP/3 aus - bitte pruefen: sudo ufw status"
   fi
 }
 
@@ -1156,6 +1192,20 @@ apply_firewall() {
   ensure_ufw_ipv6_yes
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
   _ufw_rules_apply
+  # Lockout-Schutz: NUR aktivieren, wenn der SSH-Port (und der aktive Sitzungsport)
+  # nach _ufw_rules_apply wirklich als ALLOW-Regel vorhanden ist. Sonst wuerde
+  # "ufw --force enable" bei default-deny die laufende SSH-Sitzung aussperren.
+  local ufw_rules; ufw_rules="$(ufw status 2>/dev/null || true)"
+  if ! grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+    err "SSH-Port ${SSH_PORT}/tcp ist NICHT als UFW-Regel vorhanden - Firewall wird NICHT aktiviert (Aussperr-Schutz)."
+    err "Bitte SSH_PORT pruefen (sudo homeedge settings) und erneut versuchen."
+    return 1
+  fi
+  if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]] \
+     && ! grep -qE "(^|[[:space:]])${cur_ssh_port}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+    err "Aktiver SSH-Sitzungsport ${cur_ssh_port}/tcp ist NICHT freigegeben - Firewall wird NICHT aktiviert (Aussperr-Schutz)."
+    return 1
+  fi
   ufw --force enable
   echo
   _ufw_status_report
@@ -1181,7 +1231,21 @@ ufw_ensure_active() {
   ensure_ufw_ipv6_yes
   # SSH-Port (und aktiven SSH-Sitzungsport) VOR enable erlauben -> kein Lockout.
   _ufw_rules_apply
-  if ufw status 2>/dev/null | grep -qiE "Status: (active|aktiv)"; then
+  # Lockout-Schutz: vor dem Aktivieren sicherstellen, dass die SSH-Regel da ist.
+  local cur_ssh_port; cur_ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
+  local ufw_rules; ufw_rules="$(ufw status 2>/dev/null || true)"
+  if ! grep -qiE "Status: (active|aktiv)" <<<"$ufw_rules"; then
+    if ! grep -qE "(^|[[:space:]])${SSH_PORT:-22}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+      err "SSH-Port ${SSH_PORT:-22}/tcp ist nicht freigegeben - UFW wird NICHT aktiviert (Aussperr-Schutz)."
+      return 1
+    fi
+    if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT:-22}" ]] \
+       && ! grep -qE "(^|[[:space:]])${cur_ssh_port}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+      err "Aktiver SSH-Sitzungsport ${cur_ssh_port}/tcp ist nicht freigegeben - UFW wird NICHT aktiviert (Aussperr-Schutz)."
+      return 1
+    fi
+  fi
+  if grep -qiE "Status: (active|aktiv)" <<<"$ufw_rules"; then
     ufw reload >/dev/null 2>&1 || true
   else
     ufw --force enable >/dev/null 2>&1 || true
@@ -1576,6 +1640,7 @@ status_all() {
   section "Caddy Logs"; docker logs --tail 30 caddy-edge 2>/dev/null | mask_secrets || true
   section "Fail2ban"; fail2ban-client status 2>/dev/null || true; fail2ban-client status sshd 2>/dev/null || true; fail2ban-client status caddy-auth 2>/dev/null || true
   section "UFW"; ufw status verbose 2>/dev/null || true
+  section "Update-Verhalten"; update_policy_info
 }
 
 # Zeigt pro Domain Backend, erwartete VPS-IP, aktuelle DNS-Records und Bewertung (Bug 7).
@@ -2355,12 +2420,15 @@ _tls_check_one() {
   code="$(curl -sS -I --connect-timeout 10 --max-time 20 --resolve "${domain}:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://${domain}" 2>"$tmp")" || rc=$?
   if [[ "$rc" -eq 0 && "$code" != "000" ]]; then
     _health_line green "TLS ${domain}" "Zertifikat ok, HTTP ${code}"
-  elif caddy_is_running; then
-    # Caddy laeuft -> Zertifikat wird per DNS-01 evtl. noch geholt: GELB, nicht ROT.
-    _health_line yellow "TLS ${domain}" "Zertifikat wird noch angefordert / ausstehend (DNS-01 kann dauern)"
-  else
+  elif ! caddy_is_running; then
     detail="$(tr '\n' ' ' < "$tmp" | cut -c1-140)"
     _health_line red "TLS ${domain}" "Lokaler SNI-Test nicht moeglich: Caddy laeuft nicht (${detail:-kein TLS})"
+  elif caddy_acme_error_for_domain "$domain"; then
+    # Caddy laeuft, aber die Logs zeigen einen echten ACME-Fehler -> ROT.
+    _health_line red "TLS ${domain}" "ACME-/Zertifikatsfehler in den Logs - Cloudflare Token/DNS-01 pruefen (sudo homeedge caddy-logs)"
+  else
+    # Caddy laeuft, kein Fehler im Log -> Zertifikat wird per DNS-01 noch geholt: GELB.
+    _health_line yellow "TLS ${domain}" "Zertifikat wird noch angefordert / ausstehend (DNS-01 kann dauern)"
   fi
   rm -f "$tmp"
 
@@ -2698,21 +2766,40 @@ system_update() {
   ok "Systemupdates abgeschlossen."
 }
 
+# Manuelles, sicheres Caddy/Docker-Update (Image mit --pull neu bauen). Bewusst
+# NICHT automatisch - Container-Updates koennen Dienste ungeplant brechen.
 caddy_update() {
-  need_root
-  section "Caddy / Docker aktualisieren"
-  if ! caddy_compose_file_exists; then err "Caddy Compose-Datei nicht gefunden: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; fi
+  need_root; load_env
+  section "Caddy / Docker neu bauen (manuelles Update)"
+  info "OS-Updates/Zertifikate laufen automatisch. Caddy/Docker-Image ist ein MANUELLES Update."
+  # 1) services.tsv validieren.
+  require_valid_services || { err "services.tsv ungueltig - bitte zuerst: sudo homeedge repair-services"; return 1; }
+  # 2) Backup anbieten/erstellen.
   maybe_backup_before_change
-  # services.tsv pruefen + Caddyfile generieren/validieren (atomar, mit Rollback).
+  # 3) Stack-Dateien sicherstellen (Dockerfile/compose/.env/Verzeichnisse, kein Dir-Caddyfile).
+  _ensure_caddyfile_not_dir
+  write_caddy_stack
+  caddy_compose_file_exists || { err "Caddy Compose-Datei nicht gefunden: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; }
+  # 4) Image mit --pull neu bauen.
+  info "Baue Caddy-Image neu (docker compose build --pull) - das kann dauern..."
+  if ! caddy_compose build --pull >/dev/null 2>&1; then err "Caddy-Image-Build (--pull) fehlgeschlagen."; return 1; fi
+  # Cloudflare-DNS-Modul im frischen Image verifizieren.
+  if caddy_has_cloudflare_module; then ok "Cloudflare DNS Modul im neuen Image vorhanden."; else err "Cloudflare DNS Modul fehlt im neuen Image - Abbruch."; return 1; fi
+  # 5) Caddyfile generieren/validieren (atomar, mit Rollback) BEVOR Container neu erstellt wird.
   if ! _caddy_prepare_config; then err "Abbruch: Konfiguration ungueltig, kein Rebuild. Letzte Caddyfile bleibt."; return 1; fi
-  if caddy_compose build --pull >/dev/null 2>&1 && caddy_compose up -d >/dev/null 2>&1; then
-    :
-  else
-    err "Caddy-Build/Start fehlgeschlagen. Vorherige Caddyfile bleibt erhalten - bei Bedarf Rollback ueber Backup."
+  # 6) Container neu erstellen.
+  if ! caddy_compose up -d --force-recreate >/dev/null 2>&1; then
+    err "Caddy-Start (up -d --force-recreate) fehlgeschlagen. Vorherige Caddyfile bleibt - Rollback ueber Backup moeglich (sudo homeedge restore-config)."
     return 1
   fi
-  if caddy_is_running; then ok "Caddy neu gebaut und laeuft."; else err "Caddy laeuft nicht (Status Restarting/aus). Logs pruefen: homeedge logs"; return 1; fi
+  # 7) Laufzeit pruefen.
+  if caddy_is_running; then ok "Caddy neu gebaut und laeuft (running=true, restarting=false)."; else err "Caddy laeuft nicht (Restarting/exited). Logs: sudo homeedge caddy-logs"; return 1; fi
+  # 8) Aktive Konfig validieren.
+  if validate_caddyfile; then ok "Caddy Konfig valid."; else warn "Caddy Konfig konnte nicht bestaetigt werden - Logs pruefen."; fi
+  # 9) Lokaler SNI-Test + Zertifikate abwarten.
   wait_for_certs
+  # 10) Ergebnis.
+  ok "Caddy/Docker-Update abgeschlossen. Bestehende Domains sollten weiter per HTTPS erreichbar sein."
 }
 
 _repo_raw_url() {
@@ -3405,10 +3492,22 @@ sm_backup() {
     esac
   done
 }
+# Zeigt klar, was automatisch und was manuell aktualisiert wird (Bug P1).
+update_policy_info() {
+  info "OS-Sicherheitsupdates: automatisch (unattended-upgrades)"
+  info "TLS-Zertifikate: automatisch durch Caddy (Let's Encrypt / DNS-01)"
+  info "Caddy/Docker-Image: MANUELL ueber Updates & Wartung -> Docker / Caddy neu bauen"
+  info "Caddy Cloudflare DNS Plugin: MANUELL (beim Caddy-Neubau enthalten)"
+  info "HomeEdge selbst: MANUELL per Update (Updates & Wartung -> HomeEdge aktualisieren)"
+  info "Hinweis: automatische Container-/Image-Updates sind bewusst NICHT aktiv (koennten Dienste ungeplant brechen)."
+}
+
 sm_updates() {
   need_root; set +e
   while true; do
     hmenu_head "Updates & Wartung"
+    update_policy_info
+    echo
     menu_item 1 "HomeEdge Version anzeigen"
     menu_item 2 "Nach Update suchen"
     menu_item 3 "HomeEdge aktualisieren"
@@ -3546,6 +3645,8 @@ case "${1:-menu}" in
       *) echo "Aktuell: MIGRATION_MODE=${MIGRATION_MODE:-0}"; echo "Nutzung: sudo homeedge migration-mode on|off" ;;
     esac ;;
   update|updates|wartung) sm_updates ;;
+  update-policy|update-info) section "Update-Verhalten"; update_policy_info ;;
+  caddy-update|caddy-rebuild-pull) need_root; caddy_update ;;
   migrate) need_root; homeedge_migrate "${2:-}" ;;
   mtu) need_root; edit_wg_mtu ;;
   self-update|update-repo|repo-update) need_root; homeedge_repo_update ;;
