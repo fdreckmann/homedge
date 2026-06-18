@@ -59,6 +59,49 @@ function Get-CfgBool($Config, $Name, $Default = $false) {
     return [bool]$Default
 }
 
+# --- Dienste-Validierung (gleich streng wie die Bash-Installer) ---
+function Test-EdgeDomain($d) {
+    if ([string]::IsNullOrWhiteSpace($d)) { return $false }
+    if ($d -match '[\s:/]') { return $false }
+    # Optionaler Wildcard-Prefix *. + FQDN mit mindestens einem Punkt. Nur
+    # A-Za-z0-9, Bindestrich und Punkt erlaubt -> schliesst { } ; " ' ` $ \ aus.
+    return ($d -match '^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')
+}
+function Test-EdgeBackend($b) {
+    if ([string]::IsNullOrWhiteSpace($b)) { return $false }
+    if ($b -match '[\s:/]') { return $false }
+    if ($b -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') {
+        foreach ($o in $b.Split('.')) { if ([int]$o -lt 0 -or [int]$o -gt 255) { return $false } }
+        return $true
+    }
+    return ($b -match '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$')
+}
+function Test-EdgeScheme($s) { return ($s -eq "http" -or $s -eq "https") }
+function Test-EdgePort($p) {
+    if ($p -notmatch '^[0-9]+$') { return $false }
+    $n = [int]$p
+    return ($n -ge 1 -and $n -le 65535)
+}
+function Test-EdgeProfile($pr) { return ($pr -eq "standard" -or $pr -eq "jellyfin" -or $pr -eq "jellyseerr") }
+# Validiert eine ganze services.tsv (Tab-getrennt, 5 Spalten). Gibt $true/$false.
+function Test-EdgeServicesTsv($tsv, [ref]$Errors) {
+    $errs = @()
+    $ln = 0
+    foreach ($line in ($tsv -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $ln++
+        $f = $line -split "`t"
+        if ($f.Count -ne 5) { $errs += "  Dienst ${ln}: $($f.Count) Felder statt 5"; continue }
+        if (-not (Test-EdgeDomain $f[0]))  { $errs += "  Dienst ${ln}: ungueltige Domain '$($f[0])'" }
+        if (-not (Test-EdgeScheme $f[1]))  { $errs += "  Dienst ${ln}: Scheme '$($f[1])' (http/https)" }
+        if (-not (Test-EdgeBackend $f[2])) { $errs += "  Dienst ${ln}: ungueltiges Backend '$($f[2])'" }
+        if (-not (Test-EdgePort $f[3]))    { $errs += "  Dienst ${ln}: Port '$($f[3])' (1-65535)" }
+        if (-not (Test-EdgeProfile $f[4])) { $errs += "  Dienst ${ln}: Profil '$($f[4])'" }
+    }
+    $Errors.Value = $errs
+    return ($errs.Count -eq 0)
+}
+
 
 function Build-SshArgs($HostName, $UserName, $Port, $KeyPath) {
     $args = @()
@@ -328,10 +371,10 @@ if (-not $UseSavedServices) {
     for ($i = 1; $i -le $ServiceCount; $i++) {
         Write-Host ""
         Write-Host "Dienst $i"
-        $d = Ask "Domain"
-        $s = Ask "Backend Scheme http/https" "http"
-        $ip = Ask "Backend IP im Heimnetz"
-        $p = Ask "Backend Port"
+        do { $d = Ask "Domain"; if (-not (Test-EdgeDomain $d)) { Write-Host "Ungueltige Domain. Erlaubt: FQDN (jft.example.de) oder *.example.de, keine Sonderzeichen/Leerzeichen." } } until (Test-EdgeDomain $d)
+        do { $s = Ask "Backend Scheme http/https" "http"; if (-not (Test-EdgeScheme $s)) { Write-Host "Scheme muss http oder https sein." } } until (Test-EdgeScheme $s)
+        do { $ip = Ask "Backend IP im Heimnetz"; if (-not (Test-EdgeBackend $ip)) { Write-Host "Ungueltiges Backend. Erlaubt: IPv4 (192.168.10.99) oder Hostname, keine Sonderzeichen." } } until (Test-EdgeBackend $ip)
+        do { $p = Ask "Backend Port"; if (-not (Test-EdgePort $p)) { Write-Host "Port muss numerisch und 1-65535 sein." } } until (Test-EdgePort $p)
         Write-Host "Backend-Profil: 1) Standard  2) Jellyfin  3) Jellyseerr"
         $prc = Ask "Profil" "1"
         $prof = switch ($prc) { "2" { "jellyfin" } "3" { "jellyseerr" } default { "standard" } }
@@ -460,6 +503,18 @@ Write-Host "Achtung:"
 Write-Host "Auf dem VPS werden jetzt Pakete installiert und konfiguriert:"
 Write-Host "Docker/Caddy, WireGuard, UFW, Fail2ban, automatische Updates, Swap, HomeEdge-Menue."
 Write-Host ""
+
+# Dienste FRUEH validieren, bevor irgendetwas remote installiert wird. Faengt auch
+# aus der gespeicherten Config geladene, ungueltige Dienste ab.
+$svcErrors = @()
+if (-not (Test-EdgeServicesTsv $ServicesTsv ([ref]$svcErrors))) {
+    Write-Host ""
+    Write-Host "FEHLER: Ungueltige Dienste-Konfiguration. Installation NICHT gestartet:"
+    $svcErrors | ForEach-Object { Write-Host $_ }
+    Write-Host "Bitte Domain/Scheme/Backend/Port/Profil korrigieren und erneut starten."
+    exit 1
+}
+
 if (!(Ask-YesNo "Konfiguration uebernehmen und Installation jetzt starten?" "n")) {
     Write-Host "Installation abgebrochen. Die Konfiguration kann beim naechsten Start wiederverwendet werden."
     exit 0

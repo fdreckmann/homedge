@@ -144,7 +144,15 @@ HOMEEDGE_REPO=$(printf '%q' "${HOMEEDGE_REPO:-fdreckmann/homedge}")
 HOMEEDGE_BRANCH=$(printf '%q' "${HOMEEDGE_BRANCH:-main}")
 EOF
 chmod 600 "${ENV_FILE}"
-printf '%s' "${SERVICES_TSV}" > "${SERVICES_FILE}"
+# services.tsv DIREKT aus Base64 schreiben (NICHT ueber die Variable SERVICES_TSV
+# via printf): Command Substitution oben entfernt finale Newlines, wodurch der
+# abschliessende Zeilenumbruch fehlt und validate_services_file faelschlich
+# "ungueltig" meldet. Direkt dekodieren + finalen Newline sicherstellen.
+printf '%s' "__SERVICES_TSV_B64__" | base64 -d > "${SERVICES_FILE}" 2>/dev/null || : > "${SERVICES_FILE}"
+if [[ -s "${SERVICES_FILE}" && -n "$(tail -c1 "${SERVICES_FILE}")" ]]; then
+  printf '\n' >> "${SERVICES_FILE}"
+fi
+chmod 600 "${SERVICES_FILE}"
 
 echo "[7/10] WireGuard, Caddy und Fail2ban anwenden..."
 # Fehler hier nicht sofort abbrechen: die finale Verifikation (verify-setup)
