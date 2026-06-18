@@ -633,10 +633,12 @@ _validate_caddyfile_path() {
   [[ -f "${CADDY_DIR}/.env" ]] && envargs=(--env-file "${CADDY_DIR}/.env")
   # WICHTIG: NUR die generierte Datei mounten (kein Service-Volume) und
   # --adapter caddyfile erzwingen (sonst wird die Datei als JSON interpretiert).
+  # rc defensiv erfassen: eine Befehlssubstitutions-Zuweisung wuerde unter set -e
+  # sonst das Script beenden, statt sauber 1 zurueckzugeben.
+  rc=0
   CADDY_VALIDATE_OUTPUT="$(docker run --rm "${envargs[@]}" \
     -v "${f}:/etc/caddy/Caddyfile:ro" --entrypoint caddy "$CADDY_IMAGE" \
-    validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"
-  rc=$?
+    validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)" || rc=$?
   {
     echo "[$(date -Is)] caddy validate (rc=${rc}) fuer ${f}"
     printf '%s\n' "$CADDY_VALIDATE_OUTPUT"
@@ -825,6 +827,12 @@ caddy_rebuild() {
 
 install_fail2ban() {
   load_env; mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  # SSH_PORT muss numerisch sein, sonst vergiftet ein kaputter Wert die sshd-Jail
+  # (fail2ban-client -t schlaegt fehl). Defensiver Fallback auf 22.
+  if ! [[ "${SSH_PORT:-}" =~ ^[0-9]+$ ]]; then
+    warn "SSH_PORT='${SSH_PORT:-}' ist nicht numerisch - nutze 22 fuer die Fail2ban sshd-Jail."
+    SSH_PORT=22
+  fi
   # Caddy-Access-Log muss existieren, bevor Fail2ban startet (sonst Jail-Fehler).
   mkdir -p "${CADDY_DIR}/logs"; touch "${CADDY_DIR}/logs/access.log"
 
@@ -873,7 +881,13 @@ EOF2
     rm -f /etc/fail2ban/jail.d/caddy-auth.local /etc/fail2ban/filter.d/caddy-auth.conf
     cp -a "${bdir}/caddy-auth.local" /etc/fail2ban/jail.d/ 2>/dev/null || true
     cp -a "${bdir}/caddy-auth.conf" /etc/fail2ban/filter.d/ 2>/dev/null || true
-    systemctl restart fail2ban 2>/dev/null || true
+    # Nur neu starten, wenn die wiederhergestellte Konfig den Test besteht.
+    if fail2ban-client -t >/dev/null 2>&1; then
+      systemctl restart fail2ban 2>/dev/null || true
+    else
+      err "Auch die wiederhergestellte Fail2ban-Konfig ist fehlerhaft - Fail2ban NICHT neu gestartet."
+      err "Bitte manuell pruefen: sudo fail2ban-client -t"
+    fi
     rm -rf "$bdir"
     return 1
   fi
@@ -1129,15 +1143,27 @@ _ufw_rules_apply() {
   fi
 }
 
-# Statusausgabe der UFW-Service-Lage.
+# Statusausgabe der UFW-Service-Lage. Liest die ECHTE "ufw status" (nicht nur die
+# ENV-Flags), damit ein evtl. nicht entfernter v6-443-Eintrag nicht faelschlich
+# als "geschlossen" gemeldet wird (UFW-Regel-Match beim delete kann abweichen).
 _ufw_status_report() {
+  local st v6tcp=0 v6udp=0
+  st="$(ufw status 2>/dev/null || true)"
+  grep -qE '443.*\(v6\)' <<<"$st" && v6tcp=1
+  # grobe Unterscheidung tcp/udp v6 anhand der Zeile
+  grep -qiE '443/udp.*\(v6\)|443/udp \(v6\)' <<<"$st" && v6udp=1
   ok "443/tcp erlaubt (IPv4)"
-  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "443/tcp (v6) erlaubt"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
+    if (( v6tcp )); then ok "443/tcp (v6) erlaubt"; else warn "443/tcp (v6) SOLL offen sein (ENABLE_IPV6=1), ist aber laut 'ufw status' nicht gelistet."; fi
+  else
+    if (( v6tcp )); then warn "443 (v6) ist laut 'ufw status' noch offen, obwohl ENABLE_IPV6=0 - bitte pruefen: sudo ufw status"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+  fi
   ok "WireGuard ${WG_PORT}/udp erlaubt"
   if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
     if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "HTTP/3 aktiv, 443/udp und 443/udp (v6) erlaubt"; else ok "HTTP/3 aktiv, 443/udp erlaubt"; fi
   else
     ok "HTTP/3 aus, 443/udp geschlossen"
+    (( v6udp )) && warn "443/udp (v6) ist laut 'ufw status' noch offen, obwohl HTTP/3 aus - bitte pruefen: sudo ufw status"
   fi
 }
 
@@ -1156,6 +1182,20 @@ apply_firewall() {
   ensure_ufw_ipv6_yes
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
   _ufw_rules_apply
+  # Lockout-Schutz: NUR aktivieren, wenn der SSH-Port (und der aktive Sitzungsport)
+  # nach _ufw_rules_apply wirklich als ALLOW-Regel vorhanden ist. Sonst wuerde
+  # "ufw --force enable" bei default-deny die laufende SSH-Sitzung aussperren.
+  local ufw_rules; ufw_rules="$(ufw status 2>/dev/null || true)"
+  if ! grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+    err "SSH-Port ${SSH_PORT}/tcp ist NICHT als UFW-Regel vorhanden - Firewall wird NICHT aktiviert (Aussperr-Schutz)."
+    err "Bitte SSH_PORT pruefen (sudo homeedge settings) und erneut versuchen."
+    return 1
+  fi
+  if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT}" ]] \
+     && ! grep -qE "(^|[[:space:]])${cur_ssh_port}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+    err "Aktiver SSH-Sitzungsport ${cur_ssh_port}/tcp ist NICHT freigegeben - Firewall wird NICHT aktiviert (Aussperr-Schutz)."
+    return 1
+  fi
   ufw --force enable
   echo
   _ufw_status_report
@@ -1181,7 +1221,21 @@ ufw_ensure_active() {
   ensure_ufw_ipv6_yes
   # SSH-Port (und aktiven SSH-Sitzungsport) VOR enable erlauben -> kein Lockout.
   _ufw_rules_apply
-  if ufw status 2>/dev/null | grep -qiE "Status: (active|aktiv)"; then
+  # Lockout-Schutz: vor dem Aktivieren sicherstellen, dass die SSH-Regel da ist.
+  local cur_ssh_port; cur_ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
+  local ufw_rules; ufw_rules="$(ufw status 2>/dev/null || true)"
+  if ! grep -qiE "Status: (active|aktiv)" <<<"$ufw_rules"; then
+    if ! grep -qE "(^|[[:space:]])${SSH_PORT:-22}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+      err "SSH-Port ${SSH_PORT:-22}/tcp ist nicht freigegeben - UFW wird NICHT aktiviert (Aussperr-Schutz)."
+      return 1
+    fi
+    if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT:-22}" ]] \
+       && ! grep -qE "(^|[[:space:]])${cur_ssh_port}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+      err "Aktiver SSH-Sitzungsport ${cur_ssh_port}/tcp ist nicht freigegeben - UFW wird NICHT aktiviert (Aussperr-Schutz)."
+      return 1
+    fi
+  fi
+  if grep -qiE "Status: (active|aktiv)" <<<"$ufw_rules"; then
     ufw reload >/dev/null 2>&1 || true
   else
     ufw --force enable >/dev/null 2>&1 || true
