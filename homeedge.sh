@@ -1539,24 +1539,38 @@ repair_services() {
   [[ -f "$SERVICES_FILE" ]] || { warn "Keine services.tsv vorhanden."; return 0; }
   if validate_services_file >/dev/null 2>&1; then ok "services.tsv ist bereits gueltig."; return 0; fi
   warn "services.tsv ist defekt. Reparatur wird versucht."
-  local bak="${SERVICES_FILE}.broken.$(date +%Y%m%d-%H%M%S)"
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  # 1) Defekte aktive Datei sichern.
+  local bak="${SERVICES_FILE}.broken.${ts}"
   cp -a "$SERVICES_FILE" "$bak"; chmod 600 "$bak" 2>/dev/null || true
   warn "Defekte Datei gesichert: $bak"
+  # 2) Reparatur NUR in eine temporaere Datei (aktive Datei bleibt unangetastet).
   local tmp; tmp="$(mktemp)"
-  if repair_build "$SERVICES_FILE" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]] && validate_services_file "$tmp" >/dev/null 2>&1; then
+  repair_build "$SERVICES_FILE" > "$tmp" 2>/dev/null || true
+  # 3) Temp-Datei validieren. 4) Nur bei OK uebernehmen.
+  if [[ -s "$tmp" ]] && validate_services_file "$tmp" >/dev/null 2>&1; then
     echo "Vorschlag fuer reparierte services.tsv:"
     nl -w2 -s'. ' "$tmp" | sed $'s/\t/ | /g'
     echo
     if (( noninteractive )) || yesno "Diese reparierte Version uebernehmen?" "y"; then
-      cat "$tmp" > "$SERVICES_FILE"; rm -f "$tmp"
+      # Schluss-Newline sicherstellen und atomar uebernehmen.
+      [[ -n "$(tail -c1 "$tmp")" ]] && printf '\n' >> "$tmp"
+      cat "$tmp" > "$SERVICES_FILE"; chmod 600 "$SERVICES_FILE" 2>/dev/null || true; rm -f "$tmp"
       ok "services.tsv repariert."
       validate_services_file && ok "Validierung erfolgreich."
     else
       rm -f "$tmp"; warn "Nicht uebernommen. Original (defekt) bleibt, Backup: $bak"; return 1
     fi
   else
+    # 5) Reparatur unsicher: aktive Datei NICHT veraendern, Reparaturvorschlag
+    #    (falls vorhanden) zur Diagnose sichern.
+    if [[ -s "$tmp" ]]; then
+      local rf="${SERVICES_FILE}.repair-failed.${ts}"
+      cp -a "$tmp" "$rf"; chmod 600 "$rf" 2>/dev/null || true
+      warn "Ungueltiger Reparaturvorschlag zur Diagnose gesichert: $rf"
+    fi
     rm -f "$tmp"
-    err "Automatische Reparatur unsicher - bitte manuell pruefen."
+    err "Automatische Reparatur unsicher - aktive services.tsv bleibt unveraendert, bitte manuell pruefen."
     echo "Datei:  $SERVICES_FILE"
     echo "Backup: $bak"
     return 1
@@ -2650,6 +2664,9 @@ health_check() {
   fi
   echo
   info "Hinweis: Die Ampel ist ein technischer Check, keine Garantie fuer perfekte Sicherheit."
+  # Exitcode != 0, sobald es kritische (ROT) Punkte gibt - fuer Skripte/Migration.
+  (( HEALTH_RED > 0 )) && return 1
+  return 0
 }
 
 
@@ -2905,13 +2922,24 @@ _install_homeedge_from_file() {
   cp -a /usr/local/bin/homeedge "$old" 2>/dev/null || true
   install -m 0755 "$tmp" /usr/local/bin/homeedge
   ln -sf /usr/local/bin/homeedge /usr/local/bin/edgectl
-  ok "HomeEdge aktualisiert auf Version: ${new_ver:-unbekannt}"
+  ok "HomeEdge Script wurde aktualisiert auf Version: ${new_ver:-unbekannt}"
   info "Vorherige Version gesichert: ${old}"
   /usr/local/bin/homeedge --version || true
   # Migration mit der NEU installierten Version ausfuehren (Backup wurde vorher erstellt).
+  # Das Script-Update selbst ist erfolgt; schlaegt die Migration fehl (z. B. kaputte
+  # services.tsv), muss der GESAMTE Update-Prozess als nicht vollstaendig enden.
   echo
   info "Fuehre Migration/Reparatur mit der neuen Version aus..."
-  /usr/local/bin/homeedge migrate --no-backup || warn "Migration meldete Probleme - bitte 'sudo homeedge migrate' pruefen."
+  if /usr/local/bin/homeedge migrate --no-backup; then
+    return 0
+  fi
+  echo
+  err "Migration nach Update nicht erfolgreich."
+  info "Vorherige Version: ${old}"
+  local lastbak; lastbak="$(ls -1t "${BACKUP_DIR}"/edge-backup-*.tar.gz 2>/dev/null | head -n1 || true)"
+  [[ -n "$lastbak" ]] && info "Backup: ${lastbak}"
+  info "Reparatur: sudo homeedge repair-services ; sudo homeedge migrate ; sudo homeedge health"
+  return 1
 }
 
 # Repariert/aktualisiert eine bestehende Installation (idempotent).
@@ -2920,34 +2948,56 @@ homeedge_migrate() {
   section "Migration / Reparatur bestehender Installation"
   [[ "${1:-}" == "--no-backup" ]] || maybe_backup_before_change
   load_env
-  # load_env hat Defaults gesetzt (ENABLE_HTTP3=0, WG_MTU= leer/automatisch,
-  # CADDY_FAIL2BAN, F2B_*). save_env bereinigt zugleich den Token (sanitize) und
-  # schreibt alle Variablen einzeilig - repariert alte/mehrzeilige Token-Zeilen.
-  # Bestehende manuelle WG_MTU-Werte bleiben erhalten (kein Auto-Umstellen).
+  local migration_failed=0 services_ok=1
+  # load_env hat fehlende Werte mit Defaults belegt (ENABLE_HTTP3=0, ENABLE_IPV6=0,
+  # WG_MTU= leer, ...) und BESTEHENDE Werte aus der env beibehalten. save_env
+  # bereinigt zugleich den Token. Es werden KEINE Legacy-Defaults erzwungen.
   save_env
-  ok "Konfiguration repariert: Token bereinigt, fehlende Werte ergaenzt."
-  echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU:-auto}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  caddy-auth=${F2B_CADDY_MAXRETRY}/${F2B_CADDY_FINDTIME}/${F2B_CADDY_BANTIME}"
-  # Alte 4-Spalten-Eintraege (ohne Profil) vor der Validierung migrieren, damit
-  # saubere Legacy-Dateien nicht faelschlich als "defekt" gemeldet werden.
+  ok "Konfiguration repariert: Token bereinigt, fehlende Werte ergaenzt (bestehende beibehalten)."
+  echo "ENABLE_HTTP3=${ENABLE_HTTP3:-0}  ENABLE_IPV6=${ENABLE_IPV6:-0}  WG_MTU=${WG_MTU:-auto}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN:-0}"
+  # Hinweise zu bestehenden, nicht-Standard-Werten (nur informieren, nicht aendern).
+  [[ "${ENABLE_HTTP3:-0}" == "1" ]] && warn "HTTP/3 ist aktiv. UDP 443 wird geoeffnet. Fuer maximale Kompatibilitaet kann HTTP/3 deaktiviert werden (Caddy-Menue)."
+  [[ -n "${WG_MTU:-}" ]] && warn "WG_MTU=${WG_MTU} ist gesetzt. Standard ist Auto/leer. Aendern ueber WireGuard -> MTU anzeigen/aendern."
+  [[ "${CADDY_FAIL2BAN:-0}" == "0" ]] && info "caddy-auth Fail2ban ist deaktiviert. Aktivieren ueber Sicherheit -> Fail2ban."
+
+  # Alte 4-Spalten-Eintraege migrieren, dann reparieren, dann ERNEUT validieren.
   migrate_services_4to5 || true
-  # services.tsv pruefen und ggf. nicht-interaktiv reparieren (verklebte Zeilen,
-  # fehlendes Newline, mehrdeutige Reste) bevor die Caddyfile erzeugt wird.
-  if ! validate_services_file >/dev/null 2>&1; then
+  if [[ -s "$SERVICES_FILE" ]] && ! validate_services_file >/dev/null 2>&1; then
     warn "services.tsv defekt - versuche automatische Reparatur..."
-    repair_services --non-interactive || warn "services.tsv konnte nicht automatisch repariert werden."
+    repair_services --non-interactive || true
+    if ! validate_services_file >/dev/null 2>&1; then
+      services_ok=0; migration_failed=1
+      err "services.tsv ist weiterhin ungueltig."
+      err "Caddy Reload wird uebersprungen, damit die bestehende funktionierende Konfiguration aktiv bleibt."
+      info "Reparatur: sudo homeedge repair-services"
+    fi
   fi
-  # WireGuard-Konfig mit MTU neu schreiben (best effort, braucht wg).
+
+  # WireGuard-Konfig neu schreiben (best effort, braucht wg).
   if command -v wg >/dev/null 2>&1; then write_wg_config 2>/dev/null && ok "WireGuard-Konfig (inkl. MTU) neu geschrieben." || warn "WireGuard-Konfig nicht aktualisiert."; fi
-  # Caddyfile neu generieren + validieren (Services/Zertifikate bleiben erhalten).
-  if command -v docker >/dev/null 2>&1; then reload_caddy || warn "Caddy-Reload bitte spaeter pruefen."; fi
-  # Fail2ban mit Config-Test.
-  command -v fail2ban-client >/dev/null 2>&1 && install_fail2ban || true
-  # UFW an HTTP/3 angleichen (nicht-interaktiv, ohne Reset).
+  # Caddyfile NUR neu erzeugen/laden, wenn services.tsv valide ist. Sonst bleibt
+  # die laufende produktive Caddyfile unangetastet.
+  if (( services_ok )); then
+    if command -v docker >/dev/null 2>&1; then
+      reload_caddy || { warn "Caddy-Reload meldete Probleme (siehe oben)."; migration_failed=1; }
+    fi
+  fi
+  # Fail2ban mit Config-Test (best effort, aber Fehler sammeln).
+  if command -v fail2ban-client >/dev/null 2>&1; then install_fail2ban || migration_failed=1; fi
+  # UFW an Konfig angleichen (nicht-interaktiv, ohne Reset).
   ufw_apply_auto || true
   echo
   info "Healthcheck:"
-  health_check || true
+  health_check || true   # Diagnose-Anzeige; harte Fehler werden oben separat erfasst.
+  echo
+  if (( migration_failed )); then
+    err "Migration nicht vollstaendig abgeschlossen."
+    (( ! services_ok )) && err "Hauptursache: services.tsv ungueltig -> sudo homeedge repair-services"
+    info "Danach erneut: sudo homeedge migrate ; sudo homeedge health"
+    return 1
+  fi
   ok "Migration abgeschlossen."
+  return 0
 }
 
 # Update direkt vom GitHub-Repo (raw.githubusercontent.com). Standardquelle.
@@ -3254,6 +3304,21 @@ diag_report() {
     echo "Update-Repo: ${HOMEEDGE_REPO}@${HOMEEDGE_BRANCH}"
     echo "services.tsv: ${svc_state}"
     echo "ENABLE_HTTP3=${ENABLE_HTTP3}  WG_MTU=${WG_MTU}  CADDY_FAIL2BAN=${CADDY_FAIL2BAN}  BACKUP_BEHAVIOR=${BACKUP_BEHAVIOR}  EXPERT_MODE=${EXPERT_MODE}"
+    echo
+    echo "## services.tsv"
+    echo "Aktive Datei: ${SERVICES_FILE}"
+    if [[ "$svc_state" != "ok" ]]; then
+      echo "Status: UNGUELTIG - jede Zeile muss exakt 5 Tab-Felder haben:"
+      echo "  domain<TAB>scheme<TAB>backend<TAB>port<TAB>profile"
+      echo "Feldanalyse (Felder pro Zeile):"
+      awk -F'\t' '{print "  " NR ": Felder=" NF " | " $0}' "$SERVICES_FILE" 2>/dev/null | head -50
+      echo "Letzte Sicherungen:"
+      ls -1t "${SERVICES_FILE}".broken.* 2>/dev/null | head -5 | sed 's/^/  /' || true
+      ls -1t "${SERVICES_FILE}".repair-failed.* 2>/dev/null | head -5 | sed 's/^/  /' || true
+      echo "Reparatur: sudo homeedge repair-services"
+    else
+      echo "Status: valide"
+    fi
     echo
     echo "## Werte"; show_values
     echo; echo "## Domains/DNS"; domains_status
