@@ -1408,7 +1408,16 @@ validate_services_file() {
     nf=$(awk -F'\t' '{print NF}' <<<"$line")
     if [[ "$nf" -ne 5 ]]; then err "Zeile ${ln}: ${nf} Felder statt 5 (verklebt?): ${line}"; rc=1; continue; fi
     IFS=$'\t' read -r d s i p pr <<<"$line"
-    valid_domain "$d" || { err "Zeile ${ln}: ungueltige Domain '${d}' (erlaubt: FQDN oder *.domain, keine Sonderzeichen)"; rc=1; }
+    if ! valid_domain "$d"; then
+      err "services.tsv Zeile ${ln}: Domain \"${d}\" ist ungueltig."
+      # Haeufigster Fall: unvollstaendige Domain ohne Punkt (z. B. "jf").
+      if [[ -n "$d" && "$d" != *.* ]]; then
+        info "Bitte vollstaendige Domain (FQDN) verwenden, z. B. ${d}.smatitec.de"
+      else
+        info "Erlaubt: FQDN oder *.domain.tld, keine Leerzeichen/Sonderzeichen ( { } ; \" ' \` \$ \\ / : )."
+      fi
+      rc=1
+    fi
     if [[ -n "$d" ]]; then
       if [[ -n "${seen[$d]:-}" ]]; then err "Zeile ${ln}: doppelte Domain '${d}' (auch Zeile ${seen[$d]})"; rc=1; else seen[$d]="$ln"; fi
     fi
@@ -1573,6 +1582,15 @@ repair_services() {
     err "Automatische Reparatur unsicher - aktive services.tsv bleibt unveraendert, bitte manuell pruefen."
     echo "Datei:  $SERVICES_FILE"
     echo "Backup: $bak"
+    # Diagnose-Hinweis: unvollstaendige Domains (ohne Punkt) sind die haeufigste
+    # Ursache und koennen NICHT sicher erraten werden.
+    local _d _rest
+    while IFS=$'\t' read -r _d _rest || [[ -n "$_d" ]]; do
+      [[ -z "$_d" ]] && continue
+      if [[ "$_d" != *.* && "$_d" != \** ]]; then
+        info "Domain \"${_d}\" scheint unvollstaendig zu sein. Bitte FQDN eintragen, z. B. ${_d}.smatitec.de."
+      fi
+    done < "$SERVICES_FILE"
     return 1
   fi
 }
@@ -2984,8 +3002,11 @@ homeedge_migrate() {
   fi
   # Fail2ban mit Config-Test (best effort, aber Fehler sammeln).
   if command -v fail2ban-client >/dev/null 2>&1; then install_fail2ban || migration_failed=1; fi
-  # UFW an Konfig angleichen (nicht-interaktiv, ohne Reset).
-  ufw_apply_auto || true
+  # UFW an Konfig angleichen (nicht-interaktiv, ohne Reset). Fehler nicht still
+  # verschlucken - Hinweis geben; der finale Health-Check zeigt den UFW-Status.
+  if command -v ufw >/dev/null 2>&1; then
+    ufw_apply_auto || warn "UFW-Angleichung meldete Probleme - UFW-Status im Healthcheck pruefen (sudo homeedge firewall)."
+  fi
   echo
   info "Healthcheck:"
   health_check || true   # Diagnose-Anzeige; harte Fehler werden oben separat erfasst.
