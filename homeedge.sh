@@ -682,14 +682,25 @@ wait_for_certs() {
     (( SECONDS >= deadline )) && break
     sleep 5
   done
+  # Endbewertung: GRUEN ok, GELB "wartet noch" (kein Fehler im Log), ROT echter
+  # ACME-/Cloudflare-/DNS-Fehler. Rueckgabe 1, sobald mind. eine Domain einen
+  # eindeutigen ACME-Fehler hat (damit reload/apply Exitcode != 0 liefern).
+  local rc=0
   while IFS=$'\t' read -r domain _s _i _p _pr || [[ -n "$domain" ]]; do
     [[ -z "$domain" ]] && continue
     if cert_ready "$domain"; then
       ok "Zertifikat aktiv (SNI ok): ${domain}"
+    elif caddy_acme_error_for_domain "$domain"; then
+      err "TLS ${domain} fehlgeschlagen - eindeutiger ACME-/Cloudflare-/DNS-01-Fehler in den Caddy-Logs."
+      rc=1
     else
-      warn "Zertifikat noch ausstehend: ${domain} - bitte in 1-2 Minuten erneut testen (homeedge test-domain ${domain})"
+      warn "Warte auf Zertifikat fuer ${domain} (noch ausstehend, kein Fehler im Log) - spaeter testen: homeedge test-domain ${domain}"
     fi
   done < "$SERVICES_FILE"
+  if (( rc != 0 )); then
+    err "Cloudflare Token / DNS-01 / ACME pruefen (sudo homeedge caddy-logs ; sudo homeedge set-token)."
+  fi
+  return $rc
 }
 
 # Schreibt Stack, generiert das Caddyfile atomar aus der Service-Liste, prueft
@@ -742,8 +753,17 @@ _caddy_prepare_config() {
     return 1
   fi
   ok "Config validiert"
-  # Optional: vor dem Aktivieren formatieren (kein Blocker), dann produktiv setzen.
-  docker run --rm -v "${gen}:/etc/caddy/Caddyfile" --entrypoint caddy "$CADDY_IMAGE" fmt --overwrite /etc/caddy/Caddyfile >/dev/null 2>&1 || true
+  # Formatieren und DANACH erneut validieren (caddy fmt sollte nie etwas kaputt
+  # machen - vor Release pruefen wir es trotzdem). Schlaegt das Re-Validate fehl,
+  # wird die unformatierte (bereits validierte) Datei genutzt.
+  if docker run --rm -v "${gen}:/etc/caddy/Caddyfile" --entrypoint caddy "$CADDY_IMAGE" fmt --overwrite /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    if _validate_caddyfile_path "$gen"; then
+      ok "Re-Validate nach caddy fmt ok"
+    else
+      warn "Re-Validate nach caddy fmt fehlgeschlagen - regeneriere unformatierte, bereits validierte Version."
+      generate_caddyfile_to "$gen"; chmod 644 "$gen" 2>/dev/null || true
+    fi
+  fi
   # Gueltig: produktiv ersetzen (cp, damit Caddyfile.generated als Referenz bleibt).
   cp -a "$gen" "$cf"
   chmod 644 "$cf" 2>/dev/null || true
@@ -779,9 +799,12 @@ reload_caddy() {
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
   # Nur "Container laeuft" reicht nicht: pro Domain lokal per SNI mit Retry
   # pruefen, dass die (neue) Domain aktiv beantwortet wird / Zertifikat kommt.
-  wait_for_certs
+  # wait_for_certs liefert 1 NUR bei eindeutigem ACME-Fehler -> dann auch hier 1
+  # (Exitcode != 0), aber der Container/die Config bleiben aktiv.
+  local cert_rc=0; wait_for_certs || cert_rc=$?
   echo
   info "Test einer Domain: sudo homeedge test-domain DEINE.DOMAIN"
+  return $cert_rc
 }
 
 # Wie reload, aber baut das Image neu (build) - mit gleicher Validierung/Rollback.
@@ -797,7 +820,8 @@ restart_caddy() {
     err "Caddy-Build/Start fehlgeschlagen."; return 1
   fi
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
-  wait_for_certs
+  local cert_rc=0; wait_for_certs || cert_rc=$?
+  return $cert_rc
 }
 
 # Erzwingt das Neuschreiben des kompletten Caddy-Stacks und baut/startet ihn neu.
@@ -1157,18 +1181,26 @@ _ufw_rules_apply() {
 # ENV-Flags), damit ein evtl. nicht entfernter v6-443-Eintrag nicht faelschlich
 # als "geschlossen" gemeldet wird (UFW-Regel-Match beim delete kann abweichen).
 _ufw_status_report() {
-  local st v6tcp=0 v6udp=0
+  local st v6tcp=0 v6udp=0 wgv6=0
   st="$(ufw status 2>/dev/null || true)"
   grep -qE '443.*\(v6\)' <<<"$st" && v6tcp=1
   # grobe Unterscheidung tcp/udp v6 anhand der Zeile
   grep -qiE '443/udp.*\(v6\)|443/udp \(v6\)' <<<"$st" && v6udp=1
+  grep -qiE "${WG_PORT}/udp.*\(v6\)" <<<"$st" && wgv6=1
+  # Klarstellung: ENABLE_IPV6 betrifft NUR externen HTTPS-Zugriff (443/tcp v6).
+  info "ENABLE_IPV6 steuert nur externen HTTPS-Zugriff (443/tcp v6), nicht WireGuard."
   ok "443/tcp erlaubt (IPv4)"
   if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
-    if (( v6tcp )); then ok "443/tcp (v6) erlaubt"; else warn "443/tcp (v6) SOLL offen sein (ENABLE_IPV6=1), ist aber laut 'ufw status' nicht gelistet."; fi
+    if (( v6tcp )); then ok "HTTPS extern IPv6: 443/tcp (v6) erlaubt"; else warn "443/tcp (v6) SOLL offen sein (ENABLE_IPV6=1), ist aber laut 'ufw status' nicht gelistet."; fi
   else
-    if (( v6tcp )); then warn "443 (v6) ist laut 'ufw status' noch offen, obwohl ENABLE_IPV6=0 - bitte pruefen: sudo ufw status"; else ok "443/tcp (v6) geschlossen (ENABLE_IPV6=0)"; fi
+    if (( v6tcp )); then warn "443 (v6) ist laut 'ufw status' noch offen, obwohl ENABLE_IPV6=0 - bitte pruefen: sudo ufw status"; else ok "HTTPS extern IPv6: aus (443/tcp v6 geschlossen, ENABLE_IPV6=0)"; fi
   fi
-  ok "WireGuard ${WG_PORT}/udp erlaubt"
+  ok "WireGuard ${WG_PORT}/udp erlaubt (IPv4)"
+  # WireGuard ist von ENABLE_IPV6 unabhaengig: bei IPV6=yes legt UFW i. d. R. auch
+  # eine v6-Regel fuer den WG-Port an. Das transparent ausweisen.
+  if (( wgv6 )); then
+    info "WireGuard ${WG_PORT}/udp ist auch via IPv6 (v6) freigegeben - unabhaengig von ENABLE_IPV6 (Systemeinstellung IPV6=yes)."
+  fi
   if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
     if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ok "HTTP/3 aktiv, 443/udp und 443/udp (v6) erlaubt"; else ok "HTTP/3 aktiv, 443/udp erlaubt"; fi
   else
@@ -1419,8 +1451,18 @@ _service_change_commit() {
     rm -f "$bak"
     return 0
   fi
-  # Fehler: services.tsv auf alten Stand zuruecksetzen und Caddy mit altem
-  # (funktionierendem) Stand neu laden, damit nichts Halbfertiges aktiv bleibt.
+  # reload_caddy gibt 1 auch bei einem reinen ZERTIFIKATS-/ACME-Fehler zurueck,
+  # obwohl die Config gueltig ist und der Container laeuft. In dem Fall ist die
+  # Aenderung selbst korrekt - NICHT zurueckrollen, nur warnen (Token/DNS-01).
+  if caddy_is_running && [[ -s "${CADDY_DIR}/Caddyfile" ]] && validate_caddyfile; then
+    warn "Dienst gespeichert und Config aktiv, aber Zertifikat fuer mind. eine Domain steht aus oder schlaegt fehl."
+    warn "Falls es ein echter Fehler ist: Cloudflare Token / DNS-01 pruefen (sudo homeedge caddy-logs ; sudo homeedge set-token)."
+    rm -f "$bak"
+    return 0
+  fi
+  # Echter Config-/Apply-Fehler: services.tsv auf alten Stand zuruecksetzen und
+  # Caddy mit altem (funktionierendem) Stand neu laden, damit nichts Halbfertiges
+  # aktiv bleibt.
   err "Caddy-Reload fehlgeschlagen - alter Stand (services.tsv + Caddyfile) wird wiederhergestellt."
   [[ -f "$bak" ]] && mv "$bak" "$SERVICES_FILE"
   reload_caddy >/dev/null 2>&1 || true
@@ -2461,13 +2503,22 @@ check_certs() {
 health_check() {
   need_root
   load_env
-  require_valid_services || return 1
   HEALTH_RED=0; HEALTH_YELLOW=0; HEALTH_GREEN=0
 
   section "Ampel-Check: Aktivitaet / Sicherheit / Zertifikate"
 
   [[ -f "$ENV_FILE" ]] && _health_line green "HomeEdge Konfig" "$ENV_FILE" || _health_line red "HomeEdge Konfig" "fehlt"
-  [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] && _health_line green "Externe Dienste" "konfiguriert" || _health_line yellow "Externe Dienste" "keine Dienste eingetragen"
+  # services.tsv als EIGENEN Punkt bewerten und danach trotzdem weiterlaufen
+  # (nicht abbrechen, damit Docker/Caddy/UFW/Fail2ban/WG-Status sichtbar bleiben).
+  local services_ok=1
+  if [[ ! -f "$SERVICES_FILE" || ! -s "$SERVICES_FILE" ]]; then
+    _health_line yellow "Externe Dienste" "keine Dienste eingetragen"
+  elif validate_services_file >/dev/null 2>&1; then
+    _health_line green "Externe Dienste" "konfiguriert und services.tsv valide"
+  else
+    _health_line red "services.tsv" "ungueltig - Reparatur: sudo homeedge repair-services"
+    services_ok=0
+  fi
 
   if systemctl is-active --quiet docker 2>/dev/null; then _health_line green "Docker" "aktiv"; else _health_line red "Docker" "nicht aktiv"; fi
 
@@ -2550,7 +2601,7 @@ health_check() {
     if (( age < 600 )); then _health_line green "WG Handshake" "vor ${age}s"; elif (( age < 3600 )); then _health_line yellow "WG Handshake" "vor ${age}s"; else _health_line red "WG Handshake" "zu alt: ${age}s"; fi
   fi
 
-  if [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]]; then
+  if (( services_ok )) && [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]]; then
     local domain scheme ip port route code rc url tmp msg dns
     while IFS=$'\t' read -r domain scheme ip port profile || [[ -n "$domain" ]]; do
       [[ -z "${domain:-}" ]] && continue
@@ -2583,9 +2634,11 @@ health_check() {
         _health_line green "DNS ${domain}" "A-Record: ${dns}"
       fi
     done < "$SERVICES_FILE"
+  elif (( ! services_ok )); then
+    _health_line yellow "Backend/DNS/TLS-Checks" "uebersprungen (services.tsv ungueltig) - erst reparieren"
   fi
 
-  check_certs || true
+  (( services_ok )) && { check_certs || true; }
 
   section "Gesamt-Ampel"
   if (( HEALTH_RED > 0 )); then
@@ -2796,9 +2849,13 @@ caddy_update() {
   if caddy_is_running; then ok "Caddy neu gebaut und laeuft (running=true, restarting=false)."; else err "Caddy laeuft nicht (Restarting/exited). Logs: sudo homeedge caddy-logs"; return 1; fi
   # 8) Aktive Konfig validieren.
   if validate_caddyfile; then ok "Caddy Konfig valid."; else warn "Caddy Konfig konnte nicht bestaetigt werden - Logs pruefen."; fi
-  # 9) Lokaler SNI-Test + Zertifikate abwarten.
-  wait_for_certs
+  # 9) Lokaler SNI-Test + Zertifikate abwarten (cert_rc=1 bei echtem ACME-Fehler).
+  local cert_rc=0; wait_for_certs || cert_rc=$?
   # 10) Ergebnis.
+  if (( cert_rc != 0 )); then
+    err "Caddy/Docker-Update durchgefuehrt, aber Zertifikat fuer mind. eine Domain schlaegt fehl (siehe oben)."
+    return 1
+  fi
   ok "Caddy/Docker-Update abgeschlossen. Bestehende Domains sollten weiter per HTTPS erreichbar sein."
 }
 
@@ -3071,7 +3128,8 @@ caddy_logs() {
 ipv6_status() {
   load_env
   section "IPv6 Status (extern)"
-  echo "ENABLE_IPV6: ${ENABLE_IPV6:-0}"
+  echo "ENABLE_IPV6: ${ENABLE_IPV6:-0}  (steuert NUR externen HTTPS-Zugriff 443/tcp v6)"
+  info "WireGuard ist davon unabhaengig: bei UFW IPV6=yes kann der WG-UDP-Port auch via IPv6 erreichbar sein."
   local v6; v6="$(vps_ipv6)"
   [[ -n "$v6" ]] && ok "VPS hat globale IPv6: ${v6}" || warn "Keine globale IPv6-Adresse am VPS gefunden."
   if ufw_ipv6_enabled; then ok "UFW IPv6 aktiv (/etc/default/ufw: IPV6=yes)"; else warn "UFW IPv6 nicht aktiv (IPV6=yes fehlt)"; fi

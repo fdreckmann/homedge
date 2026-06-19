@@ -27,7 +27,9 @@ ENABLE_HTTP3="$(b64d "__ENABLE_HTTP3_B64__")"; ENABLE_HTTP3="${ENABLE_HTTP3:-0}"
 # Ohne diesen Default bricht der UFW-Schritt unter set -u mit "unbound variable" ab.
 ENABLE_IPV6="${ENABLE_IPV6:-0}"
 CLIENT_PUBLIC_KEY="$(b64d "__CLIENT_PUBLIC_KEY_B64__")"
-SERVICES_TSV="$(b64d "__SERVICES_TSV_B64__")"
+# services.tsv wird NICHT ueber eine Variable geladen (Command Substitution
+# entfernt finale Newlines) - es wird weiter unten direkt aus Base64 in die
+# Datei geschrieben (mit garantiertem Schluss-Newline).
 SWAP_MB="$(b64d "__SWAP_MB_B64__")"
 CREATE_ADMIN="$(b64d "__CREATE_ADMIN_B64__")"
 ADMIN_USER="$(b64d "__ADMIN_USER_B64__")"
