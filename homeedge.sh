@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.11-homeedge"
+APP_VERSION="0.9.13-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -22,6 +22,16 @@ CADDY_IMAGE="homeedge-caddy:local"
 SERVICES_FILE="${CFG_DIR}/services.tsv"
 ENV_FILE="${CFG_DIR}/homeedge.env"
 KEY_DIR="${CFG_DIR}/keys"
+
+# Beszel-Agent Monitoring (optional, muss aktiv installiert werden).
+# WICHTIG: Der Agent-Port darf NIE oeffentlich (IPv4/IPv6) erreichbar sein -
+# ausschliesslich ueber das WireGuard-Interface (${WG_IF}). Kein pauschales
+# "ufw allow" auf 0.0.0.0/0 oder ::/0.
+BESZEL_ENV="${CFG_DIR}/beszel.env"
+BESZEL_BIN="/usr/local/bin/beszel-agent"
+BESZEL_UNIT="/etc/systemd/system/beszel-agent.service"
+BESZEL_PORT_DEFAULT="45876"
+BESZEL_DOWNLOAD_BASE="https://github.com/henrygd/beszel/releases/latest/download"
 
 mkdir -p "$CFG_DIR" "$EDGE_DIR" "$KEY_DIR"
 
@@ -83,7 +93,10 @@ mask_secrets() {
     -e 's/(X-MediaBrowser-Token[":= ]+)[A-Za-z0-9]+/\1MASKED/Ig' \
     -e 's/(AccessToken[":= ]+)[A-Za-z0-9]+/\1MASKED/Ig' \
     -e 's/(PrivateKey[[:space:]]*=[[:space:]]*).*/\1***MASKED***/g' \
-    -e 's/(PresharedKey[[:space:]]*=[[:space:]]*).*/\1***MASKED***/g'
+    -e 's/(PresharedKey[[:space:]]*=[[:space:]]*).*/\1***MASKED***/g' \
+    -e 's/(BESZEL_TOKEN[=:][[:space:]]*)[^[:space:]]*/\1***MASKED***/g' \
+    -e 's/(TOKEN[=:][[:space:]]*)[^[:space:]]{8,}/\1***MASKED***/g' \
+    -e 's/(^|[[:space:]])(KEY[=:][[:space:]]*)[^[:space:]]{16,}/\1\2***MASKED***/g'
 }
 # Zentrale, robuste Laufzeitpruefung fuer den Caddy-Container.
 # running=true UND restarting=false -> OK; sonst (fehlt/Restarting) -> Fehler.
@@ -1907,6 +1920,356 @@ system_usage() {
 
 
 # ------------------------------------------------------------
+# Monitoring: Beszel Agent (optional)
+# ------------------------------------------------------------
+# Der Agent wird NIE automatisch installiert. Der Port ist NUR ueber WireGuard
+# erreichbar (kein oeffentliches 0.0.0.0/0 oder ::/0). Der WireGuard-Interface-
+# Name kommt aus HomeEdge (${WG_IF}, Default "unifi") - die Spec nennt "wg0"
+# als Beispiel, gemeint ist die WireGuard-Schnittstelle.
+
+# Ermittelt den Beszel-Release-Dateinamen fuer die aktuelle Architektur.
+beszel_arch() {
+  case "$(uname -m 2>/dev/null)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l|armv7) echo armv7 ;;
+    *) return 1 ;;
+  esac
+}
+
+beszel_installed() { [[ -x "$BESZEL_BIN" ]]; }
+
+# Liest den aktuell gesetzten LISTEN-Port aus der env, sonst Default.
+beszel_port() {
+  local p=""
+  [[ -f "$BESZEL_ENV" ]] && p="$(grep -m1 '^LISTEN=' "$BESZEL_ENV" 2>/dev/null | cut -d= -f2- | tr -d '"'\''[:space:]' || true)"
+  [[ -n "$p" && "$p" =~ ^[0-9]+$ ]] || p="$BESZEL_PORT_DEFAULT"
+  echo "$p"
+}
+
+beszel_version() {
+  [[ -x "$BESZEL_BIN" ]] || { echo "nicht installiert"; return; }
+  "$BESZEL_BIN" -v 2>/dev/null | head -n1 \
+    || "$BESZEL_BIN" --version 2>/dev/null | head -n1 \
+    || echo "unbekannt"
+}
+
+# Erlaubt harmlose Zeichen fuer Token/KEY: kein CR/LF/Whitespace, keine
+# Sonderzeichen die die env-Datei aushebeln koennten. KEY darf Base64 sein
+# (Slash/Plus/Gleich enthalten), TOKEN typischerweise nur Base64/URL-safe.
+_beszel_sanitize_line() { printf '%s' "${1:-}" | tr -d '\r\n[:space:]"'\''`$\\'; }
+
+beszel_write_env() {
+  # $1 KEY  $2 TOKEN  $3 HUB_URL  $4 LISTEN
+  local key="$1" tok="$2" hub="$3" port="$4"
+  umask 077
+  cat > "$BESZEL_ENV" <<EOB
+# HomeEdge - Beszel-Agent Konfiguration
+# Verwaltet ueber: sudo homeedge beszel-install / beszel-uninstall
+KEY=${key}
+TOKEN=${tok}
+HUB_URL=${hub}
+LISTEN=${port}
+EOB
+  chmod 600 "$BESZEL_ENV"
+}
+
+beszel_write_unit() {
+  cat > "$BESZEL_UNIT" <<'EOUNIT'
+[Unit]
+Description=Beszel Agent (HomeEdge, WireGuard-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/homeedge/beszel.env
+ExecStart=/usr/local/bin/beszel-agent
+Restart=on-failure
+RestartSec=5s
+# Absicherung
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+EOUNIT
+  chmod 644 "$BESZEL_UNIT"
+  systemctl daemon-reload
+}
+
+# Sucht "oeffentliche" UFW-Regeln fuer den Beszel-Port (also nicht 'on ${WG_IF}').
+# Gibt die Regel-Zeilen aus, sonst leer.
+beszel_ufw_public_rules() {
+  local port="$1"
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | awk -v p="$port" -v wg="${WG_IF:-}" '
+    $0 ~ p"/tcp" && $0 !~ "on "wg { print }
+    $0 ~ p"/udp" && $0 !~ "on "wg { print }
+  '
+}
+
+# Setzt die restriktive UFW-Regel: nur eingehend ueber ${WG_IF} erlaubt.
+# Entfernt auf Wunsch bestehende oeffentliche Freigaben (kein Auto-Loeschen).
+beszel_ufw_lockdown() {
+  local port="$1"
+  if ! command -v ufw >/dev/null 2>&1; then
+    warn "UFW nicht installiert - Firewall-Regel wird nicht gesetzt."
+    warn "Bitte manuell sicherstellen, dass ${port}/tcp NICHT oeffentlich erreichbar ist."
+    return 0
+  fi
+  # Oeffentliche Regeln erkennen und explizit ansprechen (kein Auto-Loeschen).
+  local public; public="$(beszel_ufw_public_rules "$port")"
+  if [[ -n "$public" ]]; then
+    warn "Oeffentliche UFW-Regel(n) fuer ${port}/tcp gefunden:"
+    printf '%s\n' "$public" | sed 's/^/  /'
+    if yesno "Diese oeffentliche Freigabe(n) fuer ${port} JETZT entfernen (empfohlen)?" "y"; then
+      ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+      ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+      # UFW-numbered-Loeschen als Fallback fuer Rest (case-tolerant, auch v6).
+      local left; left="$(beszel_ufw_public_rules "$port")"
+      if [[ -n "$left" ]]; then
+        warn "Konnte nicht alle oeffentlichen Regeln automatisch entfernen - bitte manuell pruefen: sudo ufw status numbered"
+      else
+        ok "Oeffentliche Regel(n) fuer ${port} entfernt."
+      fi
+    else
+      warn "Oeffentliche Freigabe fuer ${port} bleibt bestehen - das ist unsicher!"
+    fi
+  fi
+  # Restriktive Regel: nur ueber WireGuard-Interface.
+  if [[ -z "${WG_IF:-}" ]]; then err "WG_IF ist nicht gesetzt - kann keine WG-nur-Regel setzen."; return 1; fi
+  ufw allow in on "${WG_IF}" to any port "${port}" proto tcp comment 'Beszel Agent via WireGuard only' >/dev/null 2>&1 \
+    && ok "UFW: ${port}/tcp NUR ueber WireGuard-Interface (${WG_IF}) erlaubt." \
+    || warn "UFW-Regel konnte nicht gesetzt werden - bitte manuell pruefen."
+  ufw reload >/dev/null 2>&1 || true
+}
+
+# Laedt das aktuelle Beszel-Agent-Binary (latest) und installiert es atomar.
+# Erfolgt IMMER in einer Temp-Datei; nur bei erfolgreicher Groessen-/Format-
+# Pruefung wird /usr/local/bin/beszel-agent ersetzt.
+beszel_download_binary() {
+  need_root
+  local arch tar_name url tmp tmp2
+  if ! command -v curl >/dev/null 2>&1; then err "curl ist nicht installiert."; return 1; fi
+  arch="$(beszel_arch)" || { err "Nicht unterstuetzte Architektur: $(uname -m)"; return 1; }
+  tar_name="beszel-agent_linux_${arch}.tar.gz"
+  url="${BESZEL_DOWNLOAD_BASE}/${tar_name}"
+  info "Lade Beszel Agent (${arch}) von ${url} ..."
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  if ! curl -fsSL -o "${tmp}/${tar_name}" "$url"; then
+    err "Download fehlgeschlagen. Netzwerk/URL pruefen."
+    return 1
+  fi
+  if ! tar -xzf "${tmp}/${tar_name}" -C "$tmp" 2>/dev/null; then
+    err "Archiv konnte nicht entpackt werden."
+    return 1
+  fi
+  local extracted; extracted="$(find "$tmp" -maxdepth 2 -type f -name 'beszel-agent' | head -n1 || true)"
+  if [[ -z "$extracted" || ! -s "$extracted" ]]; then
+    err "beszel-agent Binary nicht im Archiv gefunden."
+    return 1
+  fi
+  # Atomar installieren (kein halb ueberschriebenes Binary).
+  install -m 0755 "$extracted" "$BESZEL_BIN"
+  ok "Beszel Agent installiert: $(beszel_version)"
+}
+
+# Interaktive Installation.
+beszel_install() {
+  need_root; load_env
+  section "Beszel Agent installieren"
+  if beszel_installed; then
+    warn "Beszel Agent ist bereits installiert (${BESZEL_BIN})."
+    echo "  1) Konfiguration neu setzen (reconfigure)"
+    echo "  2) Auf aktuelle Version aktualisieren"
+    echo "  0) Abbruch"
+    local c; c="$(ask "Auswahl" "0")"
+    case "$c" in
+      1) : ;;                       # weiter zur Neu-Konfiguration
+      2) beszel_update; return $? ;;
+      *) warn "Abgebrochen."; return 0 ;;
+    esac
+  fi
+
+  info "Der Agent laeuft ausschliesslich ueber die WireGuard-Schnittstelle (${WG_IF})."
+  info "Es wird KEINE oeffentliche Freigabe angelegt (weder IPv4 noch IPv6)."
+  echo
+
+  # Werte abfragen (KEY = Public-Key des Hubs, TOKEN = Registrations-Token).
+  local key tok hub port
+  key="$(_beszel_sanitize_line "$(ask_secret "Beszel HUB Public-Key (Feld KEY, ed25519 Hub-Key)")")"
+  tok="$(_beszel_sanitize_line "$(ask_secret "Beszel Registrations-TOKEN")")"
+  hub="$(_beszel_sanitize_line "$(ask "Beszel HUB_URL (z. B. https://beszel.example.de)")")"
+  port="$(ask "LISTEN-Port" "$BESZEL_PORT_DEFAULT")"
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    err "Ungueltiger Port '${port}' - nutze Default ${BESZEL_PORT_DEFAULT}."
+    port="$BESZEL_PORT_DEFAULT"
+  fi
+  [[ -z "$key" || -z "$tok" || -z "$hub" ]] && { err "KEY, TOKEN und HUB_URL sind Pflicht."; return 1; }
+
+  # Nur herunterladen, wenn Binary fehlt oder Reconfigure ohne aktuelle Version.
+  if ! beszel_installed; then
+    beszel_download_binary || return 1
+  fi
+
+  beszel_write_env "$key" "$tok" "$hub" "$port"
+  ok "Konfig geschrieben: ${BESZEL_ENV} (chmod 600, Secrets nicht ausgegeben)."
+  beszel_write_unit
+  ok "systemd-Unit geschrieben: ${BESZEL_UNIT}"
+
+  # Firewall: NUR ueber WireGuard.
+  beszel_ufw_lockdown "$port"
+
+  systemctl enable --now beszel-agent >/dev/null 2>&1 || true
+  sleep 1
+  beszel_verify_installation "$port"
+}
+
+# Zeigt nach der Installation eine klare Statuszusammenfassung.
+beszel_verify_installation() {
+  local port="${1:-$(beszel_port)}"
+  section "Beszel Agent - Post-Install-Pruefung"
+  local svc="nein" listen="nein" ufw_wg="nein" ufw_pub="nein"
+  systemctl is-active --quiet beszel-agent 2>/dev/null && svc="ja"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . && listen="ja"
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status 2>/dev/null | grep -qE "${port}/tcp.*on ${WG_IF}" && ufw_wg="ja"
+    [[ -n "$(beszel_ufw_public_rules "$port")" ]] && ufw_pub="ja"
+  fi
+  printf '  Dienst aktiv:                          %s\n' "$svc"
+  printf '  Lauscht auf Port %s:                %s\n' "$port" "$listen"
+  printf '  UFW erlaubt %s nur auf %s:      %s\n' "$port" "${WG_IF}" "$ufw_wg"
+  printf '  Oeffentliche Freigabe fuer %s:      %s\n' "$port" "$ufw_pub"
+  if [[ "$ufw_pub" == "ja" ]]; then
+    err "ACHTUNG: Es existiert eine OEFFENTLICHE UFW-Freigabe fuer Port ${port}!"
+    err "Der Agent darf nur ueber WireGuard erreichbar sein. Bitte entfernen:"
+    printf '  %s\n' "sudo ufw status numbered"
+    printf '  %s\n' "sudo ufw delete <Nummer>"
+    return 1
+  fi
+  if [[ "$svc" == "ja" && "$listen" == "ja" && "$ufw_wg" == "ja" ]]; then
+    ok "Beszel Agent laeuft und ist NUR ueber WireGuard (${WG_IF}) erreichbar."
+    return 0
+  fi
+  warn "Post-Install-Pruefung nicht komplett gruen. Bitte 'sudo homeedge beszel-status' pruefen."
+  return 1
+}
+
+beszel_status() {
+  need_root; load_env
+  section "Beszel Agent Status"
+  if ! beszel_installed; then warn "Beszel Agent ist NICHT installiert."; return 1; fi
+  echo "Version: $(beszel_version)"
+  echo
+  systemctl status beszel-agent --no-pager 2>&1 | mask_secrets || true
+  echo
+  local port; port="$(beszel_port)"
+  echo "== Lauschende Sockets auf Port ${port} =="
+  ss -H -ltn "sport = :${port}" 2>/dev/null | sed 's/^/  /' || true
+  echo
+  echo "== UFW-Regeln fuer Port ${port} =="
+  ufw status 2>/dev/null | awk -v p="$port" '$0 ~ p"/tcp" || $0 ~ p"/udp"' | sed 's/^/  /' || true
+  local pub; pub="$(beszel_ufw_public_rules "$port")"
+  if [[ -n "$pub" ]]; then
+    echo
+    err "ACHTUNG: Oeffentliche UFW-Regel(n) fuer Port ${port} erkannt (siehe oben)."
+    info "Der Agent soll ausschliesslich ueber WireGuard (${WG_IF}) erreichbar sein."
+    info "Bereinigung: sudo homeedge beszel-lockdown"
+  fi
+}
+
+beszel_logs() {
+  need_root
+  if ! beszel_installed; then warn "Beszel Agent ist NICHT installiert."; return 1; fi
+  section "Beszel Agent Logs"
+  local mode="${1:-tail}"
+  case "$mode" in
+    -f|follow|live) journalctl -u beszel-agent -f --no-pager 2>&1 | mask_secrets ;;
+    *) journalctl -u beszel-agent -n 200 --no-pager 2>&1 | mask_secrets ;;
+  esac
+}
+
+beszel_restart() {
+  need_root
+  if ! beszel_installed; then err "Beszel Agent ist NICHT installiert."; return 1; fi
+  section "Beszel Agent neu starten"
+  systemctl restart beszel-agent && ok "Neu gestartet." || err "Neustart fehlgeschlagen."
+  sleep 1
+  systemctl status beszel-agent --no-pager 2>&1 | mask_secrets | sed -n '1,10p' || true
+}
+
+beszel_update() {
+  need_root; load_env
+  section "Beszel Agent aktualisieren"
+  if ! beszel_installed; then err "Beszel Agent ist NICHT installiert (zuerst installieren)."; return 1; fi
+  local ver_before; ver_before="$(beszel_version)"
+  info "Aktuelle Version: ${ver_before}"
+  # Atomar herunterladen und ersetzen (kein Restart, wenn Download fehlschlaegt).
+  beszel_download_binary || return 1
+  systemctl restart beszel-agent && ok "Neu gestartet." || warn "Neustart nicht erfolgreich."
+  local ver_after; ver_after="$(beszel_version)"
+  info "Neue Version:     ${ver_after}"
+}
+
+beszel_uninstall() {
+  need_root; load_env
+  section "Beszel Agent deinstallieren"
+  if ! beszel_installed && [[ ! -f "$BESZEL_UNIT" && ! -f "$BESZEL_ENV" ]]; then
+    warn "Beszel Agent ist nicht installiert - nichts zu tun."
+    return 0
+  fi
+  if ! yesno "Beszel Agent wirklich deinstallieren?" "n"; then warn "Abgebrochen."; return 0; fi
+  # Dienst stoppen/deaktivieren.
+  systemctl stop beszel-agent 2>/dev/null || true
+  systemctl disable beszel-agent 2>/dev/null || true
+  # Unit entfernen.
+  if [[ -f "$BESZEL_UNIT" ]]; then rm -f "$BESZEL_UNIT"; systemctl daemon-reload; ok "systemd-Unit entfernt."; fi
+  # Binary optional entfernen.
+  if [[ -x "$BESZEL_BIN" ]] && yesno "Binary ${BESZEL_BIN} entfernen?" "y"; then rm -f "$BESZEL_BIN"; ok "Binary entfernt."; fi
+  # env-Datei optional entfernen.
+  if [[ -f "$BESZEL_ENV" ]] && yesno "Konfigurationsdatei ${BESZEL_ENV} entfernen (enthaelt Secrets)?" "y"; then rm -f "$BESZEL_ENV"; ok "Konfig entfernt."; fi
+  # UFW-Regel optional entfernen (nur die WG-scoped Regel, KEINE anderen).
+  local port; port="$(beszel_port)"
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qE "${port}/tcp.*on ${WG_IF}"; then
+      if yesno "UFW-Regel 'allow in on ${WG_IF} to any port ${port}/tcp' entfernen?" "y"; then
+        ufw delete allow in on "${WG_IF}" to any port "${port}" proto tcp >/dev/null 2>&1 || true
+        ufw reload >/dev/null 2>&1 || true
+        ok "UFW-Regel entfernt."
+      fi
+    fi
+  fi
+  ok "Beszel Agent deinstalliert."
+}
+
+# Setzt/erneuert die restriktive UFW-Regel und entfernt ggf. oeffentliche.
+beszel_lockdown() {
+  need_root; load_env
+  section "Beszel Agent: Firewall auf WireGuard einschraenken"
+  beszel_ufw_lockdown "$(beszel_port)"
+  beszel_verify_installation "$(beszel_port)"
+}
+
+
+# ------------------------------------------------------------
 # Backup / Restore
 # ------------------------------------------------------------
 BACKUP_DIR="${EDGE_DIR}/backups"
@@ -1942,8 +2305,11 @@ Hinweis: Dieses Backup enthaelt Secrets wie WireGuard-Keys und Cloudflare Token.
 EOF
 
   local items=()
-  [[ -d /etc/homeedge ]] && items+=("etc/homeedge")
+  [[ -d /etc/homeedge ]] && items+=("etc/homeedge")   # enthaelt auch beszel.env falls vorhanden
   [[ -d /etc/wireguard ]] && items+=("etc/wireguard")
+  # Beszel-systemd-Unit (falls installiert) mitsichern - Binary NICHT (kann via
+  # sudo homeedge beszel-install/beszel-update wieder geholt werden).
+  [[ -f /etc/systemd/system/beszel-agent.service ]] && items+=("etc/systemd/system/beszel-agent.service")
   # Caddy-Dateien EINZELN pruefen - ein halb erstellter Stack (z. B. ohne
   # docker-compose.yml) darf das Backup nicht crashen lassen (Bug P1).
   local caddy_complete=1 cf
@@ -3731,6 +4097,36 @@ sm_settings() {
   done
 }
 
+sm_monitoring() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Monitoring / Beszel Agent"
+    if beszel_installed; then info "Beszel Agent ist installiert ($(beszel_version))."; else info "Beszel Agent ist NICHT installiert."; fi
+    info "Sicherheitsprinzip: Port ausschliesslich ueber WireGuard (${WG_IF}), nie oeffentlich."
+    line
+    menu_item 1 "Beszel Agent installieren"
+    menu_item 2 "Beszel Agent Status anzeigen"
+    menu_item 3 "Beszel Agent Logs anzeigen"
+    menu_item 4 "Beszel Agent neu starten"
+    menu_item 5 "Beszel Agent aktualisieren"
+    menu_item 6 "Beszel Agent deinstallieren"
+    menu_item 7 "Firewall auf WireGuard einschraenken (Lockdown)"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) beszel_install; pause ;;
+      2) beszel_status; pause ;;
+      3) beszel_logs -f ;;
+      4) beszel_restart; pause ;;
+      5) beszel_update; pause ;;
+      6) beszel_uninstall; pause ;;
+      7) beszel_lockdown; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+
 menu() {
   need_root
   set +e  # interaktive Menues: ein fehlschlagender Handler darf das Skript nicht beenden
@@ -3748,6 +4144,7 @@ menu() {
     menu_item 7 "Updates & Wartung"
     menu_item 8 "Logs & Diagnose"
     menu_item 9 "Einstellungen"
+    menu_item 10 "Monitoring / Beszel Agent (optional)"
     menu_item 0 "Beenden"
     line
     read -rp "Auswahl: " choice
@@ -3761,6 +4158,7 @@ menu() {
       7) sm_updates ;;
       8) sm_logs ;;
       9) sm_settings ;;
+      10) sm_monitoring ;;
       0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -3825,10 +4223,18 @@ case "${1:-menu}" in
   restart) restart_caddy ;;
   caddy-rebuild|rebuild-caddy) need_root; caddy_rebuild ;;
   caddy-logs|caddy-log) caddy_logs "${2:-120}" ;;
+  monitoring|beszel) sm_monitoring ;;
+  beszel-install) beszel_install ;;
+  beszel-status) beszel_status ;;
+  beszel-logs) beszel_logs "${2:-tail}" ;;
+  beszel-restart) beszel_restart ;;
+  beszel-update) beszel_update ;;
+  beszel-uninstall) beszel_uninstall ;;
+  beszel-lockdown) beszel_lockdown ;;
   test-backends) test_backends ;;
   logs) show_logs ;;
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|caddy-update|monitoring|beszel-install|beszel-status|beszel-logs|beszel-restart|beszel-update|beszel-uninstall|beszel-lockdown|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac
