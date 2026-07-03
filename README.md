@@ -37,15 +37,16 @@ sudo homeedge menu
 
 `edgectl` bleibt als Kompatibilitaets-Alias erhalten (`sudo edgectl menu`).
 
-Das Terminal-Menue ist in neun Gruppen mit Breadcrumb (z. B. `HomeEdge > Sicherheit`)
+Das Terminal-Menue ist in Gruppen mit Breadcrumb (z. B. `HomeEdge > Sicherheit`)
 und je `b) Zurueck` / `0) Beenden` organisiert:
 
 ```text
-1) Status / Ampel            6) Backup & Restore
-2) Domains & Dienste         7) Updates & Wartung
-3) WireGuard Tunnel          8) Logs & Diagnose
+1) Status / Ampel             6) Backup & Restore
+2) Domains & Dienste          7) Updates & Wartung
+3) WireGuard Tunnel           8) Logs & Diagnose
 4) Caddy / HTTPS / Cloudflare 9) Einstellungen
-5) Sicherheit                0) Beenden
+5) Sicherheit                10) Monitoring / Beszel Agent (optional)
+                              0) Beenden
 ```
 
 Weitere Direktbefehle:
@@ -61,8 +62,10 @@ sudo homeedge check-update  # nur pruefen, ob ein Update vorliegt
 
 Direktbefehle oeffnen die jeweilige Menue-Gruppe:
 `homeedge security`, `homeedge fail2ban`, `homeedge backup`, `homeedge update`,
-`homeedge wg-menu`, `homeedge network`. Weitere: `homeedge reload`, `certs`,
-`domains`, `test-domain DOMAIN`, `set-token`, `mtu`, `migrate`, `rollback`.
+`homeedge wg-menu`, `homeedge network`, `homeedge monitoring`. Weitere:
+`homeedge reload`, `restart`, `caddy-rebuild`, `caddy-update`, `caddy-logs`,
+`certs`, `domains`, `test-domain DOMAIN`, `verify-setup`, `set-token`, `mtu`,
+`migrate`, `rollback`, `diagnose`.
 
 ## Installation
 
@@ -101,17 +104,25 @@ uebersichtlich zusammen und startet erst nach ausdruecklicher Bestaetigung.
 
 ## Update
 
-Im Menue unter `Wartung / Updates`:
+Im Menue unter `Updates & Wartung`:
 
 ```text
-1) HomeEdge-Version anzeigen
-2) Nach Update suchen
-3) HomeEdge aus GitHub aktualisieren (empfohlen)
-4) Caddy/Docker neu bauen und aktualisieren
-5) Systemupdates installieren
-6) Backup vor Update erstellen
-7) Rollback auf letztes Backup
+1) HomeEdge Version anzeigen      6) Server Auslastung anzeigen
+2) Nach Update suchen             7) Dienste neu starten
+3) HomeEdge aktualisieren         8) Rollback auf letztes Backup
+4) Systemupdates installieren     9) System rebooten
+5) Docker / Caddy neu bauen
 ```
+
+**Was automatisch laeuft und was manuell ist** (auch im Menue und in `status` sichtbar):
+
+```text
+Automatisch:  OS-Sicherheitsupdates (unattended-upgrades), TLS-Zertifikate (Caddy)
+Manuell:      HomeEdge-Script, Caddy/Docker-Image, Cloudflare-DNS-Plugin, Container-Rebuild
+```
+
+Automatische Container-/Image-Updates sind bewusst NICHT aktiv (koennten Dienste
+ungeplant brechen).
 
 - Standardquelle ist `https://raw.githubusercontent.com/fdreckmann/homedge/main/homeedge.sh`.
 - Vor jedem Update wird automatisch ein Backup erstellt.
@@ -121,13 +132,20 @@ Im Menue unter `Wartung / Updates`:
 - Empfehlung: nicht blind von `main`, sondern bevorzugt getaggte Releases nutzen.
 - Nach dem Update laeuft automatisch eine Migration (`sudo homeedge migrate`):
   Cloudflare-Token wird bereinigt (immer einzeilig), fehlende Werte werden
-  ergaenzt (`ENABLE_HTTP3=0`, `WG_MTU=` leer/automatisch, Fail2ban-Schwellenwerte), die
-  Caddyfile neu erzeugt/validiert und ein Healthcheck ausgefuehrt. Bestehende
-  Dienste, Zertifikate und WireGuard-Keys bleiben erhalten.
+  ergaenzt (`ENABLE_HTTP3=0`, `ENABLE_IPV6=0`, `WG_MTU=` leer/automatisch), die
+  Caddyfile neu erzeugt/validiert und ein Healthcheck ausgefuehrt. **Bestehende
+  Werte werden respektiert** (z. B. `ENABLE_HTTP3=1` oder `WG_MTU=1280` bleiben
+  erhalten, es gibt nur einen Hinweis). Dienste, Zertifikate und WireGuard-Keys
+  bleiben erhalten.
+- **Migration/Update melden Fehler ehrlich:** Bleibt `services.tsv` nach dem
+  Reparaturversuch ungueltig, wird der Caddy-Reload uebersprungen (die laufende
+  Caddyfile bleibt aktiv), die Migration endet mit `[ERR]` und Exitcode != 0 -
+  und auch das Self-/Repo-Update endet mit Fehlerstatus. Ein Update wirkt nie
+  faelschlich erfolgreich.
 - Die "Nur HomeEdge aktualisieren"-Skripte (`Update-HomeEdgeOnly.sh/.ps1`)
   ersetzen das Script, erstellen ein Pre-Update-Backup und fuehren danach
   Migration, `validate-services` und `health` aus; bei Fehlern wird ein
-  Rollback-Hinweis ausgegeben.
+  Rollback-Hinweis ausgegeben und der Exitcode ist != 0.
 - Logs (Menue Logs & Diagnose, Diagnosebericht) werden maskiert ausgegeben;
   ein Caddy-Container im Status "Restarting" gilt als Fehler, nicht als OK.
 
@@ -170,13 +188,17 @@ Backend-Zugriff ins Heimnetz bleibt IPv4 ueber WireGuard.
 Im Menue unter `Backup / Restore`. Ein Backup enthaelt:
 
 ```text
-/etc/homeedge        HomeEdge-Konfiguration, Keys
+/etc/homeedge        HomeEdge-Konfiguration, Keys (inkl. beszel.env, falls vorhanden)
 /etc/wireguard       WireGuard-Konfiguration
 /opt/caddy-edge      Caddy (Caddyfile, Compose, Daten)
 Fail2ban-Konfiguration
 UFW-Regeln
+beszel-agent.service (systemd-Unit, falls installiert)
 /usr/local/bin/homeedge  (Binary/Script)
 ```
+
+Das Beszel-Agent-Binary wird bewusst NICHT gesichert (per `beszel-install` /
+`beszel-update` jederzeit neu holbar).
 
 - Vor kritischen Aenderungen bietet HomeEdge automatisch ein Backup an.
 - **Restore-Varianten:** "Komplettes Restore" (Software + Config) oder
@@ -193,11 +215,18 @@ UFW-Regeln
 
 - Jeder Dienst ist eine Zeile mit genau 5 Feldern:
   `domain<TAB>scheme<TAB>ip<TAB>port<TAB>profile`.
+- Streng validiert werden Domain (vollstaendiger FQDN oder `*.domain.tld`, keine
+  Sonderzeichen), Scheme (`http`/`https`), Backend (IPv4 oder Hostname), Port
+  (1-65535) und Profil (`standard`/`jellyfin`/`jellyseerr`). Fehlermeldungen
+  nennen Zeile und Ursache, z. B. `Zeile 1: Domain "jf" ist ungueltig` mit dem
+  Hinweis, einen vollstaendigen FQDN wie `jf.smatitec.de` zu verwenden.
 - HomeEdge haengt neue Dienste immer sauber an (Trailing-Newline-Schutz) und
   validiert die Datei nach jeder Aenderung; bei Fehlern wird zurueckgerollt.
-- Ist die Datei defekt (z. B. verklebte Zeilen aus aelteren Versionen), zeigt
-  `homeedge list-services` einen Fehler. Reparatur:
-  `sudo homeedge repair-services` (sichert die defekte Datei vorher).
+- `sudo homeedge repair-services` arbeitet atomar: die defekte Datei wird nach
+  `services.tsv.broken.TIMESTAMP` gesichert, repariert wird nur in einer
+  Temp-Datei, und die aktive Datei wird nur ersetzt, wenn das Ergebnis gueltig
+  ist. Ist die Reparatur unsicher, bleibt die aktive Datei unveraendert und ein
+  Vorschlag wird als `services.tsv.repair-failed.TIMESTAMP` zur Diagnose abgelegt.
 - `homeedge reload` verweigert das Neu-Generieren der Caddyfile bei defekter
   `services.tsv` und behaelt die letzte funktionierende Version.
 
@@ -215,6 +244,50 @@ Im Menue unter `Fail2ban verwalten`:
 
 Sind keine IPs gebannt, meldet HomeEdge: `Aktuell sind keine IPs gebannt.`
 
+## Monitoring: Beszel Agent (optional)
+
+HomeEdge kann optional einen [Beszel](https://github.com/henrygd/beszel) Agent
+als systemd-Service installieren. Der Agent wird **nie automatisch** installiert,
+sondern nur ueber `Hauptmenue -> Monitoring / Beszel Agent` bzw.
+`sudo homeedge monitoring`.
+
+**Sicherheitsprinzip:** Der Agent-Port (Default `45876`, konfigurierbar) ist
+**ausschliesslich ueber den WireGuard-Tunnel** erreichbar - nie oeffentlich
+(weder IPv4 noch IPv6).
+
+- Gesetzt wird nur eine restriktive UFW-Regel gebunden an das WireGuard-Interface:
+  `ufw allow in on <WG_IF> to any port 45876 proto tcp comment 'Beszel Agent via WireGuard only'`.
+  Kein `0.0.0.0/0`, kein `::/0`.
+- Findet HomeEdge eine bestehende **oeffentliche** Freigabe fuer den Port, warnt
+  es und bietet an, sie zu entfernen (nichts wird ungefragt geloescht).
+- Nach der Installation zeigt HomeEdge eine klare Pruefung: Dienst aktiv (ja/nein),
+  lauscht auf dem Port (ja/nein), UFW erlaubt den Port nur ueber WireGuard (ja/nein),
+  oeffentliche Freigabe gefunden (ja/nein) - bei oeffentlicher Freigabe ein harter Fehler.
+- Konfiguration liegt in `/etc/homeedge/beszel.env` (`chmod 600`); `KEY` und
+  `TOKEN` werden verdeckt eingelesen und in Status/Logs maskiert. Es wird **kein**
+  Beszel Hub installiert.
+- Das Binary wird passend zur Architektur (amd64/arm64/armv7) heruntergeladen und
+  atomar installiert; ein fehlgeschlagener Download laesst das alte Binary intakt.
+
+Menue / CLI:
+
+```text
+1) Installieren       4) Neu starten        7) Firewall auf WireGuard einschraenken
+2) Status             5) Aktualisieren
+3) Logs (-f)          6) Deinstallieren
+```
+
+```bash
+sudo homeedge beszel-install    # abfragen: KEY, TOKEN, HUB_URL, LISTEN-Port (Default 45876)
+sudo homeedge beszel-status     # Dienst-/Port-/UFW-Status
+sudo homeedge beszel-logs -f    # journalctl -u beszel-agent -f (maskiert)
+sudo homeedge beszel-lockdown   # Firewall erneut auf WireGuard einschraenken
+sudo homeedge beszel-uninstall  # fragt pro Artefakt (Binary, env, UFW-Regel) einzeln
+```
+
+**Akzeptanz:** Nach der Installation ist der Agent ueber die oeffentliche VPS-IP
+nicht erreichbar, nur ueber WireGuard.
+
 ## Security-Check
 
 `sudo homeedge health` (oder Menue -> Sicherheitsmenue -> Ampel-Check komplett)
@@ -226,6 +299,19 @@ Zertifikate. Bewertung als einfache Ampel (ASCII):
 [GELB ] Hinweis / optional
 [ROT  ] Problem
 ```
+
+- Bei defekter `services.tsv` bricht der Check nicht ab: die Datei wird als
+  eigener `[ROT]`-Punkt gemeldet, die uebrigen Checks (Docker, Caddy, UFW,
+  Fail2ban, WireGuard) laufen trotzdem weiter. Der Gesamtstatus ist dann `[ROT]`
+  und der Exitcode != 0.
+- TLS/Zertifikate werden differenziert: `[GELB]` solange Caddy das Zertifikat
+  per DNS-01 noch anfordert, `[ROT]` erst bei einem eindeutigen ACME-Fehler in
+  den Logs (z. B. falscher Cloudflare Token) oder wenn Caddy gar nicht laeuft.
+- Nach einem Wizard/Apply prueft `sudo homeedge verify-setup` den kompletten
+  Stack (Caddy-Container laeuft, UFW aktiv, 443/tcp + WG-Port frei, Fail2ban,
+  caddy-auth Jail, WireGuard-Interface, lokaler SNI-Test je Domain). Im
+  Parallelbetrieb (`MIGRATION_MODE=1`) ist ein DNS-Eintrag, der noch auf den
+  alten VPS zeigt, nur eine Warnung - der Rest muss trotzdem gruen sein.
 
 ## Diagnose & Tests
 
@@ -243,10 +329,18 @@ curl -vk --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
 # NICHT: curl -vk https://127.0.0.1 -H "Host: DOMAIN"
 ```
 
-`homeedge reload` erzeugt das Caddyfile immer komplett aus der Service-Liste,
-validiert es, ersetzt es atomar und wartet danach bis zu 120 s auf das
-Zertifikat (DNS-01 kann etwas dauern). Ist es noch nicht fertig, gibt es eine
-Warnung statt eines harten Fehlers.
+`homeedge reload` erzeugt das Caddyfile zuerst als `Caddyfile.generated`,
+validiert es in einem Wegwerf-Container (ohne die produktive Datei zu mounten),
+formatiert und validiert erneut, und ersetzt die produktive `/opt/caddy-edge/Caddyfile`
+nur bei Erfolg. Danach wird die aktive Config wirklich neu geladen
+(`caddy reload`, notfalls `up -d --force-recreate`) und bis zu 120 s auf das
+Zertifikat gewartet (DNS-01 kann dauern). Ein noch ausstehendes Zertifikat ist
+eine Warnung; ein eindeutiger ACME-Fehler fuehrt zu Exitcode != 0. Schlaegt das
+Validate fehl, bleibt die alte Caddyfile aktiv und der echte `caddy validate`-
+Fehler wird angezeigt und nach `/var/log/homeedge/caddy-validate.log`
+geschrieben (fehlerhafte Version als `/opt/caddy-edge/Caddyfile.failed`).
+`sudo homeedge caddy-rebuild` erzeugt den kompletten Stack neu, wenn er fehlt
+oder kaputt ist.
 
 ## Cloudflare API Token
 
@@ -264,10 +358,13 @@ Warnung statt eines harten Fehlers.
 ```text
 /usr/local/bin/homeedge
 /usr/local/bin/edgectl -> Alias (Symlink)
-/etc/homeedge/
+/etc/homeedge/                         (Konfiguration, Keys, optional beszel.env)
 /root/homeedge/
-/opt/caddy-edge/
+/opt/caddy-edge/                       (Caddyfile, Caddyfile.generated, .env, Compose)
 /etc/wireguard/
+/var/log/homeedge/caddy-validate.log   (echter caddy-validate-Output, maskiert)
+/usr/local/bin/beszel-agent            (nur falls Beszel Agent installiert)
+/etc/systemd/system/beszel-agent.service
 ```
 
 Bei bestehenden Installationen migriert HomeEdge alte Daten aus `/etc/edgectl/`
