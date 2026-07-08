@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.16-homeedge"
+APP_VERSION="0.9.17-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -2286,22 +2286,25 @@ beszel_download_binary() {
   url="${BESZEL_DOWNLOAD_BASE}/${tar_name}"
   info "Lade Beszel Agent (${arch}) von ${url} ..."
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  # KEIN RETURN-Trap: der feuert bei verschachtelten Funktionen unerwartet
+  # erneut und laeuft dann unter "set -u" auf ein ungesetztes $tmp. Stattdessen
+  # wird das Temp-Verzeichnis auf jedem Pfad explizit aufgeraeumt.
   if ! curl -fsSL -o "${tmp}/${tar_name}" "$url"; then
     err "Download fehlgeschlagen. Netzwerk/URL pruefen."
-    return 1
+    rm -rf "$tmp"; return 1
   fi
   if ! tar -xzf "${tmp}/${tar_name}" -C "$tmp" 2>/dev/null; then
     err "Archiv konnte nicht entpackt werden."
-    return 1
+    rm -rf "$tmp"; return 1
   fi
   local extracted; extracted="$(find "$tmp" -maxdepth 2 -type f -name 'beszel-agent' | head -n1 || true)"
   if [[ -z "$extracted" || ! -s "$extracted" ]]; then
     err "beszel-agent Binary nicht im Archiv gefunden."
-    return 1
+    rm -rf "$tmp"; return 1
   fi
   # Atomar installieren (kein halb ueberschriebenes Binary).
   install -m 0755 "$extracted" "$BESZEL_BIN"
+  rm -rf "$tmp"
   ok "Beszel Agent installiert: $(beszel_version)"
 }
 
@@ -3666,12 +3669,13 @@ homeedge_repo_update() {
   if ! yesno "Neueste homeedge.sh aus diesem Repo laden und installieren?" "n"; then return; fi
 
   backup_create || true
+  # KEIN RETURN-Trap (feuert bei verschachtelten Funktionen unerwartet erneut und
+  # laeuft dann unter "set -u" auf ein ungesetztes $tmp). Explizit aufraeumen.
   local tmp; tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
   if ! curl -fsSL "$url" -o "$tmp"; then
     err "Download fehlgeschlagen. Pruefe Repo/Branch und ob homeedge.sh dort existiert."
     err "Versuchte URL: ${url}"
-    return 1
+    rm -f "$tmp"; return 1
   fi
   # Optionale Checksumme: falls <url>.sha256 existiert, wird sie geprueft.
   local sum_remote sum_local
@@ -3681,13 +3685,15 @@ homeedge_repo_update() {
     if [[ "$sum_remote" != "$sum_local" ]]; then
       err "Checksumme stimmt nicht ueberein. Abbruch, nichts geaendert."
       err "erwartet: ${sum_remote}"; err "erhalten: ${sum_local}"
-      return 1
+      rm -f "$tmp"; return 1
     fi
     ok "Checksumme verifiziert (sha256)."
   else
     info "Keine Checksumme gefunden (optional). Pruefung erfolgt ueber Marker + bash -n."
   fi
-  _install_homeedge_from_file "$tmp" || return 1
+  local irc=0; _install_homeedge_from_file "$tmp" || irc=$?
+  rm -f "$tmp"
+  return "$irc"
 }
 
 # Update von einer frei konfigurierten Raw-URL (z. B. Release-Asset).
@@ -3705,10 +3711,12 @@ homeedge_self_update() {
   if ! yesno "Update von dieser Quelle herunterladen und installieren?" "n"; then return; fi
 
   backup_create || true
+  # KEIN RETURN-Trap (siehe homeedge_repo_update) - explizit aufraeumen.
   local tmp; tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
-  if ! curl -fsSL "$HOMEEDGE_UPDATE_URL" -o "$tmp"; then err "Download fehlgeschlagen."; return 1; fi
-  _install_homeedge_from_file "$tmp" || return 1
+  if ! curl -fsSL "$HOMEEDGE_UPDATE_URL" -o "$tmp"; then err "Download fehlgeschlagen."; rm -f "$tmp"; return 1; fi
+  local irc=0; _install_homeedge_from_file "$tmp" || irc=$?
+  rm -f "$tmp"
+  return "$irc"
 }
 
 # Prueft, ob im Repo eine neuere Version liegt - ohne zu installieren.
