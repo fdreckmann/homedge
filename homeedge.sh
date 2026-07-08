@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.17-homeedge"
+APP_VERSION="0.9.18-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -98,7 +98,8 @@ mask_secrets() {
     -e 's/(PresharedKey[[:space:]]*=[[:space:]]*).*/\1***MASKED***/g' \
     -e 's/(BESZEL_TOKEN[=:][[:space:]]*)[^[:space:]]*/\1***MASKED***/g' \
     -e 's/(TOKEN[=:][[:space:]]*)[^[:space:]]{8,}/\1***MASKED***/g' \
-    -e 's/(^|[[:space:]])(KEY[=:][[:space:]]*)[^[:space:]]{16,}/\1\2***MASKED***/g'
+    -e 's/(^|[[:space:]])(KEY[=:][[:space:]]*)[^[:space:]]{16,}/\1\2***MASKED***/g' \
+    -e 's/(ssh-(ed25519|rsa|dss)[[:space:]]+)[A-Za-z0-9+\/]{20,}(=*)/\1***MASKED***/g'
 }
 # Zentrale, robuste Laufzeitpruefung fuer den Caddy-Container.
 # running=true UND restarting=false -> OK; sonst (fehlt/Restarting) -> Fehler.
@@ -2047,15 +2048,24 @@ system_usage() {
 # ------------------------------------------------------------
 # Monitoring: Beszel Agent (optional)
 # ------------------------------------------------------------
-# Der Agent wird NIE automatisch installiert. Der Agent-Port ist NUR ueber das
-# WireGuard-Interface UND NUR fuer die WireGuard-IP des Beszel-Hubs erreichbar -
-# nie oeffentlich (kein 0.0.0.0/0 oder ::/0, kein pauschales "ufw allow PORT").
-# Firewall-Regel (exakt):
-#   ufw allow in on <IFACE> from <HUB_WG_IP> to any port <PORT> proto tcp \
-#     comment 'Homeedge Beszel Agent'
-# Konfig (chmod 600) in ${BESZEL_ENV}: KEY, TOKEN, HUB_URL, LISTEN,
-# BESZEL_AGENT_PORT, BESZEL_HUB_WG_IP, BESZEL_WG_IFACE.
-# Wichtig: fuer die Firewall wird NIE HUB_URL benutzt, sondern nur BESZEL_HUB_WG_IP.
+# Der Agent wird NIE automatisch installiert. Er unterstuetzt ZWEI Modelle:
+#
+#  1) PULL / SSH  (BESZEL_MODE=pull, empfohlen): Der Beszel-Hub verbindet sich
+#     zum Agent. Der Agent-Port ist NUR ueber das WireGuard-Interface UND NUR
+#     fuer die WireGuard-IP des Hubs erreichbar - nie oeffentlich. Benoetigt
+#     KEY (+ LISTEN/Port/Iface/Hub-IP), NICHT HUB_URL/TOKEN.
+#     Firewall-Regel (exakt):
+#       ufw allow in on <IFACE> from <HUB_WG_IP> to any port <PORT> proto tcp \
+#         comment 'Homeedge Beszel Agent'
+#
+#  2) WEBSOCKET / TOKEN  (BESZEL_MODE=websocket, advanced): Der Agent verbindet
+#     sich AKTIV zum Hub. Benoetigt KEY + HUB_URL + TOKEN. KEINE eingehende
+#     UFW-Regel fuer den Agent-Port noetig.
+#
+# Konfig (chmod 600) in ${BESZEL_ENV}: KEY, HUB_URL, TOKEN, LISTEN, BESZEL_MODE,
+# BESZEL_AGENT_PORT, BESZEL_WG_IFACE, BESZEL_HUB_WG_IP.
+# Wichtig: fuer die Firewall wird NIE HUB_URL benutzt, nur BESZEL_HUB_WG_IP.
+# KEY und TOKEN werden nie im Klartext ausgegeben.
 
 # Liest einen Wert aus beszel.env (unquoted). $1 = Schluessel.
 _beszel_get() {
@@ -2064,15 +2074,32 @@ _beszel_get() {
     | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
 }
 
+# Extrahiert den Port aus einem LISTEN-Wert (IP:PORT, [v6]:PORT, :PORT oder PORT).
+_beszel_port_from_listen() {
+  local l="${1:-}"
+  [[ -z "$l" ]] && return 0
+  if [[ "$l" == *:* ]]; then echo "${l##*:}"; else echo "$l"; fi
+}
+
 # Laedt die gespeicherte Konfiguration in globale Variablen (best effort).
 load_beszel_config() {
-  BESZEL_KEY=""; BESZEL_TOKEN=""; BESZEL_HUB_URL=""
+  BESZEL_KEY=""; BESZEL_TOKEN=""; BESZEL_HUB_URL=""; BESZEL_LISTEN=""
+  BESZEL_MODE="pull"
   BESZEL_AGENT_PORT="$BESZEL_PORT_DEFAULT"; BESZEL_HUB_WG_IP=""; BESZEL_WG_IFACE=""
   [[ -f "$BESZEL_ENV" ]] || return 0
   BESZEL_KEY="$(_beszel_get KEY)"
   BESZEL_TOKEN="$(_beszel_get TOKEN)"
   BESZEL_HUB_URL="$(_beszel_get HUB_URL)"
-  local p; p="$(_beszel_get BESZEL_AGENT_PORT)"; [[ -z "$p" ]] && p="$(_beszel_get LISTEN)"
+  BESZEL_LISTEN="$(_beszel_get LISTEN)"
+  local m; m="$(_beszel_get BESZEL_MODE)"
+  if [[ "$m" == "pull" || "$m" == "websocket" ]]; then
+    BESZEL_MODE="$m"
+  else
+    # Altinstallation ohne gespeicherten Modus: aus HUB_URL/TOKEN ableiten.
+    if [[ -n "$BESZEL_HUB_URL" && -n "$BESZEL_TOKEN" ]]; then BESZEL_MODE="websocket"; else BESZEL_MODE="pull"; fi
+  fi
+  local p; p="$(_beszel_get BESZEL_AGENT_PORT)"
+  [[ "$p" =~ ^[0-9]+$ ]] || p="$(_beszel_port_from_listen "$BESZEL_LISTEN")"
   [[ "$p" =~ ^[0-9]+$ ]] && BESZEL_AGENT_PORT="$p"
   BESZEL_HUB_WG_IP="$(_beszel_get BESZEL_HUB_WG_IP)"
   BESZEL_WG_IFACE="$(_beszel_get BESZEL_WG_IFACE)"
@@ -2097,6 +2124,38 @@ beszel_validate_hub_ip() {
   # grobe IPv6(/CIDR)-Pruefung: Hex-Gruppen mit Doppelpunkt
   [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] && return 0
   return 1
+}
+
+# Normalisiert einen Beszel-/SSH-Public-Key: CR/Rand-Whitespace entfernen, ein
+# fehlendes Leerzeichen nach dem Typ (z. B. "ssh-ed25519AAAA...") automatisch
+# einfuegen, und auf die ersten zwei Felder (Typ + Base64) reduzieren (Kommentar
+# verwerfen). Gibt den bereinigten Key aus (ggf. leer).
+_beszel_key_normalize() {
+  local k="${1:-}"
+  k="${k//$'\r'/}"; k="${k//$'\n'/ }"
+  # fuehrende/abschliessende Leerzeichen trimmen
+  k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+  # fehlendes Leerzeichen nach bekanntem Typ eindeutig korrigieren
+  k="$(printf '%s' "$k" | sed -E 's#^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-[a-z0-9-]+)([A-Za-z0-9+/])#\1 \3#')"
+  # auf Typ + Base64 (erste zwei Felder) reduzieren
+  local typ blob _rest
+  read -r typ blob _rest <<<"$k"
+  [[ -n "$typ" && -n "$blob" ]] && printf '%s %s' "$typ" "$blob"
+}
+
+# Prueft einen (normalisierten) SSH-Public-Key: bekannter Typ + Leerzeichen +
+# Base64-Blob (>= 32 Zeichen). 0 = gueltig.
+beszel_validate_key() {
+  [[ "${1:-}" =~ ^(ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-[a-z0-9-]+)[[:space:]][A-Za-z0-9+/]{32,}={0,3}$ ]]
+}
+
+# Prueft, ob eine HUB_URL ausgehend erreichbar ist (irgendeine HTTP-Antwort =
+# erreichbar). 0 = erreichbar, 1 = nicht erreichbar, 2 = kann nicht pruefen.
+beszel_hub_reachable() {
+  local url="${1:-}"
+  [[ -n "$url" ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 2
+  curl -sS -m 8 -o /dev/null "$url" >/dev/null 2>&1
 }
 
 # Ermittelt den Beszel-Release-Dateinamen fuer die aktuelle Architektur.
@@ -2132,54 +2191,96 @@ beszel_version() {
 _beszel_sanitize_line() { printf '%s' "${1:-}" | tr -d '\r\n[:space:]"'\''`$\\'; }
 
 beszel_write_env() {
-  # $1 KEY  $2 TOKEN  $3 HUB_URL  $4 PORT  $5 HUB_WG_IP  $6 WG_IFACE
-  local key="$1" tok="$2" hub="$3" port="$4" hubip="$5" iface="$6"
+  # $1 MODE  $2 KEY  $3 TOKEN  $4 HUB_URL  $5 LISTEN  $6 PORT  $7 HUB_WG_IP  $8 WG_IFACE
+  local mode="$1" key="$2" tok="$3" hub="$4" listen="$5" port="$6" hubip="$7" iface="$8"
   umask 077
   cat > "$BESZEL_ENV" <<EOB
 # HomeEdge - Beszel-Agent Konfiguration (chmod 600)
 # Verwaltet ueber: sudo homeedge beszel-install / beszel-reconfigure
-# HUB_URL = URL des Beszel-Hub (Agent/Token-Kontext).
+# BESZEL_MODE = pull (Hub -> Agent, WireGuard) oder websocket (Agent -> Hub).
 # BESZEL_HUB_WG_IP = WireGuard-IP/CIDR, die per UFW auf den Agent-Port darf.
 # Fuer die Firewall wird NUR BESZEL_HUB_WG_IP genutzt, NIE HUB_URL.
 KEY="${key}"
-TOKEN="${tok}"
 HUB_URL="${hub}"
-LISTEN="${port}"
+TOKEN="${tok}"
+LISTEN="${listen}"
+BESZEL_MODE="${mode}"
 BESZEL_AGENT_PORT="${port}"
-BESZEL_HUB_WG_IP="${hubip}"
 BESZEL_WG_IFACE="${iface}"
+BESZEL_HUB_WG_IP="${hubip}"
 EOB
   chmod 600 "$BESZEL_ENV"
 }
 
-# Interaktive Konfig-Abfrage. $1 = install|reconfigure. Setzt NB_KEY/NB_TOKEN/
-# NB_HUB/NB_PORT/NB_IFACE/NB_HUBIP. Bei reconfigure: leere KEY/TOKEN = behalten.
+# Fragt den KEY interaktiv ab, normalisiert und validiert ihn (mit Auto-Fix des
+# fehlenden Leerzeichens). Bei reconfigure = leer -> alten KEY behalten. Setzt NB_KEY.
+_beszel_prompt_key() {
+  local op="$1" hint="" raw clean
+  [[ "$op" == reconfigure ]] && hint=" (leer = unveraendert)"
+  while :; do
+    raw="$(ask_secret "Beszel Public-Key (KEY, vollstaendig aus dem Hub kopieren)${hint}")"
+    if [[ -z "$raw" && "$op" == reconfigure ]]; then NB_KEY="$BESZEL_KEY"; return 0; fi
+    clean="$(_beszel_key_normalize "$raw")"
+    if beszel_validate_key "$clean"; then NB_KEY="$clean"; return 0; fi
+    err "Ungueltiger Beszel Public Key. Bitte den Public Key aus dem Beszel Hub vollstaendig kopieren. Format: ssh-ed25519 AAAA..."
+  done
+}
+
+# Interaktive Konfig-Abfrage. $1 = install|reconfigure. Fragt zuerst den Modus ab
+# und danach nur die je Modus benoetigten Werte. Setzt NB_MODE/NB_KEY/NB_TOKEN/
+# NB_HUB/NB_LISTEN/NB_PORT/NB_IFACE/NB_HUBIP.
 _beszel_prompt_config() {
-  local mode="$1" hint="" vr
-  [[ "$mode" == reconfigure ]] && hint=" (leer = unveraendert)"
-  NB_KEY="$(_beszel_sanitize_line "$(ask_secret "Beszel HUB Public-Key (KEY)${hint}")")"
-  [[ -z "$NB_KEY" && "$mode" == reconfigure ]] && NB_KEY="$BESZEL_KEY"
-  NB_TOKEN="$(_beszel_sanitize_line "$(ask_secret "Beszel Registrations-TOKEN${hint}")")"
-  [[ -z "$NB_TOKEN" && "$mode" == reconfigure ]] && NB_TOKEN="$BESZEL_TOKEN"
-  NB_HUB="$(_beszel_sanitize_line "$(ask "Beszel HUB_URL (z. B. https://beszel.example.de)" "${BESZEL_HUB_URL:-}")")"
-  while :; do
-    NB_PORT="$(ask "Agent-Port" "${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}")"
-    beszel_validate_port "$NB_PORT" && break
-    err "Ungueltiger Port (1-65535)."
-  done
-  while :; do
-    NB_IFACE="$(ask "WireGuard-Interface (Agent nur ueber dieses Interface)" "${BESZEL_WG_IFACE:-${WG_IF:-wg0}}")"
-    beszel_validate_wg_iface "$NB_IFACE" && break
-    warn "Interface '${NB_IFACE}' existiert derzeit nicht (ip link show ${NB_IFACE})."
-    yesno "Trotzdem verwenden (Tunnel evtl. noch nicht aktiv)?" "n" && break
-  done
-  while :; do
-    NB_HUBIP="$(ask "WireGuard-IP/CIDR des Beszel-Hub (darf zugreifen), z. B. 10.8.0.2" "${BESZEL_HUB_WG_IP:-}")"
-    beszel_validate_hub_ip "$NB_HUBIP"; vr=$?
-    (( vr == 0 )) && break
-    (( vr == 2 )) && { err "0.0.0.0/0 bzw. ::/0 ist NICHT erlaubt - das waere oeffentlich!"; continue; }
-    err "Ungueltige IP/CIDR. Erlaubt: IPv4, IPv6 oder CIDR (nicht leer)."
-  done
+  local op="$1" vr def_mode="pull" mc
+  [[ -n "${BESZEL_MODE:-}" ]] && def_mode="$BESZEL_MODE"
+  echo "Wie soll der Beszel Agent angebunden werden?"
+  echo "  1) Hub verbindet sich zum Agent ueber WireGuard (Pull/SSH, empfohlen)"
+  echo "  2) Agent verbindet sich aktiv zum Hub per HUB_URL/TOKEN (WebSocket, advanced)"
+  mc="$(ask "Auswahl" "$([[ "$def_mode" == websocket ]] && echo 2 || echo 1)")"
+  case "$mc" in
+    2|websocket|ws) NB_MODE="websocket" ;;
+    *)              NB_MODE="pull" ;;
+  esac
+
+  # KEY wird in BEIDEN Modi benoetigt.
+  _beszel_prompt_key "$op"
+
+  # Defaults leeren, damit modus-fremde Werte nicht versehentlich bestehen bleiben.
+  NB_TOKEN=""; NB_HUB=""; NB_LISTEN=""; NB_IFACE=""; NB_HUBIP=""
+  NB_PORT="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}"
+
+  if [[ "$NB_MODE" == "pull" ]]; then
+    while :; do
+      NB_PORT="$(ask "Agent-Port" "${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}")"
+      beszel_validate_port "$NB_PORT" && break
+      err "Ungueltiger Port (1-65535)."
+    done
+    while :; do
+      NB_IFACE="$(ask "WireGuard-Interface (Agent nur ueber dieses Interface)" "${BESZEL_WG_IFACE:-${WG_IF:-wg0}}")"
+      beszel_validate_wg_iface "$NB_IFACE" && break
+      warn "Interface '${NB_IFACE}' existiert derzeit nicht (ip link show ${NB_IFACE})."
+      yesno "Trotzdem verwenden (Tunnel evtl. noch nicht aktiv)?" "n" && break
+    done
+    while :; do
+      NB_HUBIP="$(ask "WireGuard-IP/CIDR des Beszel-Hub (darf zugreifen), z. B. 192.168.10.3" "${BESZEL_HUB_WG_IP:-}")"
+      beszel_validate_hub_ip "$NB_HUBIP"; vr=$?
+      (( vr == 0 )) && break
+      (( vr == 2 )) && { err "0.0.0.0/0 bzw. ::/0 ist NICHT erlaubt - das waere oeffentlich!"; continue; }
+      err "Ungueltige IP/CIDR. Erlaubt: IPv4, IPv6 oder CIDR (nicht leer)."
+    done
+    # Lokale Listen-IP: bevorzugt an die VPS-WireGuard-IP binden (nicht oeffentlich).
+    local def_ip="${VPS_WG_IP:-}" lip
+    lip="$(ask "Lokale Listen-IP (leer = alle Interfaces; Default VPS-WireGuard-IP)" "$def_ip")"
+    if [[ -n "$lip" ]]; then NB_LISTEN="${lip}:${NB_PORT}"; else NB_LISTEN="${NB_PORT}"; fi
+  else
+    # WebSocket: HUB_URL + TOKEN Pflicht, KEINE eingehende Regel/Interface/Hub-IP.
+    NB_HUB="$(_beszel_sanitize_line "$(ask "Beszel HUB_URL (z. B. https://beszel.example.de)" "${BESZEL_HUB_URL:-}")")"
+    local rawtok
+    rawtok="$(ask_secret "Beszel Registrations-TOKEN$([[ "$op" == reconfigure ]] && echo ' (leer = unveraendert)')")"
+    NB_TOKEN="$(_beszel_sanitize_line "$rawtok")"
+    [[ -z "$NB_TOKEN" && "$op" == reconfigure ]] && NB_TOKEN="$BESZEL_TOKEN"
+    # Port nur informativ (kein Listener noetig); LISTEN bleibt leer.
+    NB_PORT="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}"
+  fi
 }
 
 beszel_write_unit() {
@@ -2220,14 +2321,17 @@ EOUNIT
   systemctl daemon-reload
 }
 
-# Findet fuer den Port UFW-Regeln, die NICHT auf die Hub-IP eingeschraenkt sind
-# (also oeffentlich/zu weit: Anywhere, 0.0.0.0/0, ::/0, oder interface-only ohne
-# 'from HUB'). Gibt die Zeilen aus, sonst leer.
+# Findet WIRKLICH zu weite UFW-Freigaben fuer den Port: Quelle Anywhere /
+# Anywhere (v6) / 0.0.0.0/0 / ::/0 (auch interface-only ohne 'from' rendert als
+# "Anywhere"). Eine restriktive Regel "... ALLOW <hub-ip>" wird NICHT gemeldet.
+# Unabhaengig von der Hub-IP - so entstehen keine falschen "oeffentlich"-Meldungen.
 beszel_public_exposure() {
-  local port="$1" hubip="${2:-}"
+  local port="$1"
   command -v ufw >/dev/null 2>&1 || return 0
-  ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/(tcp|udp)" | grep -iF "ALLOW" \
-    | { if [[ -n "$hubip" ]]; then grep -vF "$hubip"; else cat; fi; }
+  ufw status 2>/dev/null \
+    | grep -E "(^|[^0-9])${port}/(tcp|udp)([[:space:]]|\(v6\))" \
+    | grep -iF "ALLOW" \
+    | grep -iE 'Anywhere|0\.0\.0\.0/0|::/0'
 }
 
 # Entfernt GENAU die restriktive Regel anhand (alter) Werte. Fehler ignorieren.
@@ -2255,8 +2359,8 @@ beszel_apply_ufw_rule() {
 # werden NUR die bekannten pauschalen/interface-only-Formen entfernt, keine
 # fremden Regeln ungefragt.
 beszel_remove_public_exposure() {
-  local port="$1" hubip="$2" iface="$3" pub
-  pub="$(beszel_public_exposure "$port" "$hubip")"
+  local port="$1" iface="${2:-}" pub
+  pub="$(beszel_public_exposure "$port")"
   [[ -z "$pub" ]] && return 0
   warn "Oeffentliche oder zu weite UFW-Freigabe(n) fuer Port ${port} gefunden:"
   printf '%s\n' "$pub" | sed 's/^/  /'
@@ -2266,7 +2370,7 @@ beszel_remove_public_exposure() {
     ufw delete allow "${port}" >/dev/null 2>&1 || true
     [[ -n "$iface" ]] && ufw delete allow in on "$iface" to any port "${port}" proto tcp >/dev/null 2>&1 || true
     ufw reload >/dev/null 2>&1 || true
-    local left; left="$(beszel_public_exposure "$port" "$hubip")"
+    local left; left="$(beszel_public_exposure "$port")"
     if [[ -z "$left" ]]; then ok "Oeffentliche Freigabe(n) fuer ${port} entfernt."
     else warn "Nicht alles automatisch entfernbar - bitte manuell: sudo ufw status numbered"; fi
   else
@@ -2314,7 +2418,7 @@ beszel_install() {
   section "Beszel Agent installieren"
   if beszel_installed; then
     warn "Beszel Agent ist bereits installiert (${BESZEL_BIN})."
-    echo "  1) Konfiguration aendern (Port / Hub-IP / Token)"
+    echo "  1) Konfiguration aendern (Modus / Port / Hub-IP / Token)"
     echo "  2) Auf aktuelle Version aktualisieren"
     echo "  0) Abbruch"
     local c; c="$(ask "Auswahl" "0")"
@@ -2325,21 +2429,32 @@ beszel_install() {
     esac
   fi
 
-  info "Der Agent ist NUR ueber WireGuard UND NUR fuer die angegebene Hub-IP erreichbar."
-  info "Es wird KEINE oeffentliche Freigabe angelegt (weder IPv4 noch IPv6)."
-  echo
   _beszel_prompt_config install
-  [[ -z "$NB_KEY" || -z "$NB_TOKEN" || -z "$NB_HUB" ]] && { err "KEY, TOKEN und HUB_URL sind Pflicht."; return 1; }
+  # Pflichtfelder je Modus pruefen.
+  if [[ "$NB_MODE" == "pull" ]]; then
+    [[ -z "$NB_KEY" ]] && { err "KEY ist im Pull-Modus Pflicht."; return 1; }
+    [[ -z "$NB_HUBIP" ]] && { err "Hub-WireGuard-IP ist im Pull-Modus Pflicht."; return 1; }
+  else
+    [[ -z "$NB_KEY" || -z "$NB_HUB" || -z "$NB_TOKEN" ]] && { err "KEY, HUB_URL und TOKEN sind im WebSocket-Modus Pflicht."; return 1; }
+  fi
 
   beszel_download_binary || return 1
-  beszel_write_env "$NB_KEY" "$NB_TOKEN" "$NB_HUB" "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
+  beszel_write_env "$NB_MODE" "$NB_KEY" "$NB_TOKEN" "$NB_HUB" "$NB_LISTEN" "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
   ok "Konfig geschrieben: ${BESZEL_ENV} (chmod 600, Secrets nicht ausgegeben)."
   beszel_write_unit
   ok "systemd-Unit geschrieben: ${BESZEL_UNIT}"
 
-  # Bestehende oeffentliche Altlasten pruefen/bereinigen, dann restriktive Regel.
-  beszel_remove_public_exposure "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
-  beszel_apply_ufw_rule "$NB_IFACE" "$NB_HUBIP" "$NB_PORT"
+  if [[ "$NB_MODE" == "pull" ]]; then
+    # Bestehende oeffentliche Altlasten pruefen/bereinigen, dann restriktive Regel.
+    beszel_remove_public_exposure "$NB_PORT" "$NB_IFACE"
+    beszel_apply_ufw_rule "$NB_IFACE" "$NB_HUBIP" "$NB_PORT"
+  else
+    info "WebSocket-Modus: keine eingehende UFW-Regel fuer Port ${NB_PORT} noetig."
+    # Falls eine frueher gesetzte oeffentliche Freigabe existiert, anbieten zu entfernen.
+    beszel_remove_public_exposure "$NB_PORT"
+    if beszel_hub_reachable "$NB_HUB"; then ok "HUB_URL ausgehend erreichbar: ${NB_HUB}"
+    else warn "HUB_URL nicht erreichbar (${NB_HUB}) - DNS/Netz/URL pruefen. Agent versucht es weiter."; fi
+  fi
 
   systemctl enable --now beszel-agent >/dev/null 2>&1 || true
   sleep 1
@@ -2349,63 +2464,102 @@ beszel_install() {
 # Konfiguration aendern (Port/Hub-IP/Interface/Token): alte Regel weg, neue Regel.
 beszel_reconfigure() {
   need_root; load_env; load_beszel_config
-  section "Beszel Agent konfigurieren / Port oder Hub-IP aendern"
+  section "Beszel Agent konfigurieren / Modus, Port oder Hub-IP aendern"
   if ! beszel_installed && [[ ! -f "$BESZEL_ENV" ]]; then
     err "Beszel Agent ist nicht installiert. Zuerst: sudo homeedge beszel-install"
     return 1
   fi
-  # ALTE Werte merken (fuer gezielte Regel-Entfernung).
+  # ALTE Werte merken (fuer gezielte Regel-Entfernung) - unabhaengig vom alten Modus.
   local old_iface="${BESZEL_WG_IFACE:-${WG_IF:-wg0}}" old_ip="${BESZEL_HUB_WG_IP:-}" old_port="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}"
   _beszel_prompt_config reconfigure
-  [[ -z "$NB_KEY" || -z "$NB_TOKEN" || -z "$NB_HUB" ]] && { err "KEY, TOKEN und HUB_URL sind Pflicht."; return 1; }
+  if [[ "$NB_MODE" == "pull" ]]; then
+    [[ -z "$NB_KEY" ]] && { err "KEY ist im Pull-Modus Pflicht."; return 1; }
+    [[ -z "$NB_HUBIP" ]] && { err "Hub-WireGuard-IP ist im Pull-Modus Pflicht."; return 1; }
+  else
+    [[ -z "$NB_KEY" || -z "$NB_HUB" || -z "$NB_TOKEN" ]] && { err "KEY, HUB_URL und TOKEN sind im WebSocket-Modus Pflicht."; return 1; }
+  fi
 
   # Reihenfolge lt. Vorgabe: Service stoppen -> ALTE UFW-Regel entfernen ->
-  # env neu schreiben -> NEUE UFW-Regel -> daemon-reload -> Service starten.
+  # neue Werte schreiben -> ggf. NEUE UFW-Regel -> daemon-reload -> Service starten.
   systemctl stop beszel-agent 2>/dev/null || true
+  # Alte restriktive Regel immer anhand der alten Werte entfernen (Port/IP/Modus-Wechsel).
   beszel_remove_ufw_rule "$old_iface" "$old_ip" "$old_port"
-  beszel_write_env "$NB_KEY" "$NB_TOKEN" "$NB_HUB" "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
+  beszel_write_env "$NB_MODE" "$NB_KEY" "$NB_TOKEN" "$NB_HUB" "$NB_LISTEN" "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
   ok "Konfig aktualisiert: ${BESZEL_ENV}"
   beszel_write_unit    # enthaelt systemctl daemon-reload
-  beszel_remove_public_exposure "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
-  beszel_apply_ufw_rule "$NB_IFACE" "$NB_HUBIP" "$NB_PORT"
+  if [[ "$NB_MODE" == "pull" ]]; then
+    beszel_remove_public_exposure "$NB_PORT" "$NB_IFACE"
+    beszel_apply_ufw_rule "$NB_IFACE" "$NB_HUBIP" "$NB_PORT"
+  else
+    info "WebSocket-Modus: keine eingehende UFW-Regel noetig - eingehende Freigabe wurde entfernt."
+    beszel_remove_public_exposure "$NB_PORT"
+    if beszel_hub_reachable "$NB_HUB"; then ok "HUB_URL ausgehend erreichbar: ${NB_HUB}"
+    else warn "HUB_URL nicht erreichbar (${NB_HUB}) - DNS/Netz/URL pruefen."; fi
+  fi
   systemctl start beszel-agent 2>/dev/null || true
   sleep 1
   beszel_verify_installation
 }
 
-# Zeigt eine klare Statuszusammenfassung und liefert 1 bei oeffentlicher Freigabe.
+# Zeigt eine klare, modus-abhaengige Statuszusammenfassung. Kehrt IMMER sauber
+# zurueck (kein Shell-Fehler): 0 = ok, 1 = Warnung/Problem.
 beszel_verify_installation() {
   load_beszel_config
+  local mode="${BESZEL_MODE:-pull}"
   local port="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}" ip="${BESZEL_HUB_WG_IP:-}" iface="${BESZEL_WG_IFACE:-${WG_IF:-wg0}}"
   section "Beszel Agent - Pruefung"
   local svc="nein" listen="nein" rule="nein" pub="nein"
   systemctl is-active --quiet beszel-agent 2>/dev/null && svc="ja"
   command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . && listen="ja"
   if command -v ufw >/dev/null 2>&1; then
-    [[ -n "$ip" ]] && ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/tcp" | grep -F "$iface" | grep -qF "$ip" && rule="ja"
-    [[ -n "$(beszel_public_exposure "$port" "$ip")" ]] && pub="ja"
+    # Restriktive Regel exakt: Portzeile MIT Interface UND mit der Hub-IP als Quelle.
+    if [[ -n "$ip" ]] && ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/tcp" | grep -F "$iface" | grep -qF "$ip"; then rule="ja"; fi
+    [[ -n "$(beszel_public_exposure "$port")" ]] && pub="ja"
   fi
+  local modelabel; [[ "$mode" == websocket ]] && modelabel="WebSocket/Token" || modelabel="Pull/SSH (WireGuard)"
+  printf '  Betriebsmodus:            %s\n' "$modelabel"
   printf '  Beszel Agent installiert: %s\n' "$(beszel_installed && echo ja || echo nein)"
   printf '  Service aktiv:            %s\n' "$svc"
-  printf '  Agent-Port:               %s\n' "$port"
-  printf '  WireGuard-Interface:      %s\n' "$iface"
-  printf '  Erlaubter Beszel Hub:     %s\n' "${ip:-<nicht gesetzt>}"
-  printf '  UFW-Regel vorhanden:      %s\n' "$rule"
-  printf '  Lauscht auf Port %s:  %s\n' "$port" "$listen"
-  printf '  Oeffentliche Freigabe:    %s\n' "$pub"
+  printf '  Version:                  %s\n' "$(beszel_version)"
+  printf '  KEY gesetzt:              %s\n' "$([[ -n "${BESZEL_KEY:-}" ]] && echo ja || echo nein)"
+  if [[ "$mode" == "pull" ]]; then
+    printf '  LISTEN:                   %s\n' "${BESZEL_LISTEN:-<nicht gesetzt>}"
+    printf '  Agent-Port:               %s\n' "$port"
+    printf '  WireGuard-Interface:      %s\n' "$iface"
+    printf '  Erlaubter Beszel Hub:     %s\n' "${ip:-<nicht gesetzt>}"
+    printf '  UFW-Regel vorhanden:      %s\n' "$rule"
+    printf '  Lauscht auf Port %s:  %s\n' "$port" "$listen"
+    printf '  Oeffentliche Freigabe:    %s\n' "$pub"
+  else
+    printf '  HUB_URL gesetzt:          %s\n' "$([[ -n "${BESZEL_HUB_URL:-}" ]] && echo ja || echo nein)"
+    printf '  TOKEN gesetzt:            %s\n' "$([[ -n "${BESZEL_TOKEN:-}" ]] && echo ja || echo nein)"
+    printf '  Agent-Port (informativ): %s\n' "$port"
+    printf '  Oeffentliche Freigabe:    %s\n' "$pub"
+  fi
   echo
+  # Bewertung.
   if [[ "$pub" == "ja" ]]; then
     err "ACHTUNG: OEFFENTLICHE/zu weite Freigabe fuer Port ${port} gefunden!"
-    err "Der Agent darf nur ueber ${iface} von ${ip:-der Hub-IP} erreichbar sein."
+    err "Der Agent-Port darf nicht oeffentlich erreichbar sein."
     info "Bereinigen: sudo homeedge beszel-check-firewall"
     return 1
   fi
-  if [[ "$svc" == "ja" && "$rule" == "ja" ]]; then
-    ok "Firewall: OK, Zugriff nur von ${ip} ueber ${iface} erlaubt."
-    return 0
+  if [[ "$mode" == "pull" ]]; then
+    if [[ "$svc" == "ja" && "$rule" == "ja" ]]; then
+      ok "Pull-Modus OK: Zugriff nur von ${ip} ueber ${iface} erlaubt."
+      return 0
+    fi
+    warn "Pruefung nicht komplett gruen (Details oben). Ggf. Tunnel/Interface/Hub-IP pruefen."
+    return 1
+  else
+    if [[ "$svc" == "ja" ]]; then
+      ok "WebSocket-Modus OK: Agent laeuft, keine eingehende Freigabe noetig."
+      [[ -z "${BESZEL_HUB_URL:-}" ]] && { warn "HUB_URL ist nicht gesetzt - im WebSocket-Modus erforderlich."; return 1; }
+      return 0
+    fi
+    warn "Pruefung nicht komplett gruen: Service laeuft nicht (Logs: sudo homeedge beszel-logs)."
+    return 1
   fi
-  warn "Pruefung nicht komplett gruen (Details oben). Ggf. Tunnel/Interface/Hub-IP pruefen."
-  return 1
 }
 
 beszel_status() {
@@ -2430,12 +2584,21 @@ beszel_status() {
 beszel_check_firewall() {
   need_root; load_env; load_beszel_config
   section "Beszel Firewall-Regeln pruefen"
+  local mode="${BESZEL_MODE:-pull}"
   local port="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}" ip="${BESZEL_HUB_WG_IP:-}" iface="${BESZEL_WG_IFACE:-${WG_IF:-wg0}}"
-  echo "Erwartet: Zugriff NUR von ${ip:-<keine Hub-IP gesetzt>} ueber ${iface} auf Port ${port}."
+  echo "Betriebsmodus: $([[ "$mode" == websocket ]] && echo 'WebSocket/Token' || echo 'Pull/SSH (WireGuard)')"
   echo
   echo "== Aktuelle UFW-Regeln fuer Port ${port} =="
   ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/(tcp|udp)" | sed 's/^/  /' || echo "  (keine)"
   echo
+  if [[ "$mode" == "websocket" ]]; then
+    info "WebSocket-Modus: KEINE eingehende UFW-Regel fuer Port ${port} noetig."
+    # Nur wirklich zu weite Freigaben anbieten zu entfernen.
+    beszel_remove_public_exposure "$port"
+    [[ -z "$(beszel_public_exposure "$port")" ]] && ok "Keine oeffentliche Freigabe fuer Port ${port} vorhanden."
+    return 0
+  fi
+  echo "Erwartet: Zugriff NUR von ${ip:-<keine Hub-IP gesetzt>} ueber ${iface} auf Port ${port}."
   if [[ -n "$ip" ]] && ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/tcp" | grep -F "$iface" | grep -qF "$ip"; then
     ok "Restriktive Regel vorhanden: nur ${ip} ueber ${iface}."
   else
@@ -2443,8 +2606,8 @@ beszel_check_firewall() {
     [[ -n "$ip" ]] && yesno "Restriktive Regel jetzt (neu) setzen?" "y" && beszel_apply_ufw_rule "$iface" "$ip" "$port"
   fi
   echo
-  beszel_remove_public_exposure "$port" "$ip" "$iface"
-  local left; left="$(beszel_public_exposure "$port" "$ip")"
+  beszel_remove_public_exposure "$port" "$iface"
+  local left; left="$(beszel_public_exposure "$port")"
   [[ -z "$left" ]] && ok "Keine oeffentliche Freigabe fuer Port ${port} (mehr) vorhanden."
 }
 
@@ -4375,10 +4538,10 @@ sm_monitoring() {
   while true; do
     hmenu_head "Monitoring / Beszel Agent"
     if beszel_installed; then info "Beszel Agent ist installiert ($(beszel_version))."; else info "Beszel Agent ist NICHT installiert."; fi
-    info "Sicherheitsprinzip: Port ausschliesslich ueber WireGuard (${WG_IF}), nie oeffentlich."
+    info "Pull-Modus: Agent-Port NUR ueber WireGuard fuer die Hub-IP - nie oeffentlich. WebSocket-Modus: keine eingehende Freigabe."
     line
     menu_item 1 "Beszel Agent installieren"
-    menu_item 2 "Konfigurieren / Port oder Hub-IP aendern"
+    menu_item 2 "Konfigurieren / Port, Modus oder Hub-IP aendern"
     menu_item 3 "Beszel Agent Status anzeigen"
     menu_item 4 "Beszel Agent Logs anzeigen"
     menu_item 5 "Beszel Agent neu starten"
