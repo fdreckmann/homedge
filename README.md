@@ -276,6 +276,26 @@ Nicht erlaubt: Internet -> oeffentliche VPS-IP:45876
                andere LAN-Hosts -> VPS:45876
 ```
 
+**Wichtig - welche Hub-IP?** Fuer die UFW-Regel zaehlt die Quell-IP, die der VPS
+**auf dem WireGuard-Interface sieht** - das ist oft **NICHT** die LAN-IP des
+Docker-/Unraid-Hosts und **NICHT** die Docker-Container-IP. Der Hub laeuft z. B.
+auf Unraid mit LAN-IP `192.168.10.3`, aber ueber den Tunnel kommt der Traffic beim
+VPS als `10.0.0.2` an - diese IP gehoert in `BESZEL_HUB_WG_IP`. Beachte den
+Unterschied zwischen Ziel- und Quell-IP:
+
+```text
+Im Beszel Hub eintragen (Host/IP:Port):   10.0.0.1:45876   (Ziel = VPS-WG-IP)
+In HomeEdge als erlaubte Quell-IP:        10.0.0.2         (Quelle = Hub-Tunnel-IP)
+UFW-Regel:  ufw allow in on unifi from 10.0.0.2 to any port 45876 proto tcp
+```
+
+HomeEdge zeigt diesen Hinweis bei Installation/Reconfigure und im Status. Ist die
+richtige IP unklar, hilft auf dem VPS:
+`sudo tcpdump -ni <WG_IFACE> tcp port <BESZEL_AGENT_PORT>` (bei Bedarf
+`sudo apt install -y tcpdump`) - dann im Hub die Verbindung testen; die Source-IP
+aus der tcpdump-Ausgabe (`10.0.0.2.xxxxx > 10.0.0.1.45876`) ist die einzutragende
+`BESZEL_HUB_WG_IP`.
+
 - **Pull-Modus** setzt genau **eine** restriktive UFW-Regel, eingeschraenkt auf
   Interface **und** Hub-IP:
   `ufw allow in on <WG_IFACE> from <BESZEL_HUB_WG_IP> to any port <PORT> proto tcp comment 'Homeedge Beszel Agent'`.

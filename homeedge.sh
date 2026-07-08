@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.18-homeedge"
+APP_VERSION="0.9.19-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -2226,6 +2226,40 @@ _beszel_prompt_key() {
   done
 }
 
+# Erklaert (Pull-Modus), dass fuer die UFW-Quell-IP die tatsaechlich auf dem
+# WireGuard-Interface sichtbare Source-IP zaehlt - NICHT die LAN-/Docker-IP des
+# Hub. $1 = iface, $2 = port.
+_beszel_source_ip_help() {
+  local iface="${1:-<WG_IFACE>}" port="${2:-<PORT>}" vpsip="${VPS_WG_IP:-<VPS_WG_IP>}"
+  echo
+  warn "WICHTIG - richtige Hub-Quell-IP fuer die Firewall:"
+  cat <<EOH
+  Hier muss die Quell-IP eingetragen werden, die der VPS ueber das WireGuard-
+  Interface SIEHT. Das ist oft NICHT die LAN-IP des Docker-/Unraid-Hosts und
+  NICHT die Docker-Container-IP.
+
+  Beispiel:
+    Beszel Hub laeuft auf Unraid:   192.168.10.3   (LAN - NICHT eintragen)
+    VPS WireGuard-IP:               ${vpsip}
+    Hub/Gegenseite im Tunnel:       10.0.0.2       (DIESE IP eintragen)
+
+  Im Beszel Hub ("System hinzufuegen") eintragen:
+    Host/IP: ${vpsip}
+    Port:    ${port}
+  In HomeEdge als erlaubte Hub-IP eintragen:
+    10.0.0.2   (die Tunnel-Source-IP der Hub-Seite)
+
+  Unklar, welche IP? Auf dem VPS ausfuehren:
+    sudo tcpdump -ni ${iface} tcp port ${port}
+  Dann im Beszel Hub die Verbindung testen. Die Source-IP aus tcpdump
+  (z. B.  10.0.0.2.xxxxx > ${vpsip}.${port}) ist die einzutragende Hub-IP
+  -> BESZEL_HUB_WG_IP=10.0.0.2
+EOH
+  command -v tcpdump >/dev/null 2>&1 \
+    || info "tcpdump ist nicht installiert - bei Bedarf: sudo apt update && sudo apt install -y tcpdump"
+  echo
+}
+
 # Interaktive Konfig-Abfrage. $1 = install|reconfigure. Fragt zuerst den Modus ab
 # und danach nur die je Modus benoetigten Werte. Setzt NB_MODE/NB_KEY/NB_TOKEN/
 # NB_HUB/NB_LISTEN/NB_PORT/NB_IFACE/NB_HUBIP.
@@ -2260,8 +2294,10 @@ _beszel_prompt_config() {
       warn "Interface '${NB_IFACE}' existiert derzeit nicht (ip link show ${NB_IFACE})."
       yesno "Trotzdem verwenden (Tunnel evtl. noch nicht aktiv)?" "n" && break
     done
+    # Vor der Hub-IP-Abfrage klar erklaeren, WELCHE IP gemeint ist.
+    _beszel_source_ip_help "$NB_IFACE" "$NB_PORT"
     while :; do
-      NB_HUBIP="$(ask "WireGuard-IP/CIDR des Beszel-Hub (darf zugreifen), z. B. 192.168.10.3" "${BESZEL_HUB_WG_IP:-}")"
+      NB_HUBIP="$(ask "Erlaubte Hub-Quell-IP im Tunnel (die der VPS auf ${NB_IFACE} sieht), z. B. 10.0.0.2 - NICHT die LAN-IP" "${BESZEL_HUB_WG_IP:-}")"
       beszel_validate_hub_ip "$NB_HUBIP"; vr=$?
       (( vr == 0 )) && break
       (( vr == 2 )) && { err "0.0.0.0/0 bzw. ::/0 ist NICHT erlaubt - das waere oeffentlich!"; continue; }
@@ -2526,10 +2562,12 @@ beszel_verify_installation() {
     printf '  LISTEN:                   %s\n' "${BESZEL_LISTEN:-<nicht gesetzt>}"
     printf '  Agent-Port:               %s\n' "$port"
     printf '  WireGuard-Interface:      %s\n' "$iface"
-    printf '  Erlaubter Beszel Hub:     %s\n' "${ip:-<nicht gesetzt>}"
+    printf '  Beszel Hub Ziel (im Hub): %s\n' "${VPS_WG_IP:-<VPS_WG_IP>}:${port}"
+    printf '  Erlaubte Quell-IP (UFW):  %s\n' "${ip:-<nicht gesetzt>}"
     printf '  UFW-Regel vorhanden:      %s\n' "$rule"
     printf '  Lauscht auf Port %s:  %s\n' "$port" "$listen"
     printf '  Oeffentliche Freigabe:    %s\n' "$pub"
+    echo   "  Hinweis: Ziel-IP (im Hub) und erlaubte Quell-IP (UFW) sind normalerweise UNTERSCHIEDLICH."
   else
     printf '  HUB_URL gesetzt:          %s\n' "$([[ -n "${BESZEL_HUB_URL:-}" ]] && echo ja || echo nein)"
     printf '  TOKEN gesetzt:            %s\n' "$([[ -n "${BESZEL_TOKEN:-}" ]] && echo ja || echo nein)"
@@ -2598,7 +2636,10 @@ beszel_check_firewall() {
     [[ -z "$(beszel_public_exposure "$port")" ]] && ok "Keine oeffentliche Freigabe fuer Port ${port} vorhanden."
     return 0
   fi
+  echo "Im Beszel Hub eintragen:       ${VPS_WG_IP:-<VPS_WG_IP>}:${port}"
+  echo "Auf VPS erlaubt als Quell-IP:  ${ip:-<keine Hub-IP gesetzt>}  (die IP, die der VPS auf ${iface} sieht)"
   echo "Erwartet: Zugriff NUR von ${ip:-<keine Hub-IP gesetzt>} ueber ${iface} auf Port ${port}."
+  echo "(Ziel-IP im Hub und erlaubte Quell-IP sind normalerweise UNTERSCHIEDLICH - Diagnose: sudo tcpdump -ni ${iface} tcp port ${port})"
   if [[ -n "$ip" ]] && ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/tcp" | grep -F "$iface" | grep -qF "$ip"; then
     ok "Restriktive Regel vorhanden: nur ${ip} ueber ${iface}."
   else
