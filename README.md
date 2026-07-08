@@ -251,20 +251,41 @@ als systemd-Service installieren. Der Agent wird **nie automatisch** installiert
 sondern nur ueber `Hauptmenue -> Monitoring / Beszel Agent` bzw.
 `sudo homeedge monitoring`.
 
-**Sicherheitsprinzip:** Der Agent-Port (Default `45876`, konfigurierbar) ist
-**ausschliesslich ueber den WireGuard-Tunnel** erreichbar - nie oeffentlich
-(weder IPv4 noch IPv6).
+**Sicherheitsprinzip:** Der Beszel Hub laeuft zu Hause (z. B. auf dem
+Docker-/Jellyfin-Host) und fragt den Agent auf dem VPS ueber den WireGuard-Tunnel
+ab. Der Agent-Port (Default `45876`, konfigurierbar) ist daher **ausschliesslich
+fuer die WireGuard-IP des Hub** freigegeben - nie oeffentlich (weder IPv4 noch
+IPv6) und **nicht** fuer beliebige WireGuard-Clients.
 
-- Gesetzt wird nur eine restriktive UFW-Regel gebunden an das WireGuard-Interface:
-  `ufw allow in on <WG_IF> to any port 45876 proto tcp comment 'Beszel Agent via WireGuard only'`.
-  Kein `0.0.0.0/0`, kein `::/0`.
-- Findet HomeEdge eine bestehende **oeffentliche** Freigabe fuer den Port, warnt
-  es und bietet an, sie zu entfernen (nichts wird ungefragt geloescht).
-- Nach der Installation zeigt HomeEdge eine klare Pruefung: Dienst aktiv (ja/nein),
-  lauscht auf dem Port (ja/nein), UFW erlaubt den Port nur ueber WireGuard (ja/nein),
-  oeffentliche Freigabe gefunden (ja/nein) - bei oeffentlicher Freigabe ein harter Fehler.
-- Konfiguration liegt in `/etc/homeedge/beszel.env` (`chmod 600`); `KEY` und
-  `TOKEN` werden verdeckt eingelesen und in Status/Logs maskiert. Es wird **kein**
+```text
+Erlaubt:      Beszel-Hub-WG-IP -> WireGuard-Interface -> Beszel-Agent-Port
+Nicht erlaubt: Internet -> oeffentliche VPS-IP -> Port
+              IPv6 oeffentlich -> VPS -> Port
+              beliebige WireGuard-Clients -> Port
+```
+
+- Gesetzt wird genau **eine** restriktive UFW-Regel, eingeschraenkt auf Interface
+  **und** Hub-IP:
+  `ufw allow in on <WG_IFACE> from <BESZEL_HUB_WG_IP> to any port <PORT> proto tcp comment 'Homeedge Beszel Agent'`.
+  Kein pauschales `ufw allow 45876/tcp`, kein `from any`, kein `0.0.0.0/0`/`::/0`
+  und keine reine Interface-Bindung ohne `from`.
+- **Port oder Hub-IP aendern** (`beszel-reconfigure`): HomeEdge liest die alten
+  Werte aus `/etc/homeedge/beszel.env`, entfernt die alte UFW-Regel, schreibt die
+  neue Konfiguration, setzt die neue restriktive Regel und startet den Agent neu.
+  Fehler beim Entfernen einer nicht (mehr) existierenden Regel werden ignoriert.
+- Validierung: Port nur 1-65535, Hub-IP darf nicht leer sein, `0.0.0.0/0` und
+  `::/0` werden abgelehnt, das WireGuard-Interface muss existieren (`ip link show`).
+- Findet HomeEdge eine bestehende **oeffentliche/zu weite** Freigabe fuer den Port,
+  warnt es und bietet an, sie zu entfernen - **fremde Regeln werden nie ungefragt
+  geloescht**.
+- Der Status zeigt: Agent installiert (ja/nein), Service aktiv (ja/nein),
+  Agent-Port, WireGuard-Interface, erlaubter Beszel Hub, UFW-Regel vorhanden
+  (ja/nein), oeffentliche Freigabe gefunden (ja/nein), lauscht auf dem Port
+  (ja/nein) - bei oeffentlicher Freigabe ein harter Fehler.
+- Konfiguration liegt in `/etc/homeedge/beszel.env` (`chmod 600`) mit `KEY`,
+  `TOKEN`, `HUB_URL`, `BESZEL_AGENT_PORT`, `BESZEL_HUB_WG_IP`, `BESZEL_WG_IFACE`.
+  `KEY`/`TOKEN` werden verdeckt eingelesen und in Status/Logs maskiert. Fuer die
+  Firewall zaehlt **nur** `BESZEL_HUB_WG_IP`, nie `HUB_URL`. Es wird **kein**
   Beszel Hub installiert.
 - Das Binary wird passend zur Architektur (amd64/arm64/armv7) heruntergeladen und
   atomar installiert; ein fehlgeschlagener Download laesst das alte Binary intakt.
@@ -272,21 +293,29 @@ sondern nur ueber `Hauptmenue -> Monitoring / Beszel Agent` bzw.
 Menue / CLI:
 
 ```text
-1) Installieren       4) Neu starten        7) Firewall auf WireGuard einschraenken
-2) Status             5) Aktualisieren
-3) Logs (-f)          6) Deinstallieren
+1) Installieren                          5) Neu starten
+2) Konfigurieren / Port oder Hub-IP      6) Aktualisieren
+3) Status                                7) Deinstallieren
+4) Logs (-f)                             8) Firewall-Regeln pruefen
 ```
 
 ```bash
-sudo homeedge beszel-install    # abfragen: KEY, TOKEN, HUB_URL, LISTEN-Port (Default 45876)
-sudo homeedge beszel-status     # Dienst-/Port-/UFW-Status
-sudo homeedge beszel-logs -f    # journalctl -u beszel-agent -f (maskiert)
-sudo homeedge beszel-lockdown   # Firewall erneut auf WireGuard einschraenken
-sudo homeedge beszel-uninstall  # fragt pro Artefakt (Binary, env, UFW-Regel) einzeln
+sudo homeedge beszel-install         # abfragen: KEY, TOKEN, HUB_URL, Agent-Port
+                                     # (Default 45876), WG-Interface, Hub-WG-IP
+sudo homeedge beszel-reconfigure     # Port/Hub-IP/Interface aendern (alte Regel raus, neue rein)
+sudo homeedge beszel-status          # Agent-/Port-/Interface-/UFW-Status
+sudo homeedge beszel-logs -f         # journalctl -u beszel-agent -f (maskiert)
+sudo homeedge beszel-check-firewall  # Regeln pruefen / restriktive Regel (neu) setzen
+sudo homeedge beszel-uninstall       # fragt pro Artefakt (Binary, env, UFW-Regel) einzeln
 ```
 
-**Akzeptanz:** Nach der Installation ist der Agent ueber die oeffentliche VPS-IP
-nicht erreichbar, nur ueber WireGuard.
+Bei der Deinstallation wird der Service gestoppt/deaktiviert, die systemd-Unit und
+genau die eigene Beszel-UFW-Regel (anhand der gespeicherten Werte) entfernt;
+Binary und `beszel.env` optional. Andere Firewall-Regeln bleiben unangetastet.
+
+**Akzeptanz:** Nach der Installation ist der Agent-Port ueber die oeffentliche
+VPS-IP nicht erreichbar (weder IPv4 noch IPv6), sondern nur von der angegebenen
+Beszel-Hub-WireGuard-IP ueber das WireGuard-Interface.
 
 ## Security-Check
 
@@ -330,17 +359,35 @@ curl -vk --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
 ```
 
 `homeedge reload` erzeugt das Caddyfile zuerst als `Caddyfile.generated`,
-validiert es in einem Wegwerf-Container (ohne die produktive Datei zu mounten),
-formatiert und validiert erneut, und ersetzt die produktive `/opt/caddy-edge/Caddyfile`
-nur bei Erfolg. Danach wird die aktive Config wirklich neu geladen
-(`caddy reload`, notfalls `up -d --force-recreate`) und bis zu 120 s auf das
-Zertifikat gewartet (DNS-01 kann dauern). Ein noch ausstehendes Zertifikat ist
-eine Warnung; ein eindeutiger ACME-Fehler fuehrt zu Exitcode != 0. Schlaegt das
-Validate fehl, bleibt die alte Caddyfile aktiv und der echte `caddy validate`-
-Fehler wird angezeigt und nach `/var/log/homeedge/caddy-validate.log`
-geschrieben (fehlerhafte Version als `/opt/caddy-edge/Caddyfile.failed`).
-`sudo homeedge caddy-rebuild` erzeugt den kompletten Stack neu, wenn er fehlt
-oder kaputt ist.
+validiert es in einem Wegwerf-Container gegen das **bereits vorhandene** Image
+(ohne die produktive Datei zu mounten), formatiert und validiert erneut, und
+ersetzt die produktive `/opt/caddy-edge/Caddyfile` nur bei Erfolg. Danach wird die
+aktive Config wirklich neu geladen (`caddy reload`, notfalls
+`up -d --force-recreate`).
+
+**Der normale Reload baut nie ein Docker-Image.** Ist `homeedge-caddy:local`
+vorhanden, startet weder `homeedge reload` noch die Migration jemals ein
+`docker compose build`. Ein Image-Build laeuft ausschliesslich bei
+Erstinstallation, `sudo homeedge caddy-rebuild`, `caddy-update` oder dem
+Menuepunkt "Caddy neu bauen". Validate, `caddy fmt` und `caddy reload` haben je
+ein Timeout von 20 s, damit ein kleiner VPS nicht haengt.
+
+HomeEdge unterscheidet die Fehlerursachen klar, statt pauschal "Caddyfile
+ungueltig" zu melden: **wirklich ungueltige Caddyfile** (die alte bleibt aktiv,
+fehlerhafte Version als `/opt/caddy-edge/Caddyfile.failed`, echter
+`caddy validate`-Output in `/var/log/homeedge/caddy-validate.log`), **Image
+fehlt** bzw. **Cloudflare-Modul fehlt im Image** (Hinweis auf
+`sudo homeedge caddy-rebuild`), **Validate-Timeout** oder **Abbruch (CTRL+C)**. In
+diesen umgebungsbedingten Faellen bleibt die produktive Caddyfile aktiv, und eine
+Migration gilt **nicht** als kaputt, solange Caddy laeuft und die produktive
+Config valide ist.
+
+Der Zertifikatscheck ist beim normalen Reload **kurz** (max. 15 s), damit der
+Reload nicht blockiert; ein noch ausstehendes Zertifikat ist nur eine Warnung, ein
+eindeutiger ACME-Fehler fuehrt zu Exitcode != 0. Der **lange** Check (bis 120 s,
+DNS-01 kann dauern) laeuft nur nach Rebuild/Update oder ueber `sudo homeedge certs`
+("Zertifikate pruefen"). `sudo homeedge caddy-rebuild` erzeugt den kompletten
+Stack neu, wenn er fehlt oder kaputt ist.
 
 ## Cloudflare API Token
 
