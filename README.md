@@ -376,12 +376,16 @@ im **WebSocket-Modus**:
 KEY="ssh-ed25519 AAAA..."
 HUB_URL="https://beszel.example.de"
 TOKEN="..."
-LISTEN=""
+LISTEN="127.0.0.1:45876"   # an Loopback gebunden - kein oeffentlicher Listener
 BESZEL_MODE="websocket"
 BESZEL_AGENT_PORT="45876"
 BESZEL_WG_IFACE=""
 BESZEL_HUB_WG_IP=""
 ```
+
+Im WebSocket-Modus bindet HomeEdge den Agent bewusst an `127.0.0.1`, damit er
+auch bei inaktiver/falsch konfigurierter UFW **nicht** oeffentlich erreichbar ist
+(der Agent verbindet sich aktiv zum Hub und braucht keinen eingehenden Listener).
 
 Bei der Deinstallation wird der Service gestoppt/deaktiviert, die systemd-Unit und
 genau die eigene Beszel-UFW-Regel (anhand der gespeicherten Werte) entfernt;
