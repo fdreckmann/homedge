@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.20-homeedge"
+APP_VERSION="0.9.21-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -1810,7 +1810,9 @@ add_service() {
 edit_service() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
   validate_services_file >/dev/null 2>&1 || { err "services.tsv ist ungueltig. Bitte zuerst: sudo homeedge repair-services"; return 1; }
-  list_services; local num; num="$(ask "Nummer aendern")"; mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
+  list_services; local num; num="$(ask "Nummer aendern")"
+  [[ "$num" =~ ^[0-9]+$ ]] || { err "Ungueltige Nummer."; return 1; }
+  mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
   local old_domain old_scheme old_ip old_port old_profile; IFS=$'\t' read -r old_domain old_scheme old_ip old_port old_profile <<< "${lines[$idx]}"
   local domain scheme ip port profile
@@ -1830,7 +1832,9 @@ edit_service() {
 delete_service() {
   [[ -f "$SERVICES_FILE" && -s "$SERVICES_FILE" ]] || { warn "Keine Dienste vorhanden."; return; }
   validate_services_file >/dev/null 2>&1 || { err "services.tsv ist ungueltig. Bitte zuerst: sudo homeedge repair-services"; return 1; }
-  list_services; local num; num="$(ask "Nummer loeschen")"; mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
+  list_services; local num; num="$(ask "Nummer loeschen")"
+  [[ "$num" =~ ^[0-9]+$ ]] || { err "Ungueltige Nummer."; return 1; }
+  mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
   maybe_backup_before_change
   local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
@@ -2143,17 +2147,39 @@ beszel_validate_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535
 beszel_validate_wg_iface() { [[ -n "${1:-}" ]] && ip link show "$1" >/dev/null 2>&1; }
 
 # Hub-IP/CIDR: IPv4/IPv6/CIDR, nicht leer. 0=ok, 1=Formatfehler, 2=verboten (0.0.0.0/0 ::/0).
+# CIDR-Bits werden sauber geprueft: IPv4 /0-/32, IPv6 /0-/128.
 beszel_validate_hub_ip() {
-  local ip="${1:-}" host o
+  local ip="${1:-}" host o pfx
   [[ -n "$ip" ]] || return 1
   case "$ip" in 0.0.0.0/0|::/0|0.0.0.0|::) return 2 ;; esac
-  if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]{1,2})?$ ]]; then
+  if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]{1,3})?$ ]]; then
     host="${ip%%/*}"
     for o in ${host//./ }; do (( o >= 0 && o <= 255 )) || return 1; done
+    if [[ "$ip" == */* ]]; then pfx="${ip##*/}"; (( pfx >= 0 && pfx <= 32 )) || return 1; fi
     return 0
   fi
-  # grobe IPv6(/CIDR)-Pruefung: Hex-Gruppen mit Doppelpunkt
-  [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] && return 0
+  # IPv6(/CIDR): Hex-Gruppen mit Doppelpunkt; Prefix 0-128.
+  if [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]]; then
+    if [[ "$ip" == */* ]]; then pfx="${ip##*/}"; (( pfx >= 0 && pfx <= 128 )) || return 1; fi
+    return 0
+  fi
+  return 1
+}
+
+# Validiert eine LISTEN-Bind-IP (ohne Port): leer ODER einzelne IPv4/IPv6 (KEIN
+# CIDR, KEIN Hostname, KEINE Sonderzeichen/Leerzeichen). 0 = ok.
+beszel_validate_listen_ip() {
+  local ip="${1:-}" o
+  [[ -z "$ip" ]] && return 0
+  # keine Shell-Sonderzeichen / Whitespace / CIDR
+  [[ "$ip" == */* ]] && return 1
+  [[ "$ip" =~ [[:space:]\;\$\`\"\'\\\&\|\<\>\(\)] ]] && return 1
+  if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    for o in ${ip//./ }; do (( o >= 0 && o <= 255 )) || return 1; done
+    return 0
+  fi
+  # IPv6 (ohne Zone/Prefix)
+  [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+$ ]] && return 0
   return 1
 }
 
@@ -2199,6 +2225,24 @@ beszel_listens_wildcard() {
   command -v ss >/dev/null 2>&1 || return 1
   ss -H -ltn "sport = :${port}" 2>/dev/null \
     | grep -qE '(\*|0\.0\.0\.0|\[::\]|::):'"${port}"'([[:space:]]|$)'
+}
+
+# Lauscht der Agent AUSSCHLIESSLICH auf Loopback (127.0.0.0/8 / ::1)? 0 = ja.
+# Ein reiner Loopback-Listener ist von aussen nie erreichbar (auch ohne UFW).
+beszel_listens_only_loopback() {
+  local port="$1" addrs a host
+  command -v ss >/dev/null 2>&1 || return 1
+  addrs="$(ss -H -ltn "sport = :${port}" 2>/dev/null | awk '{print $4}')"
+  [[ -z "$addrs" ]] && return 1   # lauscht gar nicht -> nicht "nur loopback"
+  while read -r a; do
+    [[ -z "$a" ]] && continue
+    host="${a%:*}"; host="${host#[}"; host="${host%]}"
+    case "$host" in
+      127.*|::1) : ;;             # loopback ok
+      *) return 1 ;;              # eine Nicht-Loopback-Adresse -> false
+    esac
+  done <<< "$addrs"
+  return 0
 }
 
 # Ist ein Host eine private/LAN-/Loopback-Adresse oder ein lokaler Hostname?
@@ -2367,9 +2411,20 @@ _beszel_prompt_config() {
       break
     done
     # Lokale Listen-IP: bevorzugt an die VPS-WireGuard-IP binden (nicht oeffentlich).
+    # Nur leer oder eine EINZELNE gueltige IPv4/IPv6 - kein Hostname/CIDR/Sonderzeichen.
     local def_ip="${VPS_WG_IP:-}" lip
-    lip="$(ask "Lokale Listen-IP (leer = alle Interfaces; Default VPS-WireGuard-IP)" "$def_ip")"
-    if [[ -n "$lip" ]]; then NB_LISTEN="${lip}:${NB_PORT}"; else NB_LISTEN="${NB_PORT}"; fi
+    while :; do
+      lip="$(ask "Lokale Listen-IP (leer = alle Interfaces; Default VPS-WireGuard-IP)" "$def_ip")"
+      beszel_validate_listen_ip "$lip" && break
+      err "Ungueltige Listen-IP. Erlaubt: leer oder einzelne IPv4/IPv6 (kein Hostname, kein CIDR, keine Sonderzeichen)."
+    done
+    if [[ -z "$lip" ]]; then
+      NB_LISTEN="${NB_PORT}"
+    elif [[ "$lip" == *:* ]]; then
+      NB_LISTEN="[${lip}]:${NB_PORT}"   # IPv6 in eckigen Klammern
+    else
+      NB_LISTEN="${lip}:${NB_PORT}"
+    fi
   else
     # WebSocket: HUB_URL + TOKEN Pflicht, KEINE eingehende Regel/Interface/Hub-IP.
     local host
@@ -2393,8 +2448,12 @@ _beszel_prompt_config() {
     rawtok="$(ask_secret "Beszel Registrations-TOKEN$([[ "$op" == reconfigure ]] && echo ' (leer = unveraendert)')")"
     NB_TOKEN="$(_beszel_sanitize_line "$rawtok")"
     [[ -z "$NB_TOKEN" && "$op" == reconfigure ]] && NB_TOKEN="$BESZEL_TOKEN"
-    # Port nur informativ (kein Listener noetig); LISTEN bleibt leer.
     NB_PORT="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}"
+    # WICHTIG: LISTEN NICHT leer lassen. Ein leeres LISTEN kann dazu fuehren, dass
+    # der Agent auf dem Default-Port auf *:PORT (alle Interfaces) lauscht. Im
+    # WebSocket-Modus verbindet sich der Agent aktiv zum Hub und braucht KEINEN
+    # oeffentlichen Listener -> fest an Loopback binden.
+    NB_LISTEN="127.0.0.1:${NB_PORT}"
   fi
 }
 
@@ -2705,13 +2764,14 @@ beszel_verify_installation() {
     info "Bereinigen: sudo homeedge beszel-check-firewall"
     return 1
   fi
-  # UFW inaktiv + Agent lauscht -> Port ist NICHT durch die Firewall geschuetzt.
-  if [[ "$listen" == "ja" && "$ufwact" == "nein" ]]; then
-    err "ACHTUNG: Agent lauscht auf Port ${port}, aber UFW ist INAKTIV!"
+  # UFW inaktiv + Agent lauscht NICHT-nur-Loopback -> Port ist NICHT durch die
+  # Firewall geschuetzt. Ein reiner Loopback-Listener (127.0.0.1/::1) ist harmlos.
+  if [[ "$listen" == "ja" && "$ufwact" == "nein" ]] && ! beszel_listens_only_loopback "$port"; then
+    err "ACHTUNG: Agent lauscht extern erreichbar auf Port ${port}, aber UFW ist INAKTIV!"
     if [[ "$wild" == "ja" ]]; then
       err "Der Agent lauscht auf einer Wildcard-Adresse (*:${port}) - Port waere oeffentlich erreichbar."
     else
-      err "Ohne aktive Firewall ist der Port nicht auf die Hub-IP eingeschraenkt."
+      err "Ohne aktive Firewall ist der Port nicht auf die Hub-IP eingeschraenkt (jeder WireGuard-Client/LAN-Host koennte zugreifen)."
     fi
     info "UFW aktivieren: sudo homeedge firewall   |   Regeln: sudo homeedge beszel-check-firewall"
     return 1
@@ -2763,12 +2823,37 @@ beszel_check_firewall() {
   echo "== Aktuelle UFW-Regeln fuer Port ${port} =="
   ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/(tcp|udp)" | sed 's/^/  /' || echo "  (keine)"
   echo
+  # Gemeinsame Laufzeit-Fakten (beide Modi).
+  local ufwact="nein" listen="nein" wild="nein" pubfound="nein"
+  command -v ufw >/dev/null 2>&1 && ufw_is_active && ufwact="ja"
+  command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . && listen="ja"
+  beszel_listens_wildcard "$port" && wild="ja"
+  [[ -n "$(beszel_public_exposure "$port")" ]] && pubfound="ja"
+  printf '  UFW aktiv: %s   Agent lauscht: %s   Wildcard *:%s: %s   Oeffentliche Regel: %s\n' \
+    "$ufwact" "$listen" "$port" "$wild" "$pubfound"
+  echo
   if [[ "$mode" == "websocket" ]]; then
     info "WebSocket-Modus: KEINE eingehende UFW-Regel fuer Port ${port} noetig."
-    # Nur wirklich zu weite Freigaben anbieten zu entfernen.
-    beszel_remove_public_exposure "$port"
-    [[ -z "$(beszel_public_exposure "$port")" ]] && ok "Keine oeffentliche Freigabe fuer Port ${port} vorhanden."
-    return 0
+    local ws_rc=0
+    if beszel_listens_only_loopback "$port"; then
+      ok "Agent lauscht nur auf Loopback (nicht extern erreichbar) - im WebSocket-Modus korrekt."
+    elif [[ "$wild" == "ja" && "$ufwact" == "nein" ]]; then
+      err "ACHTUNG: Agent lauscht auf *:${port} und UFW ist INAKTIV - Port waere oeffentlich erreichbar!"
+      info "UFW aktivieren: sudo homeedge firewall"
+      info "Oder Agent an Loopback binden: sudo homeedge beszel-reconfigure (WebSocket setzt LISTEN=127.0.0.1:${port})"
+      ws_rc=1
+    elif [[ "$listen" == "ja" && "$ufwact" == "nein" ]]; then
+      warn "Agent lauscht extern auf Port ${port} und UFW ist inaktiv - bitte UFW aktivieren oder Bind pruefen."
+      ws_rc=1
+    fi
+    # Oeffentliche/zu weite UFW-Regel -> ROT + Entfernung anbieten.
+    if [[ "$pubfound" == "ja" ]]; then
+      err "Oeffentliche/zu weite UFW-Freigabe fuer Port ${port} gefunden (im WebSocket-Modus nicht noetig)."
+      beszel_remove_public_exposure "$port"
+      [[ -n "$(beszel_public_exposure "$port")" ]] && ws_rc=1
+    fi
+    [[ -z "$(beszel_public_exposure "$port")" && "$ws_rc" == "0" ]] && ok "WebSocket-Firewall OK: keine oeffentliche Erreichbarkeit fuer Port ${port}."
+    return "$ws_rc"
   fi
   echo "Im Beszel Hub eintragen:       ${VPS_WG_IP:-<VPS_WG_IP>}:${port}"
   echo "Auf VPS erlaubt als Quell-IP:  ${ip:-<keine Hub-IP gesetzt>}  (die IP, die der VPS auf ${iface} sieht)"
