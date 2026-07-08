@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.14-homeedge"
+APP_VERSION="0.9.15-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -106,6 +106,9 @@ caddy_is_running() {
 # docker compose fuer den Caddy-Stack mit explizitem Compose-Pfad (cwd-unabhaengig).
 caddy_compose() { docker compose -f "$CADDY_COMPOSE_FILE" "$@"; }
 caddy_compose_file_exists() { [[ -f "$CADDY_COMPOSE_FILE" ]]; }
+# Prueft, ob das lokale Caddy-Image bereits gebaut vorliegt (OHNE es zu bauen).
+# Der normale Reload/Validate darf NIE bauen - nur pruefen.
+caddy_image_exists() { docker image inspect "$CADDY_IMAGE" >/dev/null 2>&1; }
 # Granulare Zustandspruefung des Caddy-Stacks. Gibt genau einen Status aus:
 #   dir_missing | caddyfile_missing | env_missing | compose_missing |
 #   compose_invalid | no_container | restarting | exited | running
@@ -613,6 +616,19 @@ caddy_build_image() {
   caddy_compose build >/dev/null 2>&1
 }
 
+# Stellt sicher, dass das Caddy-Image existiert. Baut es NUR, wenn es fehlt
+# (Erstinstallation / Restore). Der normale Reload/Validate ruft dies NICHT auf -
+# dort darf nie gebaut werden. 0 = Image vorhanden (ggf. frisch gebaut).
+caddy_ensure_image() {
+  caddy_image_exists && return 0
+  info "Caddy-Image ${CADDY_IMAGE} fehlt - wird einmalig gebaut (Erstinstallation, das kann dauern)..."
+  _ensure_caddyfile_not_dir
+  write_caddy_stack
+  if caddy_build_image; then ok "Caddy-Image gebaut: ${CADDY_IMAGE}"; return 0; fi
+  err "Caddy-Image-Build fehlgeschlagen."
+  return 1
+}
+
 # Prueft, ob ${CADDY_IMAGE} das caddy-dns/cloudflare-Modul enthaelt.
 caddy_has_cloudflare_module() {
   docker run --rm --entrypoint caddy "$CADDY_IMAGE" list-modules 2>/dev/null \
@@ -631,29 +647,49 @@ validate_caddyfile() {
 # Install die Ursache fuer "not a directory: ... /etc/caddy/Caddyfile".
 # Schreibt den echten (maskierten) Output nach CADDY_VALIDATE_LOG und in
 # CADDY_VALIDATE_OUTPUT. 0 = gueltig.
+# CADDY_VALIDATE_STATUS klassifiziert das Ergebnis fuer aufrufende Funktionen:
+#   ok | file_missing | image_missing | module_missing | timeout | aborted | invalid
 CADDY_VALIDATE_OUTPUT=""
+CADDY_VALIDATE_STATUS=""
+CADDY_VALIDATE_TIMEOUT="${CADDY_VALIDATE_TIMEOUT:-20}"
 _validate_caddyfile_path() {
   local f="$1" rc envargs=()
   CADDY_VALIDATE_OUTPUT=""
-  [[ -f "$f" ]] || { CADDY_VALIDATE_OUTPUT="Datei nicht gefunden (oder kein File): $f"; return 1; }
+  CADDY_VALIDATE_STATUS=""
+  [[ -f "$f" ]] || { CADDY_VALIDATE_OUTPUT="Datei nicht gefunden (oder kein File): $f"; CADDY_VALIDATE_STATUS="file_missing"; return 1; }
   mkdir -p "$HOMEEDGE_LOG_DIR" 2>/dev/null || true
-  # Image (mit caddy-dns/cloudflare) sicherstellen, bevor validiert wird.
-  if ! caddy_build_image; then
-    CADDY_VALIDATE_OUTPUT="docker compose build fehlgeschlagen (Caddy-Image konnte nicht gebaut werden)."
+  # WICHTIG: Der Validate-/Reload-Pfad baut NIE ein Image. Ist das Image nicht
+  # vorhanden, wird sauber gemeldet (kein "Caddyfile ungueltig") und auf den
+  # expliziten Rebuild verwiesen.
+  if ! caddy_image_exists; then
+    CADDY_VALIDATE_OUTPUT="Caddy-Image ${CADDY_IMAGE} fehlt - einmalig bauen: sudo homeedge caddy-rebuild"
+    CADDY_VALIDATE_STATUS="image_missing"
     { echo "[$(date -Is)] ${CADDY_VALIDATE_OUTPUT}"; echo "----"; } >> "$CADDY_VALIDATE_LOG" 2>/dev/null || true
     return 1
   fi
   [[ -f "${CADDY_DIR}/.env" ]] && envargs=(--env-file "${CADDY_DIR}/.env")
   # WICHTIG: NUR die generierte Datei mounten (kein Service-Volume) und
   # --adapter caddyfile erzwingen (sonst wird die Datei als JSON interpretiert).
-  # rc defensiv erfassen: eine Befehlssubstitutions-Zuweisung wuerde unter set -e
-  # sonst das Script beenden, statt sauber 1 zurueckzugeben.
+  # timeout schuetzt einen kleinen VPS vor Haengern; rc defensiv erfassen, da
+  # eine Befehlssubstitutions-Zuweisung unter set -e sonst das Script beendet.
   rc=0
-  CADDY_VALIDATE_OUTPUT="$(docker run --rm "${envargs[@]}" \
+  CADDY_VALIDATE_OUTPUT="$(timeout "${CADDY_VALIDATE_TIMEOUT}" docker run --rm "${envargs[@]}" \
     -v "${f}:/etc/caddy/Caddyfile:ro" --entrypoint caddy "$CADDY_IMAGE" \
     validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)" || rc=$?
+  if (( rc == 0 )); then
+    CADDY_VALIDATE_STATUS="ok"
+  elif (( rc == 124 )); then
+    CADDY_VALIDATE_STATUS="timeout"
+    CADDY_VALIDATE_OUTPUT="Validate-Timeout nach ${CADDY_VALIDATE_TIMEOUT}s (Docker/VPS ueberlastet?). ${CADDY_VALIDATE_OUTPUT}"
+  elif (( rc == 130 || rc == 137 || rc == 143 )); then
+    CADDY_VALIDATE_STATUS="aborted"
+  elif grep -qiE 'cloudflare|getting dns provider|unknown dns provider' <<<"${CADDY_VALIDATE_OUTPUT}"; then
+    CADDY_VALIDATE_STATUS="module_missing"
+  else
+    CADDY_VALIDATE_STATUS="invalid"
+  fi
   {
-    echo "[$(date -Is)] caddy validate (rc=${rc}) fuer ${f}"
+    echo "[$(date -Is)] caddy validate (rc=${rc}, status=${CADDY_VALIDATE_STATUS}) fuer ${f}"
     printf '%s\n' "$CADDY_VALIDATE_OUTPUT"
     echo "----"
   } 2>/dev/null | mask_secrets >> "$CADDY_VALIDATE_LOG" 2>/dev/null || true
@@ -678,13 +714,17 @@ caddy_acme_error_for_domain() {
     | grep -qiE 'could not get certificate|obtain(ing)? certificate.*(fail|error)|challenge failed|authorization (failed|error)|"level":"error"|invalid (api )?token|unauthorized|no solvers|acme.*error'
 }
 
-# Wartet nach einem Reload bis zu 120s, bis Zertifikate aktiv sind (DNS-01 dauert).
+# Wartet nach einem Reload, bis Zertifikate aktiv sind (DNS-01 dauert).
+# $1 = maximale Wartezeit in Sekunden (Default 120). Beim normalen Reload wird
+# ein KURZER Check (15s) genutzt; der lange Check (120s) nur nach explizitem
+# Rebuild/Update oder ueber den Menuepunkt "Zertifikate pruefen".
 wait_for_certs() {
   load_env
   [[ -s "$SERVICES_FILE" ]] || return 0
   if ! command -v openssl >/dev/null 2>&1; then info "openssl fehlt - Zertifikatscheck uebersprungen."; return 0; fi
-  local deadline=$((SECONDS+120)) domain _s _i _p pending
-  info "Pruefe Zertifikate lokal per SNI (bis zu 120s, DNS-01 kann dauern)..."
+  local max="${1:-120}"
+  local deadline=$((SECONDS+max)) domain _s _i _p pending
+  info "Pruefe Zertifikate lokal per SNI (bis zu ${max}s, DNS-01 kann dauern)..."
   while :; do
     pending=0
     while IFS=$'\t' read -r domain _s _i _p _pr || [[ -n "$domain" ]]; do
@@ -719,12 +759,19 @@ wait_for_certs() {
 # Schreibt Stack, generiert das Caddyfile atomar aus der Service-Liste, prueft
 # Vollstaendigkeit und validiert. 0 = ok (neues Caddyfile aktiv), 1 = Fehler
 # (auf vorherige Version zurueckgerollt, nichts kaputt).
+# CADDY_PREPARE_STATUS teilt Aufrufern mit, WARUM die Vorbereitung fehlschlug:
+#   ok | services_invalid | gen_failed | incomplete | validate_invalid | validate_env
+# "validate_env" = umgebungsbedingt (Image fehlt / Timeout / Abbruch) - die
+# produktive Config ist NICHT kaputt, daher kein harter Migrationsfehler.
+CADDY_PREPARE_STATUS=""
 _caddy_prepare_config() {
   load_env
+  CADDY_PREPARE_STATUS=""
   # services.tsv ZWINGEND validieren, bevor irgendetwas generiert wird.
   if ! validate_services_file; then
     err "services.tsv ist ungueltig - Caddyfile wird NICHT neu erzeugt, letzte Version bleibt aktiv."
     err "Bitte ausfuehren: sudo homeedge repair-services"
+    CADDY_PREPARE_STATUS="services_invalid"
     return 1
   fi
   # Falsch angelegtes Caddyfile-Verzeichnis sichern, dann Stack schreiben.
@@ -736,7 +783,7 @@ _caddy_prepare_config() {
   local cf="${CADDY_DIR}/Caddyfile" gen="${CADDY_DIR}/Caddyfile.generated"
   generate_caddyfile_to "$gen"
   # Datei-Sanity: existiert, ist Datei, nicht leer, lesbar.
-  if [[ ! -s "$gen" || -d "$gen" ]]; then err "Caddyfile.generated konnte nicht sauber erzeugt werden."; rm -f "$gen" 2>/dev/null || true; return 1; fi
+  if [[ ! -s "$gen" || -d "$gen" ]]; then err "Caddyfile.generated konnte nicht sauber erzeugt werden."; rm -f "$gen" 2>/dev/null || true; CADDY_PREPARE_STATUS="gen_failed"; return 1; fi
   chmod 644 "$gen" 2>/dev/null || true
   # Vollstaendigkeit pruefen: grep -F (Fixstring), KEIN Regex mit Domain-Inhalt,
   # damit Wildcard-Domains wie *.example.de sicher gematcht werden (Bug P2).
@@ -747,29 +794,58 @@ _caddy_prepare_config() {
       grep -Fq "${d} {" "$gen" || { err "Domain fehlt im generierten Caddyfile: $d"; missing=1; }
     done < "$SERVICES_FILE"
   fi
-  if (( missing )); then rm -f "$gen"; err "Abbruch: Caddyfile unvollstaendig, nichts geaendert."; return 1; fi
+  if (( missing )); then rm -f "$gen"; err "Abbruch: Caddyfile unvollstaendig, nichts geaendert."; CADDY_PREPARE_STATUS="incomplete"; return 1; fi
   # GENERATED-Datei VOR dem produktiven Ersetzen validieren. Nur bei OK ersetzen.
+  # WICHTIG: Sauber unterscheiden zwischen einer WIRKLICH ungueltigen Caddyfile
+  # und umgebungsbedingten Fehlern (Image fehlt / Modul fehlt / Timeout / Abbruch).
+  # Nur bei "invalid" wird die generierte Datei als .failed gesichert.
   if ! _validate_caddyfile_path "$gen"; then
-    # Fehlerhafte Datei zur Analyse aufheben (Bug P1: echten Fehler sichtbar machen).
-    cp -a "$gen" "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null || true
-    rm -f "$gen"
-    err "Neue Caddyfile ist ungueltig - die produktive Caddyfile bleibt unveraendert."
-    err "Caddy validate:"
-    printf '%s\n' "${CADDY_VALIDATE_OUTPUT:-(kein Output)}" | mask_secrets | sed 's/^/    /'
-    info "Fehlerhafte Datei gespeichert: ${CADDY_DIR}/Caddyfile.failed"
-    info "Log: ${CADDY_VALIDATE_LOG}"
-    # Haeufige Ursache: Cloudflare-DNS-Modul fehlt im Caddy-Image.
-    if grep -qiE 'cloudflare|getting dns provider|unknown directive|unrecognized directive' <<<"${CADDY_VALIDATE_OUTPUT:-}"; then
-      err "Moeglich: Caddy Cloudflare DNS Modul fehlt im Image."
-      info "Caddy Image neu bauen: sudo homeedge caddy-rebuild"
-    fi
-    return 1
+    case "${CADDY_VALIDATE_STATUS}" in
+      image_missing)
+        rm -f "$gen"
+        err "Caddy-Image ${CADDY_IMAGE} fehlt - Validierung/Reload nicht moeglich (es wird NICHT automatisch gebaut)."
+        info "Einmalig bauen: sudo homeedge caddy-rebuild"
+        info "Die produktive Caddyfile bleibt unveraendert aktiv."
+        CADDY_PREPARE_STATUS="validate_env"
+        return 1 ;;
+      module_missing)
+        rm -f "$gen"
+        err "Caddy Cloudflare DNS Modul fehlt im Image ${CADDY_IMAGE}."
+        info "Caddy Image neu bauen: sudo homeedge caddy-rebuild"
+        info "Die produktive Caddyfile bleibt unveraendert aktiv."
+        CADDY_PREPARE_STATUS="validate_env"
+        return 1 ;;
+      timeout)
+        rm -f "$gen"
+        err "Caddy validate hat das Zeitlimit (${CADDY_VALIDATE_TIMEOUT}s) ueberschritten - Docker/VPS ueberlastet?"
+        info "Spaeter erneut: sudo homeedge reload   |   Neu bauen: sudo homeedge caddy-rebuild"
+        info "Die produktive Caddyfile bleibt unveraendert aktiv."
+        CADDY_PREPARE_STATUS="validate_env"
+        return 1 ;;
+      aborted)
+        rm -f "$gen"
+        warn "Caddy validate wurde abgebrochen (CTRL+C) - keine Aenderung vorgenommen."
+        info "Die produktive Caddyfile bleibt unveraendert aktiv."
+        CADDY_PREPARE_STATUS="validate_env"
+        return 1 ;;
+      *)
+        # Wirklich ungueltige Caddyfile: zur Analyse sichern und hart melden.
+        cp -a "$gen" "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null || true
+        rm -f "$gen"
+        err "Neue Caddyfile ist ungueltig - die produktive Caddyfile bleibt unveraendert."
+        err "Caddy validate:"
+        printf '%s\n' "${CADDY_VALIDATE_OUTPUT:-(kein Output)}" | mask_secrets | sed 's/^/    /'
+        info "Fehlerhafte Datei gespeichert: ${CADDY_DIR}/Caddyfile.failed"
+        info "Log: ${CADDY_VALIDATE_LOG}"
+        CADDY_PREPARE_STATUS="validate_invalid"
+        return 1 ;;
+    esac
   fi
   ok "Config validiert"
   # Formatieren und DANACH erneut validieren (caddy fmt sollte nie etwas kaputt
   # machen - vor Release pruefen wir es trotzdem). Schlaegt das Re-Validate fehl,
   # wird die unformatierte (bereits validierte) Datei genutzt.
-  if docker run --rm -v "${gen}:/etc/caddy/Caddyfile" --entrypoint caddy "$CADDY_IMAGE" fmt --overwrite /etc/caddy/Caddyfile >/dev/null 2>&1; then
+  if timeout "${CADDY_FMT_TIMEOUT:-20}" docker run --rm -v "${gen}:/etc/caddy/Caddyfile" --entrypoint caddy "$CADDY_IMAGE" fmt --overwrite /etc/caddy/Caddyfile >/dev/null 2>&1; then
     if _validate_caddyfile_path "$gen"; then
       ok "Re-Validate nach caddy fmt ok"
     else
@@ -783,6 +859,7 @@ _caddy_prepare_config() {
   # Erfolgreich -> alten Fehlerstand aufraeumen, damit health/verify nicht weiter warnen.
   rm -f "${CADDY_DIR}/Caddyfile.failed" 2>/dev/null || true
   ok "Caddyfile generiert (alle Dienste enthalten)"
+  CADDY_PREPARE_STATUS="ok"
   return 0
 }
 
@@ -794,15 +871,16 @@ reload_caddy() {
   # Aktive Caddy-Konfiguration WIRKLICH neu laden. "up -d" allein laedt eine nur
   # gemountete, geaenderte Caddyfile nicht zuverlaessig -> erst "caddy reload"
   # per exec, sonst Container neu erzeugen (force-recreate).
+  # Reload baut NIE ein Image - _caddy_prepare_config hat bereits gegen ein
+  # vorhandenes Image validiert (sonst waeren wir hier nicht angekommen).
   if caddy_is_running; then
-    if caddy_compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    if timeout "${CADDY_RELOAD_TIMEOUT:-20}" docker compose -f "$CADDY_COMPOSE_FILE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
       ok "Aktive Caddy-Konfig neu geladen (caddy reload)."
     else
-      warn "caddy reload fehlgeschlagen - Container wird neu erzeugt (force-recreate)."
+      warn "caddy reload fehlgeschlagen/timeout - Container wird neu erzeugt (force-recreate)."
       caddy_compose up -d --force-recreate >/dev/null 2>&1 || true
     fi
   else
-    caddy_build_image >/dev/null 2>&1 || true
     caddy_compose up -d >/dev/null 2>&1 || true
   fi
   # Falls der Container trotzdem nicht laeuft: letzter Versuch mit force-recreate.
@@ -810,30 +888,39 @@ reload_caddy() {
     caddy_compose up -d --force-recreate >/dev/null 2>&1 || true
   fi
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
-  # Nur "Container laeuft" reicht nicht: pro Domain lokal per SNI mit Retry
-  # pruefen, dass die (neue) Domain aktiv beantwortet wird / Zertifikat kommt.
+  # Nur "Container laeuft" reicht nicht: KURZER lokaler SNI-Check (max 15s), damit
+  # der normale Reload nicht bis zu 120s blockiert. Der lange Check (120s) laeuft
+  # nur nach Rebuild/Update oder ueber den Menuepunkt "Zertifikate pruefen".
   # wait_for_certs liefert 1 NUR bei eindeutigem ACME-Fehler -> dann auch hier 1
   # (Exitcode != 0), aber der Container/die Config bleiben aktiv.
-  local cert_rc=0; wait_for_certs || cert_rc=$?
+  local cert_rc=0; wait_for_certs "${CADDY_RELOAD_CERT_WAIT:-15}" || cert_rc=$?
   echo
+  info "Zertifikate koennen per DNS-01 laenger dauern - vollstaendig pruefen: sudo homeedge certs"
   info "Test einer Domain: sudo homeedge test-domain DEINE.DOMAIN"
   return $cert_rc
 }
 
-# Wie reload, aber baut das Image neu (build) - mit gleicher Validierung/Rollback.
+# Wie reload, aber baut das Image explizit neu (build) - mit gleicher
+# Validierung/Rollback. Dies ist ein AUSDRUECKLICHER Build-Pfad, daher wird das
+# Image hier ZUERST gebaut (auch wenn es noch fehlt), bevor validiert wird.
 restart_caddy() {
   section "Caddy neu starten / neu bauen"
-  _caddy_prepare_config || return 1
+  load_env
+  _ensure_caddyfile_not_dir
+  write_caddy_stack
   caddy_compose_file_exists || { err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; }
+  # Image zuerst bauen (expliziter Build-Pfad), dann gegen das frische Image
+  # validieren.
+  if ! caddy_build_image; then err "Caddy-Image-Build fehlgeschlagen."; return 1; fi
+  _caddy_prepare_config || return 1
   # --force-recreate erzwingt, dass der Container mit der aktuellen Caddyfile neu
   # startet (statt nur "up").
-  if caddy_build_image && caddy_compose up -d --force-recreate >/dev/null 2>&1; then
-    :
-  else
-    err "Caddy-Build/Start fehlgeschlagen."; return 1
+  if ! caddy_compose up -d --force-recreate >/dev/null 2>&1; then
+    err "Caddy-Start fehlgeschlagen."; return 1
   fi
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
-  local cert_rc=0; wait_for_certs || cert_rc=$?
+  # Nach explizitem Rebuild: langer Zertifikatscheck (bis 120s).
+  local cert_rc=0; wait_for_certs 120 || cert_rc=$?
   return $cert_rc
 }
 
@@ -2574,7 +2661,9 @@ _do_restore() {
   ok "services.tsv valide."
 
   # 5) Caddyfile neu generieren + validieren + reload (blockiert bei Fehler).
+  # Das Image wird NICHT mitgesichert - nach Restore ggf. einmalig bauen.
   if command -v docker >/dev/null 2>&1; then
+    caddy_ensure_image || { err "Caddy-Image konnte nicht gebaut werden - bitte: sudo homeedge caddy-rebuild"; return 1; }
     reload_caddy || { err "Caddy-Reload fehlgeschlagen - bitte pruefen."; return 1; }
   fi
   # 6) Fail2ban (mit Config-Test), WireGuard, UFW.
@@ -2781,7 +2870,14 @@ apply_all() {
   write_wg_config || rc=1
   # Dienst-Werte sind optional (haengen an services.tsv) - kein Apply-Blocker.
   write_unifi_values || true
-  if reload_caddy; then ok "Caddy angewendet"; else err "Caddy Apply fehlgeschlagen"; caddy_ok=0; rc=1; fi
+  # Erstinstallation: Image einmalig bauen, falls es fehlt. Danach laedt reload
+  # nur noch neu (baut nie). Bei Build-Fehler wird kein Reload versucht.
+  if caddy_ensure_image; then
+    if reload_caddy; then ok "Caddy angewendet"; else err "Caddy Apply fehlgeschlagen"; caddy_ok=0; rc=1; fi
+  else
+    err "Caddy-Image konnte nicht gebaut werden - Caddy nicht angewendet."
+    caddy_ok=0; rc=1
+  fi
   install_fail2ban || rc=1
   # WG ist evtl. noch nicht aktivierbar (UniFi PublicKey fehlt) - nicht fatal.
   restart_wg || true
@@ -3482,7 +3578,19 @@ homeedge_migrate() {
   # die laufende produktive Caddyfile unangetastet.
   if (( services_ok )); then
     if command -v docker >/dev/null 2>&1; then
-      reload_caddy || { warn "Caddy-Reload meldete Probleme (siehe oben)."; migration_failed=1; }
+      if ! reload_caddy; then
+        # Umgebungsbedingte Reload-Probleme (Image fehlt / Validate-Timeout /
+        # CTRL+C) duerfen die Migration NICHT hart als kaputt werten, solange
+        # Caddy produktiv laeuft und die produktive Caddyfile valide ist. Nur
+        # eine WIRKLICH ungueltige Config (oder ein Container-Ausfall) ist hart.
+        if [[ "${CADDY_PREPARE_STATUS:-}" == "validate_env" ]] && caddy_is_running && validate_caddyfile; then
+          warn "Caddy-Reload uebersprungen (${CADDY_VALIDATE_STATUS:-umgebungsbedingt}) - produktive Caddyfile laeuft und ist valide."
+          info "Bei fehlendem Image: sudo homeedge caddy-rebuild"
+        else
+          warn "Caddy-Reload meldete Probleme (siehe oben)."
+          migration_failed=1
+        fi
+      fi
     fi
   fi
   # Fail2ban mit Config-Test (best effort, aber Fehler sammeln).
