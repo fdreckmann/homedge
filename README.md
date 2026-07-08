@@ -251,70 +251,114 @@ als systemd-Service installieren. Der Agent wird **nie automatisch** installiert
 sondern nur ueber `Hauptmenue -> Monitoring / Beszel Agent` bzw.
 `sudo homeedge monitoring`.
 
-**Sicherheitsprinzip:** Der Beszel Hub laeuft zu Hause (z. B. auf dem
-Docker-/Jellyfin-Host) und fragt den Agent auf dem VPS ueber den WireGuard-Tunnel
-ab. Der Agent-Port (Default `45876`, konfigurierbar) ist daher **ausschliesslich
-fuer die WireGuard-IP des Hub** freigegeben - nie oeffentlich (weder IPv4 noch
-IPv6) und **nicht** fuer beliebige WireGuard-Clients.
+Beim Setup fragt HomeEdge zuerst den **Betriebsmodus**:
+
+**1) Pull / SSH (empfohlen):** Der Beszel Hub (z. B. auf dem Unraid-/Docker-Host,
+`192.168.10.3`) verbindet sich ueber den WireGuard-Tunnel zum Agent auf dem VPS
+(`10.0.0.1:45876`). Das System wird im Hub manuell hinzugefuegt (Host/IP + Port).
+Benoetigt nur `KEY` (Public Key aus dem Hub), Agent-Port, WG-Interface und die
+WG-IP des Hub - **kein** `HUB_URL`/`TOKEN`.
+
+**2) WebSocket / Token (advanced):** Der Agent verbindet sich **aktiv** zum Hub
+(`https://beszel.example.de`) - sinnvoll, wenn der Hub den Agent nicht direkt
+erreichen kann. Benoetigt `KEY`, `HUB_URL`, `TOKEN`. Es ist **keine** eingehende
+UFW-Regel noetig; HomeEdge prueft nur die ausgehende Erreichbarkeit der `HUB_URL`.
+
+**Sicherheitsprinzip (Pull-Modus):** Der Agent-Port ist **ausschliesslich fuer die
+WireGuard-IP des Hub** freigegeben - nie oeffentlich (weder IPv4 noch IPv6) und
+**nicht** fuer beliebige WireGuard-Clients.
 
 ```text
-Erlaubt:      Beszel-Hub-WG-IP -> WireGuard-Interface -> Beszel-Agent-Port
-Nicht erlaubt: Internet -> oeffentliche VPS-IP -> Port
-              IPv6 oeffentlich -> VPS -> Port
-              beliebige WireGuard-Clients -> Port
+Erlaubt:       Beszel-Hub 192.168.10.3 -> WireGuard/unifi -> VPS 10.0.0.1:45876
+Nicht erlaubt: Internet -> oeffentliche VPS-IP:45876
+               IPv6 oeffentlich -> VPS:45876
+               beliebige WireGuard-Clients -> VPS:45876
+               andere LAN-Hosts -> VPS:45876
 ```
 
-- Gesetzt wird genau **eine** restriktive UFW-Regel, eingeschraenkt auf Interface
-  **und** Hub-IP:
+- **Pull-Modus** setzt genau **eine** restriktive UFW-Regel, eingeschraenkt auf
+  Interface **und** Hub-IP:
   `ufw allow in on <WG_IFACE> from <BESZEL_HUB_WG_IP> to any port <PORT> proto tcp comment 'Homeedge Beszel Agent'`.
-  Kein pauschales `ufw allow 45876/tcp`, kein `from any`, kein `0.0.0.0/0`/`::/0`
-  und keine reine Interface-Bindung ohne `from`.
-- **Port oder Hub-IP aendern** (`beszel-reconfigure`): HomeEdge liest die alten
+  Kein `ufw allow 45876/tcp`, kein `from any`, kein `0.0.0.0/0`/`::/0`, keine reine
+  Interface-Bindung ohne `from`. Der Agent bindet zudem bevorzugt direkt an die
+  VPS-WireGuard-IP (`LISTEN="10.0.0.1:45876"`).
+- **Port/Hub-IP/Modus aendern** (`beszel-reconfigure`): HomeEdge liest die alten
   Werte aus `/etc/homeedge/beszel.env`, entfernt die alte UFW-Regel, schreibt die
-  neue Konfiguration, setzt die neue restriktive Regel und startet den Agent neu.
-  Fehler beim Entfernen einer nicht (mehr) existierenden Regel werden ignoriert.
-- Validierung: Port nur 1-65535, Hub-IP darf nicht leer sein, `0.0.0.0/0` und
-  `::/0` werden abgelehnt, das WireGuard-Interface muss existieren (`ip link show`).
-- Findet HomeEdge eine bestehende **oeffentliche/zu weite** Freigabe fuer den Port,
-  warnt es und bietet an, sie zu entfernen - **fremde Regeln werden nie ungefragt
-  geloescht**.
-- Der Status zeigt: Agent installiert (ja/nein), Service aktiv (ja/nein),
-  Agent-Port, WireGuard-Interface, erlaubter Beszel Hub, UFW-Regel vorhanden
-  (ja/nein), oeffentliche Freigabe gefunden (ja/nein), lauscht auf dem Port
-  (ja/nein) - bei oeffentlicher Freigabe ein harter Fehler.
-- Konfiguration liegt in `/etc/homeedge/beszel.env` (`chmod 600`) mit `KEY`,
-  `TOKEN`, `HUB_URL`, `BESZEL_AGENT_PORT`, `BESZEL_HUB_WG_IP`, `BESZEL_WG_IFACE`.
-  `KEY`/`TOKEN` werden verdeckt eingelesen und in Status/Logs maskiert. Fuer die
-  Firewall zaehlt **nur** `BESZEL_HUB_WG_IP`, nie `HUB_URL`. Es wird **kein**
-  Beszel Hub installiert.
+  neue Konfiguration, setzt (nur im Pull-Modus) die neue restriktive Regel und
+  startet den Agent neu. Bei Wechsel Pull->WebSocket wird die eingehende Regel
+  entfernt und `HUB_URL`/`TOKEN` gesetzt bzw. umgekehrt. Fehler beim Entfernen
+  einer nicht (mehr) existierenden Regel werden ignoriert.
+- **KEY-Validierung:** Der Public Key wird geprueft (`ssh-ed25519 AAAA...`); ein
+  fehlendes Leerzeichen nach dem Typ (`ssh-ed25519AAAA...`) wird automatisch
+  korrigiert. Ungueltige Keys werden **nicht** gespeichert - klare Fehlermeldung.
+- Weitere Validierung: Port nur 1-65535, Hub-IP darf nicht leer sein, `0.0.0.0/0`
+  und `::/0` werden abgelehnt, das WireGuard-Interface muss existieren.
+- Eine **oeffentliche Freigabe** wird nur gemeldet, wenn UFW wirklich eine zu weite
+  Regel enthaelt (`Anywhere`, `Anywhere (v6)`, `0.0.0.0/0`, `::/0`, Allow ohne
+  Source-Einschraenkung). Eine korrekte `... ALLOW 192.168.10.3`-Regel gilt **nicht**
+  als oeffentlich. **Fremde Regeln werden nie ungefragt geloescht.**
+- Der Status zeigt (modusabhaengig): Betriebsmodus, installiert, Service aktiv,
+  Version, LISTEN, Agent-Port, WG-Interface, erlaubter Hub (Pull), HUB_URL/TOKEN
+  gesetzt (WebSocket), KEY gesetzt, UFW-Regel vorhanden, oeffentliche Freigabe,
+  lauscht auf dem Port. `KEY` und `TOKEN` werden **nie** im Klartext angezeigt.
+- Konfiguration in `/etc/homeedge/beszel.env` (`chmod 600`): `KEY`, `HUB_URL`,
+  `TOKEN`, `LISTEN`, `BESZEL_MODE`, `BESZEL_AGENT_PORT`, `BESZEL_WG_IFACE`,
+  `BESZEL_HUB_WG_IP`. Fuer die Firewall zaehlt **nur** `BESZEL_HUB_WG_IP`, nie
+  `HUB_URL`. Es wird **kein** Beszel Hub installiert.
 - Das Binary wird passend zur Architektur (amd64/arm64/armv7) heruntergeladen und
   atomar installiert; ein fehlgeschlagener Download laesst das alte Binary intakt.
 
 Menue / CLI:
 
 ```text
-1) Installieren                          5) Neu starten
-2) Konfigurieren / Port oder Hub-IP      6) Aktualisieren
-3) Status                                7) Deinstallieren
-4) Logs (-f)                             8) Firewall-Regeln pruefen
+1) Installieren                                5) Neu starten
+2) Konfigurieren / Port, Modus oder Hub-IP     6) Aktualisieren
+3) Status                                      7) Deinstallieren
+4) Logs (-f)                                   8) Firewall-Regeln pruefen
 ```
 
 ```bash
-sudo homeedge beszel-install         # abfragen: KEY, TOKEN, HUB_URL, Agent-Port
-                                     # (Default 45876), WG-Interface, Hub-WG-IP
-sudo homeedge beszel-reconfigure     # Port/Hub-IP/Interface aendern (alte Regel raus, neue rein)
-sudo homeedge beszel-status          # Agent-/Port-/Interface-/UFW-Status
+sudo homeedge beszel-install         # fragt zuerst den Modus (Pull/WebSocket),
+                                     # dann nur die je Modus noetigen Werte
+sudo homeedge beszel-reconfigure     # Modus/Port/Hub-IP/Interface aendern (alte Regel raus, neue rein)
+sudo homeedge beszel-status          # modusabhaengiger Status (ohne Secrets)
 sudo homeedge beszel-logs -f         # journalctl -u beszel-agent -f (maskiert)
 sudo homeedge beszel-check-firewall  # Regeln pruefen / restriktive Regel (neu) setzen
 sudo homeedge beszel-uninstall       # fragt pro Artefakt (Binary, env, UFW-Regel) einzeln
+```
+
+`/etc/homeedge/beszel.env` im **Pull-Modus**:
+
+```env
+KEY="ssh-ed25519 AAAA..."
+HUB_URL=""
+TOKEN=""
+LISTEN="10.0.0.1:45876"
+BESZEL_MODE="pull"
+BESZEL_AGENT_PORT="45876"
+BESZEL_WG_IFACE="unifi"
+BESZEL_HUB_WG_IP="192.168.10.3"
+```
+
+im **WebSocket-Modus**:
+
+```env
+KEY="ssh-ed25519 AAAA..."
+HUB_URL="https://beszel.example.de"
+TOKEN="..."
+LISTEN=""
+BESZEL_MODE="websocket"
+BESZEL_AGENT_PORT="45876"
+BESZEL_WG_IFACE=""
+BESZEL_HUB_WG_IP=""
 ```
 
 Bei der Deinstallation wird der Service gestoppt/deaktiviert, die systemd-Unit und
 genau die eigene Beszel-UFW-Regel (anhand der gespeicherten Werte) entfernt;
 Binary und `beszel.env` optional. Andere Firewall-Regeln bleiben unangetastet.
 
-**Akzeptanz:** Nach der Installation ist der Agent-Port ueber die oeffentliche
-VPS-IP nicht erreichbar (weder IPv4 noch IPv6), sondern nur von der angegebenen
+**Akzeptanz (Pull-Modus):** Der Agent-Port ist ueber die oeffentliche VPS-IP nicht
+erreichbar (weder IPv4 noch IPv6), sondern nur von der angegebenen
 Beszel-Hub-WireGuard-IP ueber das WireGuard-Interface.
 
 ## Security-Check
