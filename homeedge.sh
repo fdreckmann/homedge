@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.15-homeedge"
+APP_VERSION="0.9.16-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -19,6 +19,8 @@ CADDY_VALIDATE_LOG="${HOMEEDGE_LOG_DIR}/caddy-validate.log"
 # OHNE die Service-Volumes aus docker-compose.yml (insb. den produktiven
 # Caddyfile-Mount) mitzuziehen - das ist die Ursache des Fresh-Install-Mountbugs.
 CADDY_IMAGE="homeedge-caddy:local"
+# Container-Name des Caddy-Stacks (siehe write_caddy_stack: container_name).
+CADDY_CONTAINER="caddy-edge"
 SERVICES_FILE="${CFG_DIR}/services.tsv"
 ENV_FILE="${CFG_DIR}/homeedge.env"
 KEY_DIR="${CFG_DIR}/keys"
@@ -101,7 +103,34 @@ mask_secrets() {
 # Zentrale, robuste Laufzeitpruefung fuer den Caddy-Container.
 # running=true UND restarting=false -> OK; sonst (fehlt/Restarting) -> Fehler.
 caddy_is_running() {
-  [[ "$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' caddy-edge 2>/dev/null)" == "true false" ]]
+  [[ "$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' "$CADDY_CONTAINER" 2>/dev/null)" == "true false" ]]
+}
+# Prueft, ob die letzten Caddy-Logs einen erfolgreichen Reload zeigen (Caddy hat
+# die Config geladen, auch wenn der docker-exec-Aufruf nicht sauber zurueckkam).
+caddy_recent_reload_ok() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker logs --since 20s --tail 80 "$CADDY_CONTAINER" 2>&1 \
+    | grep -qiE 'load complete|config is unchanged'
+}
+# Laedt die aktive Config im LAUFENDEN Container neu - per "docker exec" (NICHT
+# "docker compose exec", das nach einem erfolgreichen Caddy-Reload gelegentlich
+# im Exec haengt). Hartes Timeout mit --kill-after, damit HomeEdge nie endlos
+# haengt. Rueckgabe: 0 = ok, 2 = Timeout, aber Log zeigt Erfolg (Warnung),
+# 1 = echter Fehler.
+caddy_exec_reload() {
+  local rc=0
+  timeout --kill-after=5s "${CADDY_RELOAD_TIMEOUT:-20}s" \
+    docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    return 0
+  elif (( rc == 124 || rc == 137 )); then
+    # 124 = TERM durch timeout, 137 = KILL nach --kill-after -> beides Timeout.
+    # Caddy kann den Reload dennoch verarbeitet haben -> Log der letzten Sek. pruefen.
+    if caddy_recent_reload_ok; then return 2; fi
+    return 1
+  else
+    return 1
+  fi
 }
 # docker compose fuer den Caddy-Stack mit explizitem Compose-Pfad (cwd-unabhaengig).
 caddy_compose() { docker compose -f "$CADDY_COMPOSE_FILE" "$@"; }
@@ -638,7 +667,10 @@ caddy_has_cloudflare_module() {
 # Validiert das aktuelle produktive Caddyfile (nur wenn Container laeuft, per exec).
 validate_caddyfile() {
   caddy_is_running || return 1
-  caddy_compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
+  # docker exec (nicht compose exec) mit hartem Timeout, damit ein haengender
+  # Exec HomeEdge nie blockiert.
+  timeout --kill-after=5s "${CADDY_VALIDATE_TIMEOUT:-20}s" \
+    docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1
 }
 
 # Validiert eine beliebige Caddyfile (Host-Pfad) mit "docker run" gegen das
@@ -868,24 +900,30 @@ reload_caddy() {
   require_valid_services || return 1
   _caddy_prepare_config || return 1
   caddy_compose_file_exists || { err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; }
-  # Aktive Caddy-Konfiguration WIRKLICH neu laden. "up -d" allein laedt eine nur
-  # gemountete, geaenderte Caddyfile nicht zuverlaessig -> erst "caddy reload"
-  # per exec, sonst Container neu erzeugen (force-recreate).
   # Reload baut NIE ein Image - _caddy_prepare_config hat bereits gegen ein
   # vorhandenes Image validiert (sonst waeren wir hier nicht angekommen).
+  # Reload erfolgt per "docker exec" direkt im laufenden Container. Bei Timeout
+  # wird KEIN stiller force-recreate ausgefuehrt - der Benutzer wird gefragt.
   if caddy_is_running; then
-    if timeout "${CADDY_RELOAD_TIMEOUT:-20}" docker compose -f "$CADDY_COMPOSE_FILE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-      ok "Aktive Caddy-Konfig neu geladen (caddy reload)."
-    else
-      warn "caddy reload fehlgeschlagen/timeout - Container wird neu erzeugt (force-recreate)."
-      caddy_compose up -d --force-recreate >/dev/null 2>&1 || true
-    fi
+    info "Lade aktive Caddy-Konfiguration im laufenden Container neu..."
+    local reload_rc=0; caddy_exec_reload || reload_rc=$?
+    case "$reload_rc" in
+      0) ok "Reload erfolgreich." ;;
+      2) warn "Reload-Befehl Timeout - pruefe Caddy-Status..."
+         ok "Caddy hat die Konfiguration geladen (Log: 'load complete'/'config is unchanged'), aber der Docker-Exec-Befehl kam nicht sauber zurueck." ;;
+      *) err "Caddy-Reload fehlgeschlagen - der Container wird NICHT automatisch neu erzeugt."
+         if [[ -t 0 ]] && yesno "Caddy-Container neu erzeugen?" "n"; then
+           info "Erzeuge Caddy-Container neu (up -d --force-recreate)..."
+           caddy_compose up -d --force-recreate >/dev/null 2>&1 || true
+         else
+           info "Container NICHT neu erzeugt. Manuell moeglich: sudo homeedge restart | sudo homeedge caddy-logs"
+           return 1
+         fi ;;
+    esac
   else
+    # Container laeuft nicht: nur starten (up -d), KEIN force-recreate.
+    warn "Caddy-Container laeuft nicht - starte Stack (up -d)..."
     caddy_compose up -d >/dev/null 2>&1 || true
-  fi
-  # Falls der Container trotzdem nicht laeuft: letzter Versuch mit force-recreate.
-  if ! caddy_is_running; then
-    caddy_compose up -d --force-recreate >/dev/null 2>&1 || true
   fi
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
   # Nur "Container laeuft" reicht nicht: KURZER lokaler SNI-Check (max 15s), damit
@@ -3156,7 +3194,7 @@ health_check() {
       _health_line red "Caddy Container" "exited (gestoppt) - Reparatur: sudo homeedge restart" ;;
     running)
       _health_line green "Caddy Container" "laeuft (running=true, restarting=false)"
-      if caddy_compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+      if validate_caddyfile; then
         _health_line green "Caddy Konfig" "valid"
       else
         _health_line red "Caddy Konfig" "ungueltig oder nicht pruefbar"
@@ -3167,7 +3205,7 @@ health_check() {
   # Laeuft Caddy mit valider Konfig, wird der Marker archiviert (kein dauerhaftes ROT).
   if [[ -f "${CADDY_DIR}/Caddyfile.failed" ]]; then
     if [[ "$(caddy_stack_state)" == "running" ]] && caddy_is_running \
-        && caddy_compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+        && validate_caddyfile; then
       local _ts; _ts="$(date +%Y%m%d-%H%M%S)"
       mv "${CADDY_DIR}/Caddyfile.failed" "${CADDY_DIR}/Caddyfile.failed.old.${_ts}" 2>/dev/null || true
       [[ -f "$CADDY_VALIDATE_LOG" ]] && cp -a "$CADDY_VALIDATE_LOG" "${CADDY_VALIDATE_LOG}.old.${_ts}" 2>/dev/null || true
