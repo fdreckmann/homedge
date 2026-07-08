@@ -362,8 +362,15 @@ curl -vk --resolve DOMAIN:443:127.0.0.1 https://DOMAIN
 validiert es in einem Wegwerf-Container gegen das **bereits vorhandene** Image
 (ohne die produktive Datei zu mounten), formatiert und validiert erneut, und
 ersetzt die produktive `/opt/caddy-edge/Caddyfile` nur bei Erfolg. Danach wird die
-aktive Config wirklich neu geladen (`caddy reload`, notfalls
-`up -d --force-recreate`).
+aktive Config im laufenden Container neu geladen - per
+`docker exec caddy-edge caddy reload` mit hartem Timeout
+(`timeout --kill-after=5s 20s`), **nicht** ueber `docker compose exec` (das hing
+nach einem erfolgreichen Caddy-Reload gelegentlich im Exec). Laeuft der
+Reload-Befehl in ein Timeout, aber die Caddy-Logs zeigen `load complete` bzw.
+`config is unchanged`, wertet HomeEdge das als Erfolg mit Warnung - es haengt
+also nie endlos. Schlaegt der Reload echt fehl, gibt es **keinen** stillen
+`up -d --force-recreate`, sondern eine klare Meldung und die Rueckfrage
+„Caddy-Container neu erzeugen?".
 
 **Der normale Reload baut nie ein Docker-Image.** Ist `homeedge-caddy:local`
 vorhanden, startet weder `homeedge reload` noch die Migration jemals ein
