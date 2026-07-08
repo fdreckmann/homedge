@@ -312,11 +312,19 @@ aus der tcpdump-Ausgabe (`10.0.0.2.xxxxx > 10.0.0.1.45876`) ist die einzutragend
   fehlendes Leerzeichen nach dem Typ (`ssh-ed25519AAAA...`) wird automatisch
   korrigiert. Ungueltige Keys werden **nicht** gespeichert - klare Fehlermeldung.
 - Weitere Validierung: Port nur 1-65535, Hub-IP darf nicht leer sein, `0.0.0.0/0`
-  und `::/0` werden abgelehnt, das WireGuard-Interface muss existieren.
+  und `::/0` werden abgelehnt, das WireGuard-Interface muss existieren. Standard ist
+  eine **einzelne** Host-IP; CIDR (mehrere Clients) nur im Expertenmodus nach
+  ausdruecklicher Bestaetigung mit Warnung.
 - Eine **oeffentliche Freigabe** wird nur gemeldet, wenn UFW wirklich eine zu weite
   Regel enthaelt (`Anywhere`, `Anywhere (v6)`, `0.0.0.0/0`, `::/0`, Allow ohne
-  Source-Einschraenkung). Eine korrekte `... ALLOW 192.168.10.3`-Regel gilt **nicht**
+  Source-Einschraenkung). Eine korrekte `... ALLOW 10.0.0.2`-Regel gilt **nicht**
   als oeffentlich. **Fremde Regeln werden nie ungefragt geloescht.**
+- Der Status zeigt **UFW aktiv: ja/nein**. Lauscht der Agent, waehrend UFW inaktiv
+  ist (im Pull-Modus generell, im WebSocket-Modus bei Wildcard-Listener `*:PORT`),
+  meldet HomeEdge das als **Fehler** - der Port waere ungeschuetzt.
+- Im **Pull-Modus** wird die systemd-Unit vom WireGuard-Interface abhaengig gemacht
+  (`After/Wants=wg-quick@<IFACE>`) und wartet per `ExecStartPre`, bis die Listen-IP
+  am Interface existiert - kein Boot-Race, wenn WireGuard spaeter kommt.
 - Der Status zeigt (modusabhaengig): Betriebsmodus, installiert, Service aktiv,
   Version, LISTEN, Agent-Port, WG-Interface, erlaubter Hub (Pull), HUB_URL/TOKEN
   gesetzt (WebSocket), KEY gesetzt, UFW-Regel vorhanden, oeffentliche Freigabe,
@@ -357,7 +365,9 @@ LISTEN="10.0.0.1:45876"
 BESZEL_MODE="pull"
 BESZEL_AGENT_PORT="45876"
 BESZEL_WG_IFACE="unifi"
-BESZEL_HUB_WG_IP="192.168.10.3"
+BESZEL_HUB_WG_IP="10.0.0.2"   # Tunnel-Source-IP der Hub-Seite - NUR eintragen,
+                             # wenn tcpdump auf dem VPS wirklich diese Source-IP
+                             # zeigt. NICHT die LAN-IP (192.168.10.3) des Hosts.
 ```
 
 im **WebSocket-Modus**:

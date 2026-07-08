@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.19-homeedge"
+APP_VERSION="0.9.20-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -659,6 +659,29 @@ caddy_ensure_image() {
   return 1
 }
 
+# Bringt den Caddy-Stack mit HARTEM Timeout hoch (kein Haenger). $1 = "recreate"
+# (up -d --force-recreate, Default) oder "up" (up -d). Bei Fehler/Timeout wird
+# NICHT still verschluckt: docker compose ps + docker logs (tail 80) werden
+# angezeigt. 0 = ok.
+caddy_compose_up() {
+  local mode="${1:-recreate}" out rc=0
+  local -a args
+  if [[ "$mode" == "up" ]]; then args=(up -d); else args=(up -d --force-recreate); fi
+  out="$(timeout --kill-after=10s "${CADDY_UP_TIMEOUT:-60}s" docker compose -f "$CADDY_COMPOSE_FILE" "${args[@]}" 2>&1)" || rc=$?
+  if (( rc == 0 )); then return 0; fi
+  if (( rc == 124 || rc == 137 )); then
+    err "Caddy-Container-Start Timeout (${CADDY_UP_TIMEOUT:-60}s) - haengt nicht mehr, aber Start unvollstaendig."
+  else
+    err "Caddy-Container-Start fehlgeschlagen (rc=${rc})."
+  fi
+  [[ -n "$out" ]] && printf '%s\n' "$out" | mask_secrets | sed 's/^/  /'
+  echo "== docker compose ps =="
+  docker compose -f "$CADDY_COMPOSE_FILE" ps 2>&1 | mask_secrets | sed 's/^/  /' || true
+  echo "== docker logs --tail 80 ${CADDY_CONTAINER} =="
+  docker logs --tail 80 "$CADDY_CONTAINER" 2>&1 | mask_secrets | sed 's/^/  /' || true
+  return "$rc"
+}
+
 # Prueft, ob ${CADDY_IMAGE} das caddy-dns/cloudflare-Modul enthaelt.
 caddy_has_cloudflare_module() {
   docker run --rm --entrypoint caddy "$CADDY_IMAGE" list-modules 2>/dev/null \
@@ -914,8 +937,8 @@ reload_caddy() {
          ok "Caddy hat die Konfiguration geladen (Log: 'load complete'/'config is unchanged'), aber der Docker-Exec-Befehl kam nicht sauber zurueck." ;;
       *) err "Caddy-Reload fehlgeschlagen - der Container wird NICHT automatisch neu erzeugt."
          if [[ -t 0 ]] && yesno "Caddy-Container neu erzeugen?" "n"; then
-           info "Erzeuge Caddy-Container neu (up -d --force-recreate)..."
-           caddy_compose up -d --force-recreate >/dev/null 2>&1 || true
+           info "Erzeuge Caddy-Container neu (up -d --force-recreate, Timeout)..."
+           caddy_compose_up recreate || true
          else
            info "Container NICHT neu erzeugt. Manuell moeglich: sudo homeedge restart | sudo homeedge caddy-logs"
            return 1
@@ -924,7 +947,7 @@ reload_caddy() {
   else
     # Container laeuft nicht: nur starten (up -d), KEIN force-recreate.
     warn "Caddy-Container laeuft nicht - starte Stack (up -d)..."
-    caddy_compose up -d >/dev/null 2>&1 || true
+    caddy_compose_up up || true
   fi
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
   # Nur "Container laeuft" reicht nicht: KURZER lokaler SNI-Check (max 15s), damit
@@ -941,20 +964,27 @@ reload_caddy() {
 
 # Wie reload, aber baut das Image explizit neu (build) - mit gleicher
 # Validierung/Rollback. Dies ist ein AUSDRUECKLICHER Build-Pfad, daher wird das
-# Image hier ZUERST gebaut (auch wenn es noch fehlt), bevor validiert wird.
+# Image hier ZUERST gebaut, bevor validiert wird. Mit "--skip-build" wird NICHT
+# gebaut (der Aufrufer, z. B. caddy_rebuild, hat das Image bereits gebaut) -
+# so wird ein doppelter Build vermieden.
 restart_caddy() {
+  local skip_build=0
+  [[ "${1:-}" == "--skip-build" ]] && skip_build=1
   section "Caddy neu starten / neu bauen"
   load_env
   _ensure_caddyfile_not_dir
   write_caddy_stack
   caddy_compose_file_exists || { err "Caddy Compose-Datei fehlt: $CADDY_COMPOSE_FILE"; caddy_stack_repair_hint; return 1; }
-  # Image zuerst bauen (expliziter Build-Pfad), dann gegen das frische Image
-  # validieren.
-  if ! caddy_build_image; then err "Caddy-Image-Build fehlgeschlagen."; return 1; fi
+  if (( skip_build )); then
+    # Kein Build: das Image MUSS bereits vorhanden sein.
+    caddy_image_exists || { err "Caddy-Image ${CADDY_IMAGE} fehlt - erst bauen: sudo homeedge caddy-rebuild"; return 1; }
+  else
+    # Image zuerst bauen (expliziter Build-Pfad), dann gegen das frische Image validieren.
+    if ! caddy_build_image; then err "Caddy-Image-Build fehlgeschlagen."; return 1; fi
+  fi
   _caddy_prepare_config || return 1
-  # --force-recreate erzwingt, dass der Container mit der aktuellen Caddyfile neu
-  # startet (statt nur "up").
-  if ! caddy_compose up -d --force-recreate >/dev/null 2>&1; then
+  # --force-recreate erzwingt den Neustart mit der aktuellen Caddyfile (mit Timeout+Diagnose).
+  if ! caddy_compose_up recreate; then
     err "Caddy-Start fehlgeschlagen."; return 1
   fi
   if caddy_is_running; then ok "Container laeuft"; else err "Container laeuft nicht"; caddy_stack_repair_hint; return 1; fi
@@ -986,8 +1016,9 @@ caddy_rebuild() {
     info "Bitte Image neu bauen: sudo homeedge caddy-rebuild"
     return 1
   fi
-  # Caddyfile generieren/validieren + Container bauen/starten (mit Caddyfile.failed bei Fehler).
-  restart_caddy || return 1
+  # Caddyfile generieren/validieren + Container starten. Das Image wurde OBEN
+  # bereits gebaut -> --skip-build vermeidet einen zweiten (doppelten) Build.
+  restart_caddy --skip-build || return 1
   # Lokaler SNI-Test je Domain (Abschlusskontrolle).
   if [[ -s "$SERVICES_FILE" ]]; then
     local d _s _i _p _pr
@@ -2158,6 +2189,30 @@ beszel_hub_reachable() {
   curl -sS -m 8 -o /dev/null "$url" >/dev/null 2>&1
 }
 
+# Ist UFW aktiv? 0 = ja.
+ufw_is_active() { ufw status 2>/dev/null | grep -qiE "Status: (active|aktiv)"; }
+
+# Lauscht der Agent auf einer WILDCARD-Adresse (*:PORT / 0.0.0.0 / [::]) - also
+# potenziell oeffentlich? 0 = ja.
+beszel_listens_wildcard() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -H -ltn "sport = :${port}" 2>/dev/null \
+    | grep -qE '(\*|0\.0\.0\.0|\[::\]|::):'"${port}"'([[:space:]]|$)'
+}
+
+# Ist ein Host eine private/LAN-/Loopback-Adresse oder ein lokaler Hostname?
+beszel_is_private_host() {
+  local h="${1:-}"
+  case "$h" in
+    localhost|*.local|*.lan|*.home|*.internal) return 0 ;;
+    10.*|127.*|192.168.*|169.254.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+    ::1|fc[0-9a-fA-F][0-9a-fA-F]:*|fd[0-9a-fA-F][0-9a-fA-F]:*|fe80:*) return 0 ;;
+  esac
+  return 1
+}
+
 # Ermittelt den Beszel-Release-Dateinamen fuer die aktuelle Architektur.
 beszel_arch() {
   case "$(uname -m 2>/dev/null)" in
@@ -2299,9 +2354,17 @@ _beszel_prompt_config() {
     while :; do
       NB_HUBIP="$(ask "Erlaubte Hub-Quell-IP im Tunnel (die der VPS auf ${NB_IFACE} sieht), z. B. 10.0.0.2 - NICHT die LAN-IP" "${BESZEL_HUB_WG_IP:-}")"
       beszel_validate_hub_ip "$NB_HUBIP"; vr=$?
-      (( vr == 0 )) && break
       (( vr == 2 )) && { err "0.0.0.0/0 bzw. ::/0 ist NICHT erlaubt - das waere oeffentlich!"; continue; }
-      err "Ungueltige IP/CIDR. Erlaubt: IPv4, IPv6 oder CIDR (nicht leer)."
+      (( vr != 0 )) && { err "Ungueltige IP/CIDR. Erlaubt: einzelne IPv4/IPv6 (nicht leer)."; continue; }
+      # Standard: nur EINZELNE Host-IP. CIDR erlaubt mehrere Clients -> nur im
+      # Expertenmodus nach ausdruecklicher Bestaetigung.
+      if [[ "$NB_HUBIP" == */* ]]; then
+        warn "CIDR erlaubt mehrere Clients und ist weniger restriktiv."
+        if yesno "CIDR ${NB_HUBIP} wirklich verwenden (Expertenmodus)?" "n"; then break; fi
+        err "Bitte eine EINZELNE Host-IP eingeben (z. B. 10.0.0.2)."
+        continue
+      fi
+      break
     done
     # Lokale Listen-IP: bevorzugt an die VPS-WireGuard-IP binden (nicht oeffentlich).
     local def_ip="${VPS_WG_IP:-}" lip
@@ -2309,7 +2372,23 @@ _beszel_prompt_config() {
     if [[ -n "$lip" ]]; then NB_LISTEN="${lip}:${NB_PORT}"; else NB_LISTEN="${NB_PORT}"; fi
   else
     # WebSocket: HUB_URL + TOKEN Pflicht, KEINE eingehende Regel/Interface/Hub-IP.
-    NB_HUB="$(_beszel_sanitize_line "$(ask "Beszel HUB_URL (z. B. https://beszel.example.de)" "${BESZEL_HUB_URL:-}")")"
+    local host
+    while :; do
+      NB_HUB="$(_beszel_sanitize_line "$(ask "Beszel HUB_URL (z. B. https://beszel.example.de)" "${BESZEL_HUB_URL:-}")")"
+      if [[ -z "$NB_HUB" ]]; then err "HUB_URL darf im WebSocket-Modus nicht leer sein."; continue; fi
+      if [[ "$NB_HUB" =~ ^https:// ]]; then break; fi
+      if [[ "$NB_HUB" =~ ^http:// ]]; then
+        host="${NB_HUB#http://}"; host="${host%%[:/]*}"
+        if beszel_is_private_host "$host"; then
+          info "http:// akzeptiert (private/LAN-Adresse ${host})."
+          break
+        fi
+        warn "HUB_URL nutzt unverschluesseltes http:// fuer eine oeffentliche Adresse (${host})."
+        yesno "Trotzdem verwenden (nicht empfohlen)?" "n" && break
+        continue
+      fi
+      err "HUB_URL muss mit http:// oder https:// beginnen."
+    done
     local rawtok
     rawtok="$(ask_secret "Beszel Registrations-TOKEN$([[ "$op" == reconfigure ]] && echo ' (leer = unveraendert)')")"
     NB_TOKEN="$(_beszel_sanitize_line "$rawtok")"
@@ -2319,23 +2398,46 @@ _beszel_prompt_config() {
   fi
 }
 
+# Schreibt die systemd-Unit. $1 mode $2 iface $3 listen. Im Pull-Modus wird die
+# Unit vom WireGuard-Interface abhaengig gemacht (After/Wants=wg-quick@IFACE) und
+# - falls LISTEN eine IP enthaelt - per ExecStartPre gewartet, bis die IP am
+# Interface existiert (verhindert Boot-Race). StateDirectory/WorkingDirectory
+# geben dem Agent ein beschreibbares Datenverzeichnis (kein "Data directory not found").
 beszel_write_unit() {
-  cat > "$BESZEL_UNIT" <<'EOUNIT'
+  local mode="${1:-pull}" iface="${2:-}" listen="${3:-}"
+  local after_line="network-online.target" wants_line="network-online.target" pre_line="" lip=""
+  if [[ "$mode" == "pull" && -n "$iface" ]]; then
+    after_line="wg-quick@${iface}.service network-online.target"
+    wants_line="wg-quick@${iface}.service network-online.target"
+    # Listen-IP aus LISTEN extrahieren (IP:PORT bzw. [v6]:PORT), Port abschneiden.
+    if [[ "$listen" == *:* ]]; then
+      lip="${listen%:*}"; lip="${lip#[}"; lip="${lip%]}"
+    fi
+    if [[ -n "$lip" ]]; then
+      # Bis zu 30s auf die Listen-IP am Interface warten; sonst Fehler -> Restart.
+      pre_line="ExecStartPre=/bin/sh -c 'for i in \$(seq 1 30); do ip -o addr show ${iface} 2>/dev/null | grep -qw ${lip} && exit 0; sleep 1; done; echo \"Beszel: Listen-IP ${lip} auf ${iface} nicht vorhanden\" >&2; exit 1'"
+    fi
+  fi
+  cat > "$BESZEL_UNIT" <<EOUNIT
 [Unit]
-Description=Beszel Agent (HomeEdge, WireGuard-only)
-After=network-online.target
-Wants=network-online.target
+Description=Beszel Agent (HomeEdge, ${mode})
+After=${after_line}
+Wants=${wants_line}
 
 [Service]
 Type=simple
 User=root
 EnvironmentFile=/etc/homeedge/beszel.env
+${pre_line}
 ExecStart=/usr/local/bin/beszel-agent
 Restart=on-failure
 RestartSec=5s
+StateDirectory=beszel-agent
+WorkingDirectory=/var/lib/beszel-agent
 # Absicherung
 NoNewPrivileges=yes
 ProtectSystem=strict
+ReadWritePaths=/var/lib/beszel-agent
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -2419,9 +2521,10 @@ beszel_remove_public_exposure() {
 # Pruefung wird /usr/local/bin/beszel-agent ersetzt.
 beszel_download_binary() {
   need_root
-  local arch tar_name url tmp tmp2
+  local arch tar_name url tmp ver_before ver_after
   if ! command -v curl >/dev/null 2>&1; then err "curl ist nicht installiert."; return 1; fi
   arch="$(beszel_arch)" || { err "Nicht unterstuetzte Architektur: $(uname -m)"; return 1; }
+  ver_before="$(beszel_version 2>/dev/null || echo 'nicht installiert')"
   tar_name="beszel-agent_linux_${arch}.tar.gz"
   url="${BESZEL_DOWNLOAD_BASE}/${tar_name}"
   info "Lade Beszel Agent (${arch}) von ${url} ..."
@@ -2433,6 +2536,20 @@ beszel_download_binary() {
     err "Download fehlgeschlagen. Netzwerk/URL pruefen."
     rm -rf "$tmp"; return 1
   fi
+  # Optionale SHA256-Pruefung: falls upstream <asset>.sha256 bereitstellt.
+  local sum_remote="" sum_local="" verified=0
+  if sum_remote="$(curl -fsSL -m 15 "${url}.sha256" 2>/dev/null)" && [[ -n "$sum_remote" ]] && command -v sha256sum >/dev/null 2>&1; then
+    sum_remote="$(awk '{print $1}' <<<"$sum_remote")"
+    sum_local="$(sha256sum "${tmp}/${tar_name}" | awk '{print $1}')"
+    if [[ -n "$sum_remote" && "$sum_remote" == "$sum_local" ]]; then
+      ok "SHA256 verifiziert."; verified=1
+    else
+      err "SHA256 stimmt nicht ueberein - Abbruch, altes Binary bleibt intakt."
+      err "erwartet: ${sum_remote}"; err "erhalten: ${sum_local}"
+      rm -rf "$tmp"; return 1
+    fi
+  fi
+  (( verified )) || warn "Download von GitHub latest OHNE separate Signatur-/Checksummenpruefung."
   if ! tar -xzf "${tmp}/${tar_name}" -C "$tmp" 2>/dev/null; then
     err "Archiv konnte nicht entpackt werden."
     rm -rf "$tmp"; return 1
@@ -2445,7 +2562,9 @@ beszel_download_binary() {
   # Atomar installieren (kein halb ueberschriebenes Binary).
   install -m 0755 "$extracted" "$BESZEL_BIN"
   rm -rf "$tmp"
-  ok "Beszel Agent installiert: $(beszel_version)"
+  ver_after="$(beszel_version)"
+  info "Version vorher: ${ver_before}  ->  nachher: ${ver_after}"
+  ok "Beszel Agent installiert: ${ver_after}"
 }
 
 # Interaktive Installation (frische Installation).
@@ -2477,7 +2596,7 @@ beszel_install() {
   beszel_download_binary || return 1
   beszel_write_env "$NB_MODE" "$NB_KEY" "$NB_TOKEN" "$NB_HUB" "$NB_LISTEN" "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
   ok "Konfig geschrieben: ${BESZEL_ENV} (chmod 600, Secrets nicht ausgegeben)."
-  beszel_write_unit
+  beszel_write_unit "$NB_MODE" "$NB_IFACE" "$NB_LISTEN"
   ok "systemd-Unit geschrieben: ${BESZEL_UNIT}"
 
   if [[ "$NB_MODE" == "pull" ]]; then
@@ -2522,7 +2641,7 @@ beszel_reconfigure() {
   beszel_remove_ufw_rule "$old_iface" "$old_ip" "$old_port"
   beszel_write_env "$NB_MODE" "$NB_KEY" "$NB_TOKEN" "$NB_HUB" "$NB_LISTEN" "$NB_PORT" "$NB_HUBIP" "$NB_IFACE"
   ok "Konfig aktualisiert: ${BESZEL_ENV}"
-  beszel_write_unit    # enthaelt systemctl daemon-reload
+  beszel_write_unit "$NB_MODE" "$NB_IFACE" "$NB_LISTEN"    # enthaelt systemctl daemon-reload
   if [[ "$NB_MODE" == "pull" ]]; then
     beszel_remove_public_exposure "$NB_PORT" "$NB_IFACE"
     beszel_apply_ufw_rule "$NB_IFACE" "$NB_HUBIP" "$NB_PORT"
@@ -2544,10 +2663,12 @@ beszel_verify_installation() {
   local mode="${BESZEL_MODE:-pull}"
   local port="${BESZEL_AGENT_PORT:-$BESZEL_PORT_DEFAULT}" ip="${BESZEL_HUB_WG_IP:-}" iface="${BESZEL_WG_IFACE:-${WG_IF:-wg0}}"
   section "Beszel Agent - Pruefung"
-  local svc="nein" listen="nein" rule="nein" pub="nein"
+  local svc="nein" listen="nein" rule="nein" pub="nein" ufwact="nein" wild="nein"
   systemctl is-active --quiet beszel-agent 2>/dev/null && svc="ja"
   command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . && listen="ja"
+  beszel_listens_wildcard "$port" && wild="ja"
   if command -v ufw >/dev/null 2>&1; then
+    ufw_is_active && ufwact="ja"
     # Restriktive Regel exakt: Portzeile MIT Interface UND mit der Hub-IP als Quelle.
     if [[ -n "$ip" ]] && ufw status 2>/dev/null | grep -E "(^|[^0-9])${port}/tcp" | grep -F "$iface" | grep -qF "$ip"; then rule="ja"; fi
     [[ -n "$(beszel_public_exposure "$port")" ]] && pub="ja"
@@ -2558,6 +2679,7 @@ beszel_verify_installation() {
   printf '  Service aktiv:            %s\n' "$svc"
   printf '  Version:                  %s\n' "$(beszel_version)"
   printf '  KEY gesetzt:              %s\n' "$([[ -n "${BESZEL_KEY:-}" ]] && echo ja || echo nein)"
+  printf '  UFW aktiv:                %s\n' "$ufwact"
   if [[ "$mode" == "pull" ]]; then
     printf '  LISTEN:                   %s\n' "${BESZEL_LISTEN:-<nicht gesetzt>}"
     printf '  Agent-Port:               %s\n' "$port"
@@ -2572,6 +2694,7 @@ beszel_verify_installation() {
     printf '  HUB_URL gesetzt:          %s\n' "$([[ -n "${BESZEL_HUB_URL:-}" ]] && echo ja || echo nein)"
     printf '  TOKEN gesetzt:            %s\n' "$([[ -n "${BESZEL_TOKEN:-}" ]] && echo ja || echo nein)"
     printf '  Agent-Port (informativ): %s\n' "$port"
+    printf '  Lauscht auf Port %s:  %s (Wildcard: %s)\n' "$port" "$listen" "$wild"
     printf '  Oeffentliche Freigabe:    %s\n' "$pub"
   fi
   echo
@@ -2582,17 +2705,28 @@ beszel_verify_installation() {
     info "Bereinigen: sudo homeedge beszel-check-firewall"
     return 1
   fi
+  # UFW inaktiv + Agent lauscht -> Port ist NICHT durch die Firewall geschuetzt.
+  if [[ "$listen" == "ja" && "$ufwact" == "nein" ]]; then
+    err "ACHTUNG: Agent lauscht auf Port ${port}, aber UFW ist INAKTIV!"
+    if [[ "$wild" == "ja" ]]; then
+      err "Der Agent lauscht auf einer Wildcard-Adresse (*:${port}) - Port waere oeffentlich erreichbar."
+    else
+      err "Ohne aktive Firewall ist der Port nicht auf die Hub-IP eingeschraenkt."
+    fi
+    info "UFW aktivieren: sudo homeedge firewall   |   Regeln: sudo homeedge beszel-check-firewall"
+    return 1
+  fi
   if [[ "$mode" == "pull" ]]; then
-    if [[ "$svc" == "ja" && "$rule" == "ja" ]]; then
-      ok "Pull-Modus OK: Zugriff nur von ${ip} ueber ${iface} erlaubt."
+    if [[ "$svc" == "ja" && "$rule" == "ja" && "$ufwact" == "ja" ]]; then
+      ok "Pull-Modus OK: Zugriff nur von ${ip} ueber ${iface} erlaubt (UFW aktiv)."
       return 0
     fi
-    warn "Pruefung nicht komplett gruen (Details oben). Ggf. Tunnel/Interface/Hub-IP pruefen."
+    warn "Pruefung nicht komplett gruen (Details oben). Ggf. Tunnel/Interface/Hub-IP/UFW pruefen."
     return 1
   else
     if [[ "$svc" == "ja" ]]; then
-      ok "WebSocket-Modus OK: Agent laeuft, keine eingehende Freigabe noetig."
       [[ -z "${BESZEL_HUB_URL:-}" ]] && { warn "HUB_URL ist nicht gesetzt - im WebSocket-Modus erforderlich."; return 1; }
+      ok "WebSocket-Modus OK: Agent laeuft, keine eingehende Freigabe noetig."
       return 0
     fi
     warn "Pruefung nicht komplett gruen: Service laeuft nicht (Logs: sudo homeedge beszel-logs)."
@@ -3701,8 +3835,8 @@ caddy_update() {
   if caddy_has_cloudflare_module; then ok "Cloudflare DNS Modul im neuen Image vorhanden."; else err "Cloudflare DNS Modul fehlt im neuen Image - Abbruch."; return 1; fi
   # 5) Caddyfile generieren/validieren (atomar, mit Rollback) BEVOR Container neu erstellt wird.
   if ! _caddy_prepare_config; then err "Abbruch: Konfiguration ungueltig, kein Rebuild. Letzte Caddyfile bleibt."; return 1; fi
-  # 6) Container neu erstellen.
-  if ! caddy_compose up -d --force-recreate >/dev/null 2>&1; then
+  # 6) Container neu erstellen (mit Timeout + Diagnose bei Fehler).
+  if ! caddy_compose_up recreate; then
     err "Caddy-Start (up -d --force-recreate) fehlgeschlagen. Vorherige Caddyfile bleibt - Rollback ueber Backup moeglich (sudo homeedge restore-config)."
     return 1
   fi
