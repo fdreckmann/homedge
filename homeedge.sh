@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.27-homeedge"
+APP_VERSION="0.9.28-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -1544,16 +1544,26 @@ crowdsec_whitelist_menu() {
   done
 }
 
-# Richtet das offizielle CrowdSec-APT-Repo OHNE "curl | bash" ein: Keyring in
-# /usr/share/keyrings + signed-by sources.list.d-Eintrag. Idempotent (erkennt
-# vorhandenes Repo) und beschaedigt bestehende Installationen nicht.
+# Richtet das offizielle CrowdSec-APT-Repo OHNE "curl | bash" ein.
+# WICHTIG: Das packagecloud-Repo ist DISTRIBUTIONS-AGNOSTISCH - der Pfad ist
+# IMMER "any/ any main" (KEIN debian/trixie, ubuntu/jammy o. ae.; ein solcher
+# Pfad fuehrt zu 404 bei "apt-get update", z. B. auf Debian 13/Trixie).
+# Keyring idempotent unter /etc/apt/keyrings. Falsche Alt-Eintraege (mit
+# Distro-/Codename-Pfad) werden automatisch auf any/any korrigiert; ein bereits
+# korrekter any/any-Eintrag bleibt unveraendert.
 _crowdsec_setup_repo() {
   local list=/etc/apt/sources.list.d/crowdsec_crowdsec.list
-  local keyring=/usr/share/keyrings/crowdsec_crowdsec-archive-keyring.gpg
-  if [[ -f "$list" ]]; then info "CrowdSec-APT-Repo bereits eingerichtet (${list}) - unveraendert."; return 0; fi
+  local keyring=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+  # Bereits korrekt (any/any)? -> nichts tun (bestehende Installation schonen).
+  if [[ -f "$list" ]] && grep -qE 'packagecloud\.io/crowdsec/crowdsec/any(/|[[:space:]])' "$list"; then
+    info "CrowdSec-APT-Repo bereits korrekt (any/any) eingerichtet - unveraendert."
+    return 0
+  fi
+  [[ -f "$list" ]] && warn "Korrigiere fehlerhaften CrowdSec-Repo-Eintrag (Distro-/Codename-Pfad) auf any/any: ${list}"
   command -v curl >/dev/null 2>&1 || { err "curl fehlt: sudo apt-get install -y curl"; return 1; }
   command -v gpg  >/dev/null 2>&1 || { err "gpg fehlt: sudo apt-get install -y gnupg"; return 1; }
-  # Distribution/Architektur bestimmen.
+  # Distribution/Codename/Architektur NUR zur Information ermitteln - sie gehen
+  # NICHT in die Repo-URL ein.
   local dist="debian" codename="" arch=""
   # shellcheck disable=SC1091
   [[ -r /etc/os-release ]] && . /etc/os-release 2>/dev/null || true
@@ -1561,9 +1571,8 @@ _crowdsec_setup_repo() {
   codename="${VERSION_CODENAME:-}"
   [[ -z "$codename" ]] && codename="$(lsb_release -cs 2>/dev/null || true)"
   arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-  [[ -z "$codename" ]] && { err "Distributions-Codename nicht ermittelbar (VERSION_CODENAME/lsb_release)."; return 1; }
-  info "Repo fuer ${dist}/${codename} (${arch})."
-  mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+  info "System: ${dist}/${codename:-?} (${arch}) - Repo-Pfad ist trotzdem any/any (distributionsagnostisch)."
+  mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
   local tmpkey; tmpkey="$(mktemp)"
   if ! curl -fsSL "https://packagecloud.io/crowdsec/crowdsec/gpgkey" -o "$tmpkey"; then
     err "GPG-Key konnte nicht geladen werden (packagecloud)."; rm -f "$tmpkey"; return 1
@@ -1573,14 +1582,18 @@ _crowdsec_setup_repo() {
   fi
   rm -f "$tmpkey"; chmod 0644 "$keyring"
   cat > "$list" <<EOF
-deb [signed-by=${keyring} arch=${arch}] https://packagecloud.io/crowdsec/crowdsec/${dist}/ ${codename} main
-deb-src [signed-by=${keyring}] https://packagecloud.io/crowdsec/crowdsec/${dist}/ ${codename} main
+deb [signed-by=${keyring}] https://packagecloud.io/crowdsec/crowdsec/any/ any main
+deb-src [signed-by=${keyring}] https://packagecloud.io/crowdsec/crowdsec/any/ any main
 EOF
   chmod 0644 "$list"
-  if ! DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1; then
-    err "apt-get update nach Repo-Setup fehlgeschlagen - Eintrag pruefen: ${list}"; return 1
+  # apt-get update MIT echter Fehlerausgabe (nicht nach /dev/null verschlucken).
+  local upd_out
+  if ! upd_out="$(DEBIAN_FRONTEND=noninteractive apt-get update 2>&1)"; then
+    err "apt-get update nach Repo-Setup fehlgeschlagen - Ausgabe:"
+    printf '%s\n' "$upd_out" | sed 's/^/    /'
+    return 1
   fi
-  ok "CrowdSec-APT-Repo eingerichtet (Keyring ${keyring})."
+  ok "CrowdSec-APT-Repo eingerichtet (any/any, Keyring ${keyring})."
   return 0
 }
 
