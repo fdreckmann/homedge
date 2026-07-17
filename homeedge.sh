@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.28-homeedge"
+APP_VERSION="0.9.29-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -1718,20 +1718,46 @@ crowdsec_selftest() {
     if cscli collections list 2>/dev/null | grep -q "$col"; then ok "Collection ${col}"; else warn "Collection ${col} fehlt"; rc=$(( rc<1?1:rc )); fi
   done
 
-  # 7) Test-Decision mit reservierter IP hinzufuegen
-  local added=0
-  if cscli decisions add --ip "$testip" --duration 2m --type ban --reason "homeedge-selftest" >/dev/null 2>&1; then
-    added=1; ok "Test-Decision gesetzt (${testip}, 2m, ban)"
-  else
+  # 7-9) Test-Decision setzen, bis zu 30s (alle 3s) auf Uebernahme in die
+  # Dataplane (nftables/ipset) warten, bei Fund SOFORT fertig, sonst erst nach
+  # vollem Timeout WARN. Die Test-Decision wird IMMER wieder entfernt - Cleanup
+  # via EXIT-/Signal-Trap in einer Subshell (auch bei Fehler oder Abbruch/Ctrl-C).
+  # Die Subshell gibt nur Status-Tokens auf stdout aus; die Bewertung erfolgt hier.
+  local added=0 dp
+  dp="$(
+    trap 'cscli decisions delete --ip "'"$testip"'" >/dev/null 2>&1 || true' EXIT
+    trap 'exit 130' INT TERM
+    if ! cscli decisions add --ip "$testip" --duration 2m --type ban --reason "homeedge-selftest" >/dev/null 2>&1; then
+      echo ADD_FAIL; exit 0
+    fi
+    cscli decisions list -o raw 2>/dev/null | grep -qF "$testip" && echo LAPI_OK || echo LAPI_MISS
+    waited=0
+    while :; do
+      if _crowdsec_ip_in_dataplane "$testip"; then echo DP_FOUND; exit 0; fi
+      (( waited >= 30 )) && break
+      sleep 3; waited=$(( waited + 3 ))
+    done
+    echo DP_TIMEOUT
+  )"
+  if grep -q ADD_FAIL <<<"$dp"; then
     warn "Test-Decision konnte nicht gesetzt werden (cscli decisions add)"; rc=$(( rc<1?1:rc ))
+  else
+    added=1
+    ok "Test-Decision gesetzt (${testip}, 2m, ban)"
+    if grep -q LAPI_OK <<<"$dp"; then ok "Test-Decision in LAPI aktiv"; else warn "Test-Decision nicht in 'decisions list'"; rc=$(( rc<1?1:rc )); fi
+    if grep -q DP_FOUND <<<"$dp"; then
+      ok "Test-Decision in nftables/ipset uebernommen"
+    else
+      warn "Test-Decision nach 30s nicht in nftables/ipset - Bouncer-Pull-Intervall/Backend pruefen"; rc=$(( rc<1?1:rc ))
+    fi
   fi
+  # Cleanup-Nachweis: die Trap-Loeschung muss gegriffen haben (Decision nicht mehr aktiv).
   if (( added )); then
-    if cscli decisions list -o raw 2>/dev/null | grep -qF "$testip"; then ok "Test-Decision in LAPI aktiv"; else warn "Test-Decision nicht in 'decisions list'"; rc=$(( rc<1?1:rc )); fi
-    # 8) Uebernahme in nftables/ipset (Bouncer-Pull-Intervall abwarten)
-    sleep 3
-    if _crowdsec_ip_in_dataplane "$testip"; then ok "Test-Decision in nftables/ipset uebernommen"; else warn "Test-Decision (noch) nicht in nftables/ipset - Bouncer-Pull-Intervall abwarten und erneut pruefen"; rc=$(( rc<1?1:rc )); fi
-    # 9) Test-Decision sicher wieder loeschen (IMMER)
-    if cscli decisions delete --ip "$testip" >/dev/null 2>&1; then ok "Test-Decision wieder geloescht"; else err "Test-Decision konnte NICHT geloescht werden - manuell: sudo cscli decisions delete --ip ${testip}"; rc=2; fi
+    if cscli decisions list -o raw 2>/dev/null | grep -qF "$testip"; then
+      err "Test-Decision noch aktiv - Cleanup fehlgeschlagen: sudo cscli decisions delete --ip ${testip}"; rc=2
+    else
+      ok "Test-Decision wieder entfernt (Cleanup ok)."
+    fi
   fi
 
   # 10) UFW unveraendert + aktiv

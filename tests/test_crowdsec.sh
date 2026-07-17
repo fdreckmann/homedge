@@ -75,7 +75,7 @@ ufw() {
   fi
   echo "ufw $*" >> "$MOCKLOG"; return 0
 }
-nft()   { [[ "${1:-}" == "list" ]] && { [[ "${CS_DATAPLANE:-1}" == 1 ]] && echo "  ip 203.0.113.10 drop"; return 0; }; return 0; }
+nft()   { echo "nft $*" >> "$MOCKLOG"; [[ "${1:-}" == "list" ]] && { [[ "${CS_DATAPLANE:-1}" == 1 ]] && echo "  ip 203.0.113.10 drop"; return 0; }; return 0; }
 ipset() { [[ "${1:-}" == "list" ]] && { [[ "${CS_DATAPLANE:-1}" == 1 ]] && echo "203.0.113.10"; return 0; }; return 0; }
 apt-get() { echo "apt-get $*" >> "$MOCKLOG"; if [[ "${CS_APT_FAIL:-0}" == 1 && "${1:-}" == "update" ]]; then echo "E: Failed to fetch ... 404  Not Found"; return 1; fi; return 0; }
 iptables() { [[ "${1:-}" == "-V" ]] && echo "iptables v1.8.7 (${IPT_BACKEND:-nf_tables})"; return 0; }
@@ -202,12 +202,19 @@ rc=0; crowdsec_selftest >/dev/null 2>&1 || rc=$?
 ck "LAPI down -> rc=2" "$rc" "2"
 ck "Cleanup auch bei Fehler" "$(grep -c 'decisions delete --ip 203.0.113.10' "$MOCKLOG")" "1"
 CS_LAPI=1
-# 6c: Dataplane-Uebernahme fehlt -> Warnung -> rc 1 (nicht kritisch), Delete trotzdem
+# 6c: Dataplane-Uebernahme fehlt -> Poll bis Timeout -> WARN -> rc 1, Delete trotzdem
 : > "$MOCKLOG"; CS_DATAPLANE=0 CS_DECISION_SET=0
 rc=0; crowdsec_selftest >/dev/null 2>&1 || rc=$?
 ck "Dataplane fehlt -> rc=1" "$rc" "1"
-ck "Delete auch hier"        "$(grep -c 'decisions delete --ip 203.0.113.10' "$MOCKLOG")" "1"
+ck "Delete GENAU einmal (Trap-Cleanup)" "$(grep -c 'decisions delete --ip 203.0.113.10' "$MOCKLOG")" "1"
+# Poll muss mehrfach nftables geprueft haben (nicht nur einmal wie frueher).
+ck "Poll prueft Dataplane mehrfach" "$([[ $(grep -c '^nft list' "$MOCKLOG") -ge 2 ]] && echo y || echo n)" "y"
 CS_DATAPLANE=1
+# 6c2: Dataplane sofort vorhanden -> KEIN langes Pollen (Fund beim 1. Check)
+: > "$MOCKLOG"; CS_DATAPLANE=1 CS_DECISION_SET=0
+rc=0; crowdsec_selftest >/dev/null 2>&1 || rc=$?
+ck "Dataplane sofort -> rc=0" "$rc" "0"
+ck "Fund sofort: nur 1 nft-Check" "$(grep -c '^nft list' "$MOCKLOG")" "1"
 # 6d: nicht installiert -> rc 2
 ( unset -f cscli; rc=0; crowdsec_selftest >/dev/null 2>&1 || rc=$?; [[ "$rc" == 2 ]] ) && echo "OK   nicht installiert -> rc=2" && pass=$((pass+1)) || { echo "FAIL nicht installiert -> rc=2"; fail=$((fail+1)); }
 
