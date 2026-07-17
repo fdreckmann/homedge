@@ -77,7 +77,7 @@ ufw() {
 }
 nft()   { [[ "${1:-}" == "list" ]] && { [[ "${CS_DATAPLANE:-1}" == 1 ]] && echo "  ip 203.0.113.10 drop"; return 0; }; return 0; }
 ipset() { [[ "${1:-}" == "list" ]] && { [[ "${CS_DATAPLANE:-1}" == 1 ]] && echo "203.0.113.10"; return 0; }; return 0; }
-apt-get() { echo "apt-get $*" >> "$MOCKLOG"; return 0; }
+apt-get() { echo "apt-get $*" >> "$MOCKLOG"; if [[ "${CS_APT_FAIL:-0}" == 1 && "${1:-}" == "update" ]]; then echo "E: Failed to fetch ... 404  Not Found"; return 1; fi; return 0; }
 iptables() { [[ "${1:-}" == "-V" ]] && echo "iptables v1.8.7 (${IPT_BACKEND:-nf_tables})"; return 0; }
 dpkg() { [[ "${1:-}" == "--print-architecture" ]] && echo "amd64"; return 0; }
 lsb_release() { [[ "${1:-}" == "-cs" ]] && echo "bookworm"; return 0; }
@@ -128,26 +128,55 @@ ck "KEIN 0.0.0.0/0"                "$(grep -c '0.0.0.0/0' "$WL")" "0"
 ck "KEIN ::/0"                     "$(grep -c '::/0' "$WL")" "0"
 ck "KEIN Muell"                    "$(grep -c 'bogus' "$WL")" "0"
 
-echo "== 4) _crowdsec_setup_repo (kein curl|bash) =="
+echo "== 4) _crowdsec_setup_repo (any/any, kein curl|bash) =="
 LIST="$T/root/etc/apt/sources.list.d/crowdsec_crowdsec.list"
-KEYRING="$T/root/usr/share/keyrings/crowdsec_crowdsec-archive-keyring.gpg"
-# 4a idempotent: vorhandene Liste -> skip, kein curl
-mkdir -p "$(dirname "$LIST")"; echo "existing" > "$LIST"; : > "$MOCKLOG"
+KEYRING="$T/root/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg"
+mkdir -p "$(dirname "$LIST")"
+set_osrel() { printf 'ID=%s\nVERSION_CODENAME=%s\n' "$1" "$2" > "$T/root/etc/os-release"; }
+
+# 4a: bereits korrekt (any/any) -> skip, kein curl, Liste unveraendert
+printf 'deb [signed-by=%s] https://packagecloud.io/crowdsec/crowdsec/any/ any main\n' "$KEYRING" > "$LIST"
+before="$(cat "$LIST")"; : > "$MOCKLOG"
 rc=0; _crowdsec_setup_repo >/dev/null 2>&1 || rc=$?
-ck "idempotent rc=0"           "$rc" "0"
-ck "idempotent ruft KEIN curl" "$(grep -c '^curl ' "$MOCKLOG")" "0"
-ck "idempotent laesst Liste"   "$(cat "$LIST")" "existing"
-# 4b frisch: Liste weg -> Keyring+Liste schreiben, curl gpgkey, apt-get update
-rm -f "$LIST" "$KEYRING"; : > "$MOCKLOG"
+ck "korrekt vorhanden rc=0"       "$rc" "0"
+ck "korrekt: KEIN curl"           "$(grep -c '^curl ' "$MOCKLOG")" "0"
+ck "korrekt: Liste unveraendert"  "$(cat "$LIST")" "$before"
+
+# 4b: falscher Distro-/Codename-Eintrag -> wird auf any/any korrigiert
+printf 'deb [signed-by=%s arch=amd64] https://packagecloud.io/crowdsec/crowdsec/debian/ trixie main\n' "$KEYRING" > "$LIST"
+: > "$MOCKLOG"
 rc=0; _crowdsec_setup_repo >/dev/null 2>&1 || rc=$?
-ck "frisch rc=0"                 "$rc" "0"
-ck "Keyring erstellt"            "$([[ -s "$KEYRING" ]] && echo y)" "y"
-ck "Liste hat signed-by (deb+deb-src)" "$(grep -c 'signed-by=' "$LIST")" "2"
-ck "Liste zeigt auf packagecloud" "$(grep -c 'packagecloud.io/crowdsec/crowdsec' "$LIST")" "2"
-ck "KEIN install.crowdsec.net"   "$(grep -c 'install.crowdsec.net' "$LIST")" "0"
-ck "curl holt gpgkey"            "$(grep -c 'gpgkey' "$MOCKLOG")" "1"
-ck "KEIN pipe-to-bash"           "$(grep -cE 'curl.*\| *bash' "$MOCKLOG")" "0"
-ck "apt-get update aufgerufen"   "$(grep -c 'apt-get update' "$MOCKLOG")" "1"
+ck "korrektur rc=0"                    "$rc" "0"
+ck "korrektur: any/any gesetzt"        "$(grep -c 'crowdsec/any/ any main' "$LIST")" "2"
+ck "korrektur: KEIN debian/trixie mehr" "$(grep -c 'crowdsec/debian/' "$LIST")" "0"
+ck "korrektur: curl holt gpgkey"       "$(grep -c 'gpgkey' "$MOCKLOG")" "1"
+ck "korrektur: apt-get update"         "$(grep -c 'apt-get update' "$MOCKLOG")" "1"
+
+# 4c: frisch (keine Liste) -> any/any, Keyring unter /etc/apt/keyrings
+rm -f "$LIST" "$KEYRING"; set_osrel debian trixie; : > "$MOCKLOG"
+rc=0; _crowdsec_setup_repo >/dev/null 2>&1 || rc=$?
+ck "frisch rc=0"                        "$rc" "0"
+ck "Keyring unter /etc/apt/keyrings"    "$([[ -s "$KEYRING" ]] && echo y)" "y"
+ck "Liste hat signed-by (deb+deb-src)"  "$(grep -c 'signed-by=' "$LIST")" "2"
+ck "KEIN Distro-/Codename-Pfad"         "$(grep -cE 'crowdsec/(debian|ubuntu)/' "$LIST")" "0"
+ck "KEIN install.crowdsec.net"          "$(grep -c 'install.crowdsec.net' "$LIST")" "0"
+ck "KEIN pipe-to-bash"                  "$(grep -cE 'curl.*\| *bash' "$MOCKLOG")" "0"
+
+# 4d: Trixie/Bookworm/Ubuntu erzeugen ALLE denselben any/any-Eintrag
+expected="$(printf 'deb [signed-by=%s] https://packagecloud.io/crowdsec/crowdsec/any/ any main' "$KEYRING")"
+for combo in "debian trixie" "debian bookworm" "ubuntu jammy"; do
+  read -r d c <<<"$combo"
+  rm -f "$LIST"; set_osrel "$d" "$c"; : > "$MOCKLOG"
+  _crowdsec_setup_repo >/dev/null 2>&1 || true
+  ck "any/any-Eintrag fuer ${d}/${c}" "$(grep -m1 '^deb ' "$LIST")" "$expected"
+done
+
+# 4e: apt-get update schlaegt fehl -> rc=1 und ECHTE Fehlerausgabe sichtbar
+rm -f "$LIST"; set_osrel debian trixie; CS_APT_FAIL=1
+rc=0; out="$(_crowdsec_setup_repo 2>&1)" || rc=$?
+ck "apt-Fehler -> rc=1"            "$rc" "1"
+ck "echte apt-Fehlerausgabe"       "$(grep -c '404  Not Found' <<<"$out")" "1"
+CS_APT_FAIL=0
 
 echo "== 5) crowdsec_detect_bouncer =="
 load_env
