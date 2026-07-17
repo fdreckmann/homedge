@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.26-homeedge"
+APP_VERSION="0.9.27-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -627,7 +627,25 @@ EOCADDY
             roll_keep 5
             roll_keep_for 168h
         }
-        format json
+        # Sensible Jellyfin-Tokens NUR in der Logausgabe schwaerzen - der echte
+        # Request bleibt unveraendert. "wrap json" behaelt exakt das JSON-Format
+        # bei, damit CrowdSec- und Fail2ban-Parser weiter funktionieren.
+        # Query-Parameter (Streaming/WebSocket-ApiKey) und Emby/MediaBrowser-Header.
+        format filter {
+            wrap json
+            fields {
+                request>uri query {
+                    replace ApiKey REDACTED
+                    replace apiKey REDACTED
+                    replace api_key REDACTED
+                    replace access_token REDACTED
+                    replace token REDACTED
+                }
+                request>headers>X-Emby-Token replace REDACTED
+                request>headers>X-Mediabrowser-Token replace REDACTED
+                request>headers>X-MediaBrowser-Token replace REDACTED
+            }
+        }
     }
 }
 EOCADDY
