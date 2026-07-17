@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.22-homeedge"
+APP_VERSION="0.9.23-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -34,6 +34,14 @@ BESZEL_BIN="/usr/local/bin/beszel-agent"
 BESZEL_UNIT="/etc/systemd/system/beszel-agent.service"
 BESZEL_PORT_DEFAULT="45876"
 BESZEL_DOWNLOAD_BASE="https://github.com/henrygd/beszel/releases/latest/download"
+
+# CrowdSec (optionales Security-Modul, Phase 1). Ergaenzt Fail2ban + caddy-auth,
+# ersetzt sie NICHT. Oeffnet KEINE neuen Ports und aendert KEINE UFW-Regeln;
+# der Firewall-Bouncer setzt Decisions ueber EIGENE nft/iptables-Regeln durch
+# (IPv4 + IPv6). Nutzt dieselbe Caddy-Access-Logdatei wie Fail2ban. Lokaler
+# Schutz funktioniert ohne CrowdSec Console (Console ist optional).
+CROWDSEC_ACQUIS_FILE="/etc/crowdsec/acquis.d/homeedge-caddy.yaml"
+CROWDSEC_BOUNCER_SVC="crowdsec-firewall-bouncer"
 
 mkdir -p "$CFG_DIR" "$EDGE_DIR" "$KEY_DIR"
 
@@ -211,6 +219,8 @@ load_env() {
   WG_MTU="${WG_MTU:-}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
   MIGRATION_MODE="${MIGRATION_MODE:-0}"
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
+  ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-0}"; CROWDSEC_CONSOLE="${CROWDSEC_CONSOLE:-0}"
+  CROWDSEC_CADDY_LOG="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"; CROWDSEC_BOUNCER="${CROWDSEC_BOUNCER:-auto}"
   if [[ -f "$ENV_FILE" ]]; then
     # Beschaedigten/mehrzeiligen Token VOR dem Sourcen reparieren.
     repair_env_file
@@ -227,6 +237,9 @@ load_env() {
     WG_MTU="${WG_MTU:-}"; ENABLE_IPV6="${ENABLE_IPV6:-0}"
     MIGRATION_MODE="${MIGRATION_MODE:-0}"
     F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
+    # CrowdSec-Defaults fuer aeltere Env-Dateien absichern.
+    ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-0}"; CROWDSEC_CONSOLE="${CROWDSEC_CONSOLE:-0}"
+    CROWDSEC_CADDY_LOG="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"; CROWDSEC_BOUNCER="${CROWDSEC_BOUNCER:-auto}"
   fi
 }
 
@@ -262,6 +275,10 @@ MIGRATION_MODE=$(q "${MIGRATION_MODE:-0}")
 F2B_CADDY_MAXRETRY=$(q "${F2B_CADDY_MAXRETRY:-20}")
 F2B_CADDY_FINDTIME=$(q "${F2B_CADDY_FINDTIME:-10m}")
 F2B_CADDY_BANTIME=$(q "${F2B_CADDY_BANTIME:-15m}")
+ENABLE_CROWDSEC=$(q "${ENABLE_CROWDSEC:-0}")
+CROWDSEC_CONSOLE=$(q "${CROWDSEC_CONSOLE:-0}")
+CROWDSEC_CADDY_LOG=$(q "${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}")
+CROWDSEC_BOUNCER=$(q "${CROWDSEC_BOUNCER:-auto}")
 EOCFG
   chmod 600 "$ENV_FILE"
 }
@@ -1309,6 +1326,248 @@ f2b_just_restart() {
   section "Fail2ban neu starten"
   systemctl restart fail2ban && ok "Fail2ban neu gestartet." || err "Neustart fehlgeschlagen."
   fail2ban-client status || true
+}
+
+
+# ------------------------------------------------------------
+# CrowdSec (optionales Security-Modul, Phase 1)
+# ------------------------------------------------------------
+# Grundsaetze: ergaenzt Fail2ban + caddy-auth (ersetzt sie NICHT), oeffnet KEINE
+# neuen Ports, aendert KEINE UFW-Regeln, kein Geo-Blocking, kein WAF/AppSec,
+# keine Jellyfin-spezifischen Login-Bans. Der lokale Schutz funktioniert ohne
+# CrowdSec Console; die Console ist optional und wird nie automatisch verbunden.
+
+# 0 = cscli/crowdsec vorhanden.
+crowdsec_installed() { command -v cscli >/dev/null 2>&1; }
+
+# Erkennt das passende Firewall-Bouncer-Backend: "nftables" oder "iptables".
+# CROWDSEC_BOUNCER kann das erzwingen (nftables|iptables), sonst Auto-Erkennung
+# ueber das iptables-Backend (nf_tables vs. legacy). Gibt genau ein Wort aus.
+crowdsec_detect_bouncer() {
+  load_env
+  case "${CROWDSEC_BOUNCER:-auto}" in
+    nftables|nft) echo "nftables"; return 0 ;;
+    iptables|legacy) echo "iptables"; return 0 ;;
+  esac
+  # Auto: primaeres Signal ist der iptables-Backend-Tag.
+  local ver; ver="$(iptables -V 2>/dev/null || true)"
+  if grep -qi 'nf_tables' <<<"$ver"; then echo "nftables"; return 0; fi
+  if grep -qi 'legacy'    <<<"$ver"; then echo "iptables"; return 0; fi
+  # Kein eindeutiger Tag: nft nutzbar -> nftables, sonst iptables.
+  if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then echo "nftables"; return 0; fi
+  echo "iptables"
+}
+
+# Schreibt die Acquisition-Datei fuer das Caddy-Access-Log und stellt die
+# Logdatei sicher (wie Fail2ban), damit die Acquisition nicht mit Fehler startet.
+crowdsec_write_acquis() {
+  load_env
+  local log="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"
+  mkdir -p "$(dirname "$log")"; touch "$log"
+  mkdir -p /etc/crowdsec/acquis.d
+  cat > "$CROWDSEC_ACQUIS_FILE" <<EOF
+filenames:
+  - ${log}
+labels:
+  type: caddy
+EOF
+  ok "Acquisition geschrieben: ${CROWDSEC_ACQUIS_FILE} -> ${log}"
+}
+
+# Interner Helfer: Firewall-Bouncer passend zum Backend installieren/aktivieren.
+# Nutzt ausschliesslich CrowdSec-eigene Regeln (kein UFW-Eingriff), IPv4 + IPv6.
+_crowdsec_install_bouncer() {
+  local backend pkg
+  backend="$(crowdsec_detect_bouncer)"
+  case "$backend" in
+    nftables) pkg="crowdsec-firewall-bouncer-nftables" ;;
+    *)        pkg="crowdsec-firewall-bouncer-iptables" ;;
+  esac
+  info "Firewall-Bouncer-Backend: ${backend} (Paket ${pkg})."
+  if systemctl list-unit-files 2>/dev/null | grep -q "^${CROWDSEC_BOUNCER_SVC}"; then
+    info "Firewall-Bouncer bereits vorhanden - aktiviere/starte neu."
+  else
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"; then return 1; fi
+  fi
+  systemctl enable "$CROWDSEC_BOUNCER_SVC" >/dev/null 2>&1 || true
+  systemctl restart "$CROWDSEC_BOUNCER_SVC" >/dev/null 2>&1 || true
+  ok "Firewall-Bouncer aktiv (IPv4 + IPv6, eigene ${backend}-Regeln - UFW unveraendert)."
+  return 0
+}
+
+crowdsec_install() {
+  need_root; load_env
+  section "CrowdSec installieren / aktivieren"
+  info "CrowdSec ergaenzt Fail2ban und caddy-auth - beide bleiben unveraendert aktiv."
+  info "Es werden KEINE neuen Ports geoeffnet und KEINE UFW-Regeln geaendert."
+
+  # 1) Offizielles APT-Repo einrichten (falls noch nicht vorhanden).
+  if ! crowdsec_installed && [[ ! -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]]; then
+    info "Richte offizielles CrowdSec APT-Repo ein ..."
+    if ! command -v curl >/dev/null 2>&1; then
+      err "curl fehlt - bitte installieren: sudo apt-get install -y curl"; return 1
+    fi
+    if ! curl -s https://install.crowdsec.net | bash; then
+      err "CrowdSec-Repo-Setup fehlgeschlagen."; return 1
+    fi
+  fi
+
+  # 2) Paket installieren (nur wenn noch nicht vorhanden).
+  if ! crowdsec_installed; then
+    DEBIAN_FRONTEND=noninteractive apt-get update || true
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec; then
+      err "apt-get install crowdsec fehlgeschlagen."; return 1
+    fi
+  else
+    info "CrowdSec ist bereits installiert - aktualisiere nur Konfiguration/Collections."
+  fi
+  crowdsec_installed || { err "cscli nach der Installation nicht gefunden."; return 1; }
+
+  # 3) Acquisition fuer das Caddy-Access-Log.
+  crowdsec_write_acquis
+
+  # 4) Collections (idempotent): Linux-Basis, SSH und Caddy.
+  info "Installiere Collections (linux, sshd, caddy) ..."
+  cscli collections install crowdsecurity/linux crowdsecurity/sshd crowdsecurity/caddy 2>/dev/null || true
+
+  # 5) Firewall-Bouncer (eigene nft/iptables-Regeln, kein UFW-Eingriff).
+  _crowdsec_install_bouncer || warn "Firewall-Bouncer nicht automatisch installiert - Decisions werden erkannt, aber evtl. nicht durchgesetzt."
+
+  # 6) Dienst aktivieren und mit neuer Acquisition/Collections neu starten.
+  systemctl enable crowdsec >/dev/null 2>&1 || true
+  systemctl restart crowdsec >/dev/null 2>&1 || true
+
+  ENABLE_CROWDSEC=1; save_env
+  ok "CrowdSec ist aktiviert (ENABLE_CROWDSEC=1)."
+  echo
+  info "Lokaler Schutz laeuft jetzt ohne CrowdSec Console."
+  info "Optional: Console verbinden ueber 'sudo homeedge crowdsec-console' (Enrollment-Key noetig)."
+  crowdsec_status
+}
+
+crowdsec_status() {
+  load_env
+  section "CrowdSec Status"
+  if ! crowdsec_installed; then
+    warn "CrowdSec ist nicht installiert. Installation: sudo homeedge crowdsec-install"
+    return 0
+  fi
+  local log="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"
+  printf '  %-28s %s\n' "ENABLE_CROWDSEC:" "${ENABLE_CROWDSEC:-0}"
+  printf '  %-28s %s\n' "CROWDSEC_CONSOLE:" "${CROWDSEC_CONSOLE:-0}"
+  systemctl is-active --quiet crowdsec 2>/dev/null && ok "crowdsec Dienst aktiv" || warn "crowdsec Dienst NICHT aktiv"
+  if systemctl is-active --quiet "$CROWDSEC_BOUNCER_SVC" 2>/dev/null; then ok "Firewall-Bouncer aktiv (${CROWDSEC_BOUNCER_SVC})"; else warn "Firewall-Bouncer NICHT aktiv"; fi
+  [[ -f "$CROWDSEC_ACQUIS_FILE" ]] && ok "Acquisition vorhanden: ${CROWDSEC_ACQUIS_FILE}" || warn "Acquisition fehlt: ${CROWDSEC_ACQUIS_FILE}"
+  [[ -f "$log" ]] && ok "Caddy-Log vorhanden: ${log}" || warn "Caddy-Log fehlt: ${log}"
+  echo; info "Registrierte Bouncer:"; cscli bouncers list 2>/dev/null || true
+  echo; info "Console-Status:"; cscli console status 2>/dev/null || true
+}
+
+crowdsec_alerts()          { load_env; crowdsec_installed || { warn "CrowdSec nicht installiert."; return 0; }; section "CrowdSec Alerts";      cscli alerts list 2>/dev/null || true; }
+crowdsec_decisions()       { load_env; crowdsec_installed || { warn "CrowdSec nicht installiert."; return 0; }; section "CrowdSec Decisions";   cscli decisions list 2>/dev/null || true; }
+crowdsec_metrics()         { load_env; crowdsec_installed || { warn "CrowdSec nicht installiert."; return 0; }; section "CrowdSec Metrics";     cscli metrics 2>/dev/null || true; }
+crowdsec_collections()     { load_env; crowdsec_installed || { warn "CrowdSec nicht installiert."; return 0; }; section "CrowdSec Collections"; cscli collections list 2>/dev/null || true; }
+crowdsec_console_status()  { load_env; crowdsec_installed || { warn "CrowdSec nicht installiert."; return 0; }; section "CrowdSec Console Status"; cscli console status 2>/dev/null || true; }
+
+# IP entbannen: loescht die aktive Decision fuer die IP.
+crowdsec_unban() {
+  need_root; load_env
+  crowdsec_installed || { err "CrowdSec ist nicht installiert."; return 1; }
+  local ip="${1:-}"
+  [[ -z "$ip" ]] && ip="$(ask "IP zum Entbannen")"
+  if ! [[ "$ip" =~ ^[0-9A-Fa-f:.]+(/[0-9]+)?$ ]]; then err "Ungueltige IP: ${ip}"; return 1; fi
+  section "CrowdSec Decision loeschen: ${ip}"
+  if cscli decisions delete --ip "$ip"; then ok "Decision(s) fuer ${ip} geloescht."; else err "Loeschen fehlgeschlagen (evtl. keine aktive Decision fuer ${ip})."; return 1; fi
+}
+
+# Hub/Collections aktualisieren (kein Dienst-Bruch: reload bevorzugt).
+crowdsec_update() {
+  need_root; load_env
+  crowdsec_installed || { err "CrowdSec ist nicht installiert."; return 1; }
+  section "CrowdSec Hub / Collections aktualisieren"
+  cscli hub update || true
+  cscli hub upgrade || true
+  systemctl reload crowdsec 2>/dev/null || systemctl restart crowdsec 2>/dev/null || true
+  ok "CrowdSec Hub/Collections aktualisiert."
+}
+
+# Console optional verbinden. Wird NIE automatisch aufgerufen; Key wird abgefragt.
+crowdsec_console_enroll() {
+  need_root; load_env
+  crowdsec_installed || { err "CrowdSec ist nicht installiert. Zuerst: sudo homeedge crowdsec-install"; return 1; }
+  section "CrowdSec Console verbinden"
+  info "Die Console ist optional - der lokale Schutz funktioniert auch ohne."
+  local key="${1:-}"
+  [[ -z "$key" ]] && key="$(ask "CrowdSec Console Enrollment-Key")"
+  [[ -z "$key" ]] && { err "Kein Enrollment-Key angegeben - abgebrochen."; return 1; }
+  if cscli console enroll "$key" --name homeedge-vps --tags homeedge --tags jellyfin --tags vps; then
+    CROWDSEC_CONSOLE=1; save_env
+    systemctl reload crowdsec 2>/dev/null || systemctl restart crowdsec 2>/dev/null || true
+    ok "Enrollment gesendet."
+    warn "Bitte die Instanz jetzt in der CrowdSec Console bestaetigen (Approve)."
+  else
+    err "Console-Enrollment fehlgeschlagen - Key pruefen."
+    return 1
+  fi
+}
+
+# Rollback: CrowdSec + Bouncer stoppen/deaktivieren, ENABLE_CROWDSEC=0. Ruehrt
+# Fail2ban, Caddy, UFW und WireGuard NICHT an und deinstalliert NICHTS (kein apt purge).
+crowdsec_disable() {
+  need_root; load_env
+  section "CrowdSec deaktivieren"
+  warn "Deaktiviert CrowdSec + Firewall-Bouncer. Fail2ban, caddy-auth, Caddy, UFW und WireGuard bleiben UNVERAENDERT."
+  info "Es wird KEIN 'apt purge' ausgefuehrt - die Pakete bleiben installiert."
+  systemctl stop "$CROWDSEC_BOUNCER_SVC" 2>/dev/null || true
+  systemctl disable "$CROWDSEC_BOUNCER_SVC" 2>/dev/null || true
+  systemctl stop crowdsec 2>/dev/null || true
+  systemctl disable crowdsec 2>/dev/null || true
+  ENABLE_CROWDSEC=0; save_env
+  ok "CrowdSec deaktiviert (ENABLE_CROWDSEC=0). Dienste gestoppt/disabled, nichts deinstalliert."
+  info "Wieder aktivieren: sudo homeedge crowdsec-install"
+}
+
+sm_crowdsec() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Sicherheit > CrowdSec"
+    load_env
+    if crowdsec_installed; then
+      echo "   Status: installiert   ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-0}   Console=${CROWDSEC_CONSOLE:-0}"
+    else
+      echo "   Status: NICHT installiert"
+    fi
+    info "Ergaenzt Fail2ban + caddy-auth (ersetzt sie nicht). Keine neuen Ports, kein UFW-Eingriff."
+    line
+    menu_item 1 "CrowdSec installieren / aktivieren"
+    menu_item 2 "Status anzeigen"
+    menu_item 3 "Alerts anzeigen"
+    menu_item 4 "Decisions anzeigen"
+    menu_item 5 "Metrics anzeigen"
+    menu_item 6 "Collections anzeigen"
+    menu_item 7 "IP entbannen (Decision loeschen)"
+    menu_item 8 "Collections / Hub aktualisieren"
+    menu_item 9 "CrowdSec Console verbinden"
+    menu_item 10 "CrowdSec Console Status"
+    menu_item 11 "CrowdSec deaktivieren"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) crowdsec_install; pause ;;
+      2) crowdsec_status; pause ;;
+      3) crowdsec_alerts; pause ;;
+      4) crowdsec_decisions; pause ;;
+      5) crowdsec_metrics; pause ;;
+      6) crowdsec_collections; pause ;;
+      7) crowdsec_unban; pause ;;
+      8) crowdsec_update; pause ;;
+      9) crowdsec_console_enroll; pause ;;
+      10) crowdsec_console_status; pause ;;
+      11) crowdsec_disable; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
 }
 
 
@@ -3690,6 +3949,15 @@ health_check() {
     _health_line red "Fail2ban" "nicht aktiv"
   fi
 
+  # CrowdSec nur bewerten, wenn das optionale Modul aktiviert ist.
+  if [[ "${ENABLE_CROWDSEC:-0}" == "1" ]]; then
+    if systemctl is-active --quiet crowdsec 2>/dev/null; then _health_line green "CrowdSec" "aktiv"; else _health_line red "CrowdSec" "aktiviert, aber Dienst nicht aktiv"; fi
+    if systemctl is-active --quiet "$CROWDSEC_BOUNCER_SVC" 2>/dev/null; then _health_line green "CrowdSec Bouncer" "aktiv (${CROWDSEC_BOUNCER_SVC})"; else _health_line red "CrowdSec Bouncer" "nicht aktiv - Decisions evtl. nicht durchgesetzt"; fi
+    [[ -f "$CROWDSEC_ACQUIS_FILE" ]] && _health_line green "CrowdSec Acquisition" "$CROWDSEC_ACQUIS_FILE" || _health_line red "CrowdSec Acquisition" "fehlt: $CROWDSEC_ACQUIS_FILE"
+    local _cslog="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"
+    [[ -f "$_cslog" ]] && _health_line green "CrowdSec Caddy-Log" "$_cslog" || _health_line yellow "CrowdSec Caddy-Log" "fehlt: $_cslog"
+  fi
+
   if ufw status 2>/dev/null | grep -qi "Status: active\|Status: aktiv"; then
     _health_line green "UFW Firewall" "aktiv"
   else
@@ -4689,9 +4957,10 @@ sm_security() {
     menu_item 2 "UFW Status"
     menu_item 3 "UFW Regeln anzeigen"
     menu_item 4 "Fail2ban verwalten"
-    menu_item 5 "SSH Hardening pruefen"
-    menu_item 6 "Jellyfin Sicherheitscheckliste"
-    menu_item 7 "Firewall neu anwenden"
+    menu_item 5 "CrowdSec verwalten"
+    menu_item 6 "SSH Hardening pruefen"
+    menu_item 7 "Jellyfin Sicherheitscheckliste"
+    menu_item 8 "Firewall neu anwenden"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
@@ -4699,9 +4968,10 @@ sm_security() {
       2) security_firewall; pause ;;
       3) ufw_rules; pause ;;
       4) sm_fail2ban ;;
-      5) security_ssh_status; pause ;;
-      6) security_jellyfin_checklist; pause ;;
-      7) apply_firewall; pause ;;
+      5) sm_crowdsec ;;
+      6) security_ssh_status; pause ;;
+      7) security_jellyfin_checklist; pause ;;
+      8) apply_firewall; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -4966,10 +5236,22 @@ case "${1:-menu}" in
   beszel-update) beszel_update ;;
   beszel-uninstall) beszel_uninstall ;;
   beszel-check-firewall|beszel-lockdown) beszel_check_firewall ;;
+  crowdsec|cs) sm_crowdsec ;;
+  crowdsec-install) need_root; crowdsec_install ;;
+  crowdsec-status) need_root; crowdsec_status ;;
+  crowdsec-alerts) need_root; crowdsec_alerts ;;
+  crowdsec-decisions) need_root; crowdsec_decisions ;;
+  crowdsec-metrics) need_root; crowdsec_metrics ;;
+  crowdsec-collections) need_root; crowdsec_collections ;;
+  crowdsec-unban) need_root; crowdsec_unban "${2:-}" ;;
+  crowdsec-update) need_root; crowdsec_update ;;
+  crowdsec-console) need_root; crowdsec_console_enroll "${2:-}" ;;
+  crowdsec-console-status) need_root; crowdsec_console_status ;;
+  crowdsec-disable) need_root; crowdsec_disable ;;
   test-backends) test_backends ;;
   logs) show_logs ;;
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|caddy-update|monitoring|beszel-install|beszel-reconfigure|beszel-status|beszel-logs|beszel-restart|beszel-update|beszel-uninstall|beszel-check-firewall|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|caddy-update|monitoring|beszel-install|beszel-reconfigure|beszel-status|beszel-logs|beszel-restart|beszel-update|beszel-uninstall|beszel-check-firewall|crowdsec|crowdsec-install|crowdsec-status|crowdsec-alerts|crowdsec-decisions|crowdsec-metrics|crowdsec-collections|crowdsec-unban|crowdsec-update|crowdsec-console|crowdsec-console-status|crowdsec-disable|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac
