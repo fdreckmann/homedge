@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.21-homeedge"
+APP_VERSION="0.9.22-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -438,7 +438,9 @@ edit_wg_interface() {
 
 edit_wg_port() {
   load_env
-  WG_PORT="$(ask "WireGuard UDP Port" "$WG_PORT")"
+  local _p; _p="$(ask "WireGuard UDP Port" "$WG_PORT")"
+  if ! [[ "$_p" =~ ^[0-9]+$ ]] || (( _p < 1 || _p > 65535 )); then err "Ungueltiger Port (1-65535). Unveraendert."; return 1; fi
+  WG_PORT="$_p"
   save_env; write_wg_config; write_unifi_values; restart_wg
   warn "Den Port auch in UniFi und ggf. in der Firewall aktualisieren. UFW-Menuepunkt kann die Regel neu setzen."
 }
@@ -580,7 +582,7 @@ generate_caddyfile_to() {
     auto_https disable_redirects
 EOCADDY
 
-  if [[ "${ENABLE_HTTP3:-1}" != "1" ]]; then
+  if [[ "${ENABLE_HTTP3:-0}" != "1" ]]; then
     cat >> "$out" <<'EOCADDY'
     servers {
         protocols h1 h2
@@ -739,7 +741,10 @@ _validate_caddyfile_path() {
     CADDY_VALIDATE_OUTPUT="Validate-Timeout nach ${CADDY_VALIDATE_TIMEOUT}s (Docker/VPS ueberlastet?). ${CADDY_VALIDATE_OUTPUT}"
   elif (( rc == 130 || rc == 137 || rc == 143 )); then
     CADDY_VALIDATE_STATUS="aborted"
-  elif grep -qiE 'cloudflare|getting dns provider|unknown dns provider' <<<"${CADDY_VALIDATE_OUTPUT}"; then
+  elif grep -qiE 'module not registered|getting dns provider module|unknown dns provider|not registered:[[:space:]]*dns\.providers' <<<"${CADDY_VALIDATE_OUTPUT}"; then
+    # Nur ECHTES Fehlen des DNS-Moduls (Image ohne caddy-dns/cloudflare). Das
+    # blosse Wort "cloudflare" wuerde sonst jeden ungueltigen/token-losen Fehler
+    # faelschlich als "Modul fehlt" einstufen (Caddyfile enthaelt immer "dns cloudflare").
     CADDY_VALIDATE_STATUS="module_missing"
   else
     CADDY_VALIDATE_STATUS="invalid"
@@ -1128,6 +1133,11 @@ f2b_thresholds() {
   ft="$(ask "findtime (z.B. 10m)" "${F2B_CADDY_FINDTIME}")"
   bt="$(ask "bantime (z.B. 15m)" "${F2B_CADDY_BANTIME}")"
   [[ "$mr" =~ ^[0-9]+$ ]] || { err "maxretry muss eine Zahl sein."; return 1; }
+  # findtime/bantime muessen ein gueltiges Fail2ban-Zeitformat sein (z. B. 10m,
+  # 1h, 600). Sonst schlaegt spaeter JEDER "fail2ban-client -t" fehl und rollt
+  # caddy-auth still zurueck - deshalb VOR dem Speichern pruefen.
+  [[ "$ft" =~ ^[0-9]+[smhdw]?$ ]] || { err "findtime ungueltig (z. B. 600, 10m, 1h)."; return 1; }
+  [[ "$bt" =~ ^[0-9]+[smhdw]?$ ]] || { err "bantime ungueltig (z. B. 900, 15m, 1h)."; return 1; }
   F2B_CADDY_MAXRETRY="$mr"; F2B_CADDY_FINDTIME="$ft"; F2B_CADDY_BANTIME="$bt"
   save_env; install_fail2ban
   ok "Schwellenwerte gespeichert: maxretry=${mr} findtime=${ft} bantime=${bt}"
@@ -1397,7 +1407,10 @@ apply_firewall() {
   # Lockout-Schutz: NUR aktivieren, wenn der SSH-Port (und der aktive Sitzungsport)
   # nach _ufw_rules_apply wirklich als ALLOW-Regel vorhanden ist. Sonst wuerde
   # "ufw --force enable" bei default-deny die laufende SSH-Sitzung aussperren.
-  local ufw_rules; ufw_rules="$(ufw status 2>/dev/null || true)"
+  # WICHTIG: "ufw show added" (NICHT "ufw status") - nach dem "ufw --force reset"
+  # ist UFW inaktiv, und "ufw status" listet dann KEINE Regeln (nur "Status:
+  # inactive"). Nur "ufw show added" zeigt die gerade gestagten allow-Regeln.
+  local ufw_rules; ufw_rules="$(ufw show added 2>/dev/null || true)"
   if ! grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
     err "SSH-Port ${SSH_PORT}/tcp ist NICHT als UFW-Regel vorhanden - Firewall wird NICHT aktiviert (Aussperr-Schutz)."
     err "Bitte SSH_PORT pruefen (sudo homeedge settings) und erneut versuchen."
@@ -1435,14 +1448,19 @@ ufw_ensure_active() {
   _ufw_rules_apply
   # Lockout-Schutz: vor dem Aktivieren sicherstellen, dass die SSH-Regel da ist.
   local cur_ssh_port; cur_ssh_port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
-  local ufw_rules; ufw_rules="$(ufw status 2>/dev/null || true)"
+  # Aktiv-Status aus "ufw status"; die gestagten Regeln aus "ufw show added" -
+  # "ufw status" listet bei INAKTIVER UFW KEINE Regeln (nur "Status: inactive"),
+  # daher wuerde der SSH-Check sonst immer fehlschlagen und UFW nie aktiviert.
+  local ufw_rules ufw_added
+  ufw_rules="$(ufw status 2>/dev/null || true)"
+  ufw_added="$(ufw show added 2>/dev/null || true)"
   if ! grep -qiE "Status: (active|aktiv)" <<<"$ufw_rules"; then
-    if ! grep -qE "(^|[[:space:]])${SSH_PORT:-22}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+    if ! grep -qE "(^|[[:space:]])${SSH_PORT:-22}/tcp([[:space:]]|$)" <<<"$ufw_added"; then
       err "SSH-Port ${SSH_PORT:-22}/tcp ist nicht freigegeben - UFW wird NICHT aktiviert (Aussperr-Schutz)."
       return 1
     fi
     if [[ -n "$cur_ssh_port" && "$cur_ssh_port" != "${SSH_PORT:-22}" ]] \
-       && ! grep -qE "(^|[[:space:]])${cur_ssh_port}/tcp([[:space:]]|$)" <<<"$ufw_rules"; then
+       && ! grep -qE "(^|[[:space:]])${cur_ssh_port}/tcp([[:space:]]|$)" <<<"$ufw_added"; then
       err "Aktiver SSH-Sitzungsport ${cur_ssh_port}/tcp ist nicht freigegeben - UFW wird NICHT aktiviert (Aussperr-Schutz)."
       return 1
     fi
@@ -1475,7 +1493,7 @@ show_values() {
   printf '%-28s %s\n' "ACME E-Mail:" "${ACME_EMAIL}"
   printf '%-28s %s\n' "Cloudflare Token:" "$([[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] && echo gesetzt || echo nicht gesetzt)"
   printf '%-28s %s\n' "Caddy Fail2ban:" "$([[ "${CADDY_FAIL2BAN}" == "1" ]] && echo aktiv || echo inaktiv)"
-  printf '%-28s %s\n' "Caddy HTTP/3 UDP443:" "$([[ "${ENABLE_HTTP3:-1}" == "1" ]] && echo aktiv || echo deaktiviert)"
+  printf '%-28s %s\n' "Caddy HTTP/3 UDP443:" "$([[ "${ENABLE_HTTP3:-0}" == "1" ]] && echo aktiv || echo deaktiviert)"
   echo
   printf '%b\n' "${C_BOLD}Externe Dienste:${C_RESET}"
   list_services
@@ -1812,7 +1830,10 @@ edit_service() {
   validate_services_file >/dev/null 2>&1 || { err "services.tsv ist ungueltig. Bitte zuerst: sudo homeedge repair-services"; return 1; }
   list_services; local num; num="$(ask "Nummer aendern")"
   [[ "$num" =~ ^[0-9]+$ ]] || { err "Ungueltige Nummer."; return 1; }
-  mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
+  # WICHTIG: gleiche Zaehlung wie list_services (nl zaehlt nur nicht-leere Zeilen).
+  # Leerzeilen ueberspringen, sonst waere die Auswahl gegenueber der Anzeige
+  # verschoben (falscher Dienst). Leerzeilen werden dabei zugleich bereinigt.
+  local lines; mapfile -t lines < <(grep -v '^$' "$SERVICES_FILE"); local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
   local old_domain old_scheme old_ip old_port old_profile; IFS=$'\t' read -r old_domain old_scheme old_ip old_port old_profile <<< "${lines[$idx]}"
   local domain scheme ip port profile
@@ -1834,11 +1855,17 @@ delete_service() {
   validate_services_file >/dev/null 2>&1 || { err "services.tsv ist ungueltig. Bitte zuerst: sudo homeedge repair-services"; return 1; }
   list_services; local num; num="$(ask "Nummer loeschen")"
   [[ "$num" =~ ^[0-9]+$ ]] || { err "Ungueltige Nummer."; return 1; }
-  mapfile -t lines < "$SERVICES_FILE"; local idx=$((num-1))
+  # Gleiche Zaehlung wie list_services (Leerzeilen ueberspringen) - sonst wird der
+  # falsche Dienst geloescht, wenn die Datei eine Leerzeile enthaelt.
+  local lines; mapfile -t lines < <(grep -v '^$' "$SERVICES_FILE"); local idx=$((num-1))
   if (( idx < 0 || idx >= ${#lines[@]} )); then err "Ungueltige Nummer."; return; fi
   maybe_backup_before_change
   local _bak; _bak="$(mktemp)"; cp -a "$SERVICES_FILE" "$_bak" 2>/dev/null || true
-  unset 'lines[$idx]'; printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"
+  unset 'lines[$idx]'
+  # Letzten Dienst geloescht -> wirklich LEERE Datei schreiben (nicht eine
+  # Leerzeile), sonst entsteht genau die Off-by-one-Bedingung fuer die naechste
+  # Bearbeitung.
+  if (( ${#lines[@]} == 0 )); then : > "$SERVICES_FILE"; else printf "%s\n" "${lines[@]}" > "$SERVICES_FILE"; fi
   if ! _service_change_commit "$_bak"; then
     err "Dienst NICHT geloescht - alter Stand ist wiederhergestellt."
     return 1
@@ -1857,7 +1884,10 @@ edit_settings() {
   else
     EXT_IF="$(ask "Externes Interface" "$EXT_IF")"
   fi
-  VPS_PUBLIC_HOST="$(ask "VPS Public Host/IP" "$VPS_PUBLIC_HOST")"; SSH_PORT="$(ask "SSH Port" "$SSH_PORT")"
+  VPS_PUBLIC_HOST="$(ask "VPS Public Host/IP" "$VPS_PUBLIC_HOST")"
+  local _sp; _sp="$(ask "SSH Port" "$SSH_PORT")"
+  if [[ "$_sp" =~ ^[0-9]+$ ]] && (( _sp >= 1 && _sp <= 65535 )); then SSH_PORT="$_sp"
+  else warn "Ungueltiger SSH-Port '${_sp}' - behalte ${SSH_PORT} (UFW/Fail2ban brauchen einen numerischen Port)."; fi
   ACME_EMAIL="$(ask "ACME E-Mail" "$ACME_EMAIL")"
   if yesno "Cloudflare API Token aendern?" "n"; then
     local _nt; _nt="$(sanitize_token "$(ask_secret "Neuer Cloudflare API Token")")"
@@ -2105,8 +2135,11 @@ system_usage() {
 # Liest einen Wert aus beszel.env (unquoted). $1 = Schluessel.
 _beszel_get() {
   [[ -f "$BESZEL_ENV" ]] || return 0
+  # "|| true": fehlt der Schluessel, liefert grep rc 1; ohne Guard wuerde die
+  # bare Zuweisung in load_beszel_config unter set -e (CLI) abbrechen (alte
+  # env ohne BESZEL_MODE etc.). Funktion gibt IMMER rc 0 zurueck.
   grep -m1 "^$1=" "$BESZEL_ENV" 2>/dev/null | cut -d= -f2- \
-    | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+    | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true
 }
 
 # Extrahiert den Port aus einem LISTEN-Wert (IP:PORT, [v6]:PORT, :PORT oder PORT).
@@ -2397,7 +2430,7 @@ _beszel_prompt_config() {
     _beszel_source_ip_help "$NB_IFACE" "$NB_PORT"
     while :; do
       NB_HUBIP="$(ask "Erlaubte Hub-Quell-IP im Tunnel (die der VPS auf ${NB_IFACE} sieht), z. B. 10.0.0.2 - NICHT die LAN-IP" "${BESZEL_HUB_WG_IP:-}")"
-      beszel_validate_hub_ip "$NB_HUBIP"; vr=$?
+      vr=0; beszel_validate_hub_ip "$NB_HUBIP" || vr=$?
       (( vr == 2 )) && { err "0.0.0.0/0 bzw. ::/0 ist NICHT erlaubt - das waere oeffentlich!"; continue; }
       (( vr != 0 )) && { err "Ungueltige IP/CIDR. Erlaubt: einzelne IPv4/IPv6 (nicht leer)."; continue; }
       # Standard: nur EINZELNE Host-IP. CIDR erlaubt mehrere Clients -> nur im
@@ -2525,10 +2558,13 @@ EOUNIT
 beszel_public_exposure() {
   local port="$1"
   command -v ufw >/dev/null 2>&1 || return 0
+  # WICHTIG: "|| true" - im Normalfall (keine zu weite Regel) liefert die letzte
+  # grep-Stufe rc 1; ohne Guard wuerde eine bare Zuweisung var="$(...)" unter
+  # set -e (CLI-Pfad) das Skript abbrechen. Die Funktion gibt IMMER rc 0 zurueck.
   ufw status 2>/dev/null \
     | grep -E "(^|[^0-9])${port}/(tcp|udp)([[:space:]]|\(v6\))" \
     | grep -iF "ALLOW" \
-    | grep -iE 'Anywhere|0\.0\.0\.0/0|::/0'
+    | grep -iE 'Anywhere|0\.0\.0\.0/0|::/0' || true
 }
 
 # Entfernt GENAU die restriktive Regel anhand (alter) Werte. Fehler ignorieren.
