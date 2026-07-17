@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.25-homeedge"
+APP_VERSION="0.9.27-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -42,6 +42,9 @@ BESZEL_DOWNLOAD_BASE="https://github.com/henrygd/beszel/releases/latest/download
 # Schutz funktioniert ohne CrowdSec Console (Console ist optional).
 CROWDSEC_ACQUIS_FILE="/etc/crowdsec/acquis.d/homeedge-caddy.yaml"
 CROWDSEC_BOUNCER_SVC="crowdsec-firewall-bouncer"
+# Whitelist-Parser: eigene Infrastruktur (Loopback, WireGuard, internes LAN,
+# explizit konfigurierte IPs) wird NIE gebannt. Keine pauschalen oeffentlichen Netze.
+CROWDSEC_WHITELIST_FILE="/etc/crowdsec/parsers/s02-enrich/homeedge-whitelist.yaml"
 
 mkdir -p "$CFG_DIR" "$EDGE_DIR" "$KEY_DIR"
 
@@ -221,6 +224,7 @@ load_env() {
   F2B_CADDY_MAXRETRY="${F2B_CADDY_MAXRETRY:-20}"; F2B_CADDY_FINDTIME="${F2B_CADDY_FINDTIME:-10m}"; F2B_CADDY_BANTIME="${F2B_CADDY_BANTIME:-15m}"
   ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-0}"; CROWDSEC_CONSOLE="${CROWDSEC_CONSOLE:-0}"
   CROWDSEC_CADDY_LOG="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"; CROWDSEC_BOUNCER="${CROWDSEC_BOUNCER:-auto}"
+  CROWDSEC_WHITELIST_IPS="${CROWDSEC_WHITELIST_IPS:-}"
   if [[ -f "$ENV_FILE" ]]; then
     # Beschaedigten/mehrzeiligen Token VOR dem Sourcen reparieren.
     repair_env_file
@@ -240,6 +244,7 @@ load_env() {
     # CrowdSec-Defaults fuer aeltere Env-Dateien absichern.
     ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-0}"; CROWDSEC_CONSOLE="${CROWDSEC_CONSOLE:-0}"
     CROWDSEC_CADDY_LOG="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"; CROWDSEC_BOUNCER="${CROWDSEC_BOUNCER:-auto}"
+    CROWDSEC_WHITELIST_IPS="${CROWDSEC_WHITELIST_IPS:-}"
   fi
 }
 
@@ -279,6 +284,7 @@ ENABLE_CROWDSEC=$(q "${ENABLE_CROWDSEC:-0}")
 CROWDSEC_CONSOLE=$(q "${CROWDSEC_CONSOLE:-0}")
 CROWDSEC_CADDY_LOG=$(q "${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}")
 CROWDSEC_BOUNCER=$(q "${CROWDSEC_BOUNCER:-auto}")
+CROWDSEC_WHITELIST_IPS=$(q "${CROWDSEC_WHITELIST_IPS:-}")
 EOCFG
   chmod 600 "$ENV_FILE"
 }
@@ -621,7 +627,25 @@ EOCADDY
             roll_keep 5
             roll_keep_for 168h
         }
-        format json
+        # Sensible Jellyfin-Tokens NUR in der Logausgabe schwaerzen - der echte
+        # Request bleibt unveraendert. "wrap json" behaelt exakt das JSON-Format
+        # bei, damit CrowdSec- und Fail2ban-Parser weiter funktionieren.
+        # Query-Parameter (Streaming/WebSocket-ApiKey) und Emby/MediaBrowser-Header.
+        format filter {
+            wrap json
+            fields {
+                request>uri query {
+                    replace ApiKey REDACTED
+                    replace apiKey REDACTED
+                    replace api_key REDACTED
+                    replace access_token REDACTED
+                    replace token REDACTED
+                }
+                request>headers>X-Emby-Token replace REDACTED
+                request>headers>X-Mediabrowser-Token replace REDACTED
+                request>headers>X-MediaBrowser-Token replace REDACTED
+            }
+        }
     }
 }
 EOCADDY
@@ -1336,9 +1360,29 @@ f2b_just_restart() {
 # neuen Ports, aendert KEINE UFW-Regeln, kein Geo-Blocking, kein WAF/AppSec,
 # keine Jellyfin-spezifischen Login-Bans. Der lokale Schutz funktioniert ohne
 # CrowdSec Console; die Console ist optional und wird nie automatisch verbunden.
+#
+# SSH-DOPPELABDECKUNG (bewusst): SSH wird aktuell parallel von Fail2ban
+# (sshd-Jail) UND CrowdSec (crowdsecurity/sshd-Collection) geschuetzt. Das ist
+# gewollte Defense-in-Depth - beide bannen unabhaengig voneinander. HomeEdge
+# deaktiviert NICHTS automatisch. Wer nur eine Ebene will, kann die Fail2ban
+# sshd-Jail bzw. die CrowdSec-sshd-Collection manuell entfernen.
 
 # 0 = cscli/crowdsec vorhanden.
 crowdsec_installed() { command -v cscli >/dev/null 2>&1; }
+
+# Reload (bevorzugt) bzw. Restart von crowdsec - errexit-sicher.
+_crowdsec_reload() { systemctl reload crowdsec 2>/dev/null || systemctl restart crowdsec 2>/dev/null || true; }
+
+# Gueltiger Whitelist-Eintrag? IPv4/IPv6 mit optionalem /prefix. Lehnt pauschale
+# oeffentliche Netze (0.0.0.0/0, ::/0) und leere Eingaben ab.
+_crowdsec_valid_wl_entry() {
+  local e="${1:-}"
+  [[ -z "$e" ]] && return 1
+  case "$e" in 0.0.0.0/0|::/0|0.0.0.0|::|*/0) return 1 ;; esac
+  [[ "$e" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] && return 0
+  [[ "$e" == *:* && "$e" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] && return 0
+  return 1
+}
 
 # Erkennt das passende Firewall-Bouncer-Backend: "nftables" oder "iptables".
 # CROWDSEC_BOUNCER kann das erzwingen (nftables|iptables), sonst Auto-Erkennung
@@ -1374,6 +1418,172 @@ EOF
   ok "Acquisition geschrieben: ${CROWDSEC_ACQUIS_FILE} -> ${log}"
 }
 
+# Schreibt die Whitelist-Parser-Datei aus: Loopback + WireGuard-Endpunkte +
+# internes LAN (HOME_SUBNET) + explizit konfigurierte CROWDSEC_WHITELIST_IPS.
+# So bannt CrowdSec NIE die eigene Infrastruktur. Keine pauschalen oeff. Netze.
+crowdsec_write_whitelist() {
+  load_env
+  mkdir -p "$(dirname "$CROWDSEC_WHITELIST_FILE")"
+  local -a ips=() cidrs=()
+  # Loopback (immer).
+  cidrs+=("127.0.0.0/8"); ips+=("::1")
+  # WireGuard-Endpunkte + internes LAN.
+  [[ -n "${VPS_WG_IP:-}" ]]    && ips+=("$VPS_WG_IP")
+  [[ -n "${CLIENT_WG_IP:-}" ]] && ips+=("$CLIENT_WG_IP")
+  [[ -n "${HOME_SUBNET:-}" ]]  && cidrs+=("$HOME_SUBNET")
+  # Explizite Zusatz-IPs (Komma- oder Space-getrennt), streng validiert.
+  local e
+  for e in ${CROWDSEC_WHITELIST_IPS//,/ }; do
+    if ! _crowdsec_valid_wl_entry "$e"; then
+      warn "Whitelist-Eintrag ignoriert (ungueltig oder pauschales oeff. Netz): ${e}"
+      continue
+    fi
+    if [[ "$e" == */* ]]; then cidrs+=("$e"); else ips+=("$e"); fi
+  done
+  {
+    echo "name: homeedge/trusted"
+    echo 'description: "HomeEdge: eigene Infrastruktur nie bannen (loopback, WireGuard, LAN, explizit)"'
+    echo "whitelist:"
+    echo '  reason: "HomeEdge trusted networks"'
+    if (( ${#ips[@]} )); then
+      echo "  ip:"
+      for e in "${ips[@]}"; do echo "    - \"${e}\""; done
+    fi
+    if (( ${#cidrs[@]} )); then
+      echo "  cidr:"
+      for e in "${cidrs[@]}"; do echo "    - \"${e}\""; done
+    fi
+  } > "$CROWDSEC_WHITELIST_FILE"
+  chmod 0644 "$CROWDSEC_WHITELIST_FILE"
+  ok "Whitelist geschrieben: ${CROWDSEC_WHITELIST_FILE} (ip=${#ips[@]}, cidr=${#cidrs[@]})."
+}
+
+crowdsec_whitelist_show() {
+  load_env
+  section "CrowdSec Whitelist (eigene IPs)"
+  info "Immer vertraut: Loopback, WireGuard-Endpunkte (${VPS_WG_IP:-?}, ${CLIENT_WG_IP:-?}), internes LAN (${HOME_SUBNET:-?})."
+  echo "Explizite Zusatz-IPs (CROWDSEC_WHITELIST_IPS): ${CROWDSEC_WHITELIST_IPS:-<leer>}"
+  if [[ -f "$CROWDSEC_WHITELIST_FILE" ]]; then
+    echo; echo "Aktive Whitelist-Datei (${CROWDSEC_WHITELIST_FILE}):"
+    sed 's/^/  /' "$CROWDSEC_WHITELIST_FILE"
+  else
+    warn "Whitelist-Datei noch nicht geschrieben (entsteht bei crowdsec-install oder beim Speichern)."
+  fi
+}
+
+# Fuegt eine explizite IP/CIDR hinzu (validiert, dedupliziert), schreibt Datei neu.
+crowdsec_whitelist_add() {
+  load_env
+  local e; e="$(ask "IP oder CIDR hinzufuegen (z. B. 10.0.1.5 oder 192.168.20.0/24)")"
+  if ! _crowdsec_valid_wl_entry "$e"; then err "Ungueltig oder pauschales oeff. Netz nicht erlaubt: ${e:-<leer>}"; return 1; fi
+  local cur=" ${CROWDSEC_WHITELIST_IPS//,/ } "
+  if [[ "$cur" == *" $e "* ]]; then warn "Bereits enthalten: ${e}"; return 0; fi
+  CROWDSEC_WHITELIST_IPS="${CROWDSEC_WHITELIST_IPS:+${CROWDSEC_WHITELIST_IPS},}${e}"
+  save_env
+  crowdsec_installed && { crowdsec_write_whitelist; _crowdsec_reload; } || info "Gespeichert. Wird bei crowdsec-install aktiv."
+  ok "Hinzugefuegt: ${e}"
+}
+
+# Entfernt eine explizite IP/CIDR aus CROWDSEC_WHITELIST_IPS.
+crowdsec_whitelist_remove() {
+  load_env
+  if [[ -z "${CROWDSEC_WHITELIST_IPS:-}" ]]; then warn "Keine expliziten Zusatz-IPs vorhanden."; return 0; fi
+  echo "Aktuell: ${CROWDSEC_WHITELIST_IPS}"
+  local e; e="$(ask "Welchen Eintrag entfernen? (exakt wie oben)")"
+  [[ -z "$e" ]] && { warn "Nichts eingegeben."; return 0; }
+  local -a keep=() x; local found=0
+  for x in ${CROWDSEC_WHITELIST_IPS//,/ }; do
+    if [[ "$x" == "$e" ]]; then found=1; continue; fi
+    keep+=("$x")
+  done
+  if (( ! found )); then err "Nicht gefunden: ${e}"; return 1; fi
+  CROWDSEC_WHITELIST_IPS="$(IFS=,; echo "${keep[*]:-}")"
+  save_env
+  crowdsec_installed && { crowdsec_write_whitelist; _crowdsec_reload; } || info "Gespeichert."
+  ok "Entfernt: ${e}"
+}
+
+# Aktuelle oeffentliche SSH-Quell-IP NUR nach ausdruecklicher Bestaetigung
+# dauerhaft whitelisten (nie automatisch - oeffentliche IPs sind oft dynamisch).
+crowdsec_whitelist_add_ssh() {
+  load_env
+  local ip; ip="$(awk '{print $1}' <<<"${SSH_CONNECTION:-}")"
+  if [[ -z "$ip" ]]; then warn "Keine SSH-Quell-IP ermittelbar (SSH_CONNECTION leer - lokale Sitzung?)."; return 0; fi
+  warn "Aktuelle SSH-Quell-IP: ${ip}"
+  warn "Oeffentliche IPs aendern sich oft (DHCP/Mobilfunk). Dauerhaft whitelisten NUR wenn statisch."
+  if ! yesno "IP ${ip} DAUERHAFT zur Whitelist hinzufuegen?" "n"; then info "Abgebrochen - nichts geaendert."; return 0; fi
+  if ! _crowdsec_valid_wl_entry "$ip"; then err "IP ${ip} ungueltig/nicht erlaubt."; return 1; fi
+  local cur=" ${CROWDSEC_WHITELIST_IPS//,/ } "
+  if [[ "$cur" == *" $ip "* ]]; then warn "Bereits enthalten: ${ip}"; return 0; fi
+  CROWDSEC_WHITELIST_IPS="${CROWDSEC_WHITELIST_IPS:+${CROWDSEC_WHITELIST_IPS},}${ip}"
+  save_env
+  crowdsec_installed && { crowdsec_write_whitelist; _crowdsec_reload; } || info "Gespeichert."
+  ok "SSH-Quell-IP ${ip} dauerhaft whitelistet."
+}
+
+crowdsec_whitelist_menu() {
+  need_root; set +e
+  while true; do
+    hmenu_head "Sicherheit > CrowdSec > Whitelist"
+    crowdsec_whitelist_show
+    line
+    menu_item 1 "IP/CIDR hinzufuegen"
+    menu_item 2 "IP/CIDR entfernen"
+    menu_item 3 "Aktuelle SSH-Quell-IP hinzufuegen (nach Bestaetigung)"
+    menu_item 4 "Whitelist-Datei neu schreiben & CrowdSec neu laden"
+    menu_back
+    read -rp "Auswahl: " c
+    case "$c" in
+      1) crowdsec_whitelist_add; pause ;;
+      2) crowdsec_whitelist_remove; pause ;;
+      3) crowdsec_whitelist_add_ssh; pause ;;
+      4) if crowdsec_installed; then crowdsec_write_whitelist; _crowdsec_reload; else warn "CrowdSec nicht installiert."; fi; pause ;;
+      b|B) return ;; 0) exit 0 ;;
+      *) err "Ungueltige Auswahl."; sleep 1 ;;
+    esac
+  done
+}
+
+# Richtet das offizielle CrowdSec-APT-Repo OHNE "curl | bash" ein: Keyring in
+# /usr/share/keyrings + signed-by sources.list.d-Eintrag. Idempotent (erkennt
+# vorhandenes Repo) und beschaedigt bestehende Installationen nicht.
+_crowdsec_setup_repo() {
+  local list=/etc/apt/sources.list.d/crowdsec_crowdsec.list
+  local keyring=/usr/share/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+  if [[ -f "$list" ]]; then info "CrowdSec-APT-Repo bereits eingerichtet (${list}) - unveraendert."; return 0; fi
+  command -v curl >/dev/null 2>&1 || { err "curl fehlt: sudo apt-get install -y curl"; return 1; }
+  command -v gpg  >/dev/null 2>&1 || { err "gpg fehlt: sudo apt-get install -y gnupg"; return 1; }
+  # Distribution/Architektur bestimmen.
+  local dist="debian" codename="" arch=""
+  # shellcheck disable=SC1091
+  [[ -r /etc/os-release ]] && . /etc/os-release 2>/dev/null || true
+  case "${ID:-debian}" in ubuntu) dist="ubuntu" ;; *) dist="debian" ;; esac
+  codename="${VERSION_CODENAME:-}"
+  [[ -z "$codename" ]] && codename="$(lsb_release -cs 2>/dev/null || true)"
+  arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+  [[ -z "$codename" ]] && { err "Distributions-Codename nicht ermittelbar (VERSION_CODENAME/lsb_release)."; return 1; }
+  info "Repo fuer ${dist}/${codename} (${arch})."
+  mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+  local tmpkey; tmpkey="$(mktemp)"
+  if ! curl -fsSL "https://packagecloud.io/crowdsec/crowdsec/gpgkey" -o "$tmpkey"; then
+    err "GPG-Key konnte nicht geladen werden (packagecloud)."; rm -f "$tmpkey"; return 1
+  fi
+  if ! gpg --dearmor < "$tmpkey" > "$keyring" 2>/dev/null; then
+    err "Keyring konnte nicht erstellt werden."; rm -f "$tmpkey"; return 1
+  fi
+  rm -f "$tmpkey"; chmod 0644 "$keyring"
+  cat > "$list" <<EOF
+deb [signed-by=${keyring} arch=${arch}] https://packagecloud.io/crowdsec/crowdsec/${dist}/ ${codename} main
+deb-src [signed-by=${keyring}] https://packagecloud.io/crowdsec/crowdsec/${dist}/ ${codename} main
+EOF
+  chmod 0644 "$list"
+  if ! DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1; then
+    err "apt-get update nach Repo-Setup fehlgeschlagen - Eintrag pruefen: ${list}"; return 1
+  fi
+  ok "CrowdSec-APT-Repo eingerichtet (Keyring ${keyring})."
+  return 0
+}
+
 # Interner Helfer: Firewall-Bouncer passend zum Backend installieren/aktivieren.
 # Nutzt ausschliesslich CrowdSec-eigene Regeln (kein UFW-Eingriff), IPv4 + IPv6.
 _crowdsec_install_bouncer() {
@@ -1401,20 +1611,13 @@ crowdsec_install() {
   info "CrowdSec ergaenzt Fail2ban und caddy-auth - beide bleiben unveraendert aktiv."
   info "Es werden KEINE neuen Ports geoeffnet und KEINE UFW-Regeln geaendert."
 
-  # 1) Offizielles APT-Repo einrichten (falls noch nicht vorhanden).
-  if ! crowdsec_installed && [[ ! -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]]; then
-    info "Richte offizielles CrowdSec APT-Repo ein ..."
-    if ! command -v curl >/dev/null 2>&1; then
-      err "curl fehlt - bitte installieren: sudo apt-get install -y curl"; return 1
-    fi
-    if ! curl -s https://install.crowdsec.net | bash; then
-      err "CrowdSec-Repo-Setup fehlgeschlagen."; return 1
-    fi
+  # 1) Offizielles APT-Repo einrichten (Keyring + sources.list.d, KEIN curl|bash).
+  if ! crowdsec_installed; then
+    _crowdsec_setup_repo || return 1
   fi
 
   # 2) Paket installieren (nur wenn noch nicht vorhanden).
   if ! crowdsec_installed; then
-    DEBIAN_FRONTEND=noninteractive apt-get update || true
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec; then
       err "apt-get install crowdsec fehlgeschlagen."; return 1
     fi
@@ -1423,8 +1626,9 @@ crowdsec_install() {
   fi
   crowdsec_installed || { err "cscli nach der Installation nicht gefunden."; return 1; }
 
-  # 3) Acquisition fuer das Caddy-Access-Log.
+  # 3) Acquisition fuer das Caddy-Access-Log + Whitelist der eigenen Infrastruktur.
   crowdsec_write_acquis
+  crowdsec_write_whitelist
 
   # 4) Collections (idempotent): Linux-Basis, SSH und Caddy.
   info "Installiere Collections (linux, sshd, caddy) ..."
@@ -1442,6 +1646,8 @@ crowdsec_install() {
   echo
   info "Lokaler Schutz laeuft jetzt ohne CrowdSec Console."
   info "Optional: Console verbinden ueber 'sudo homeedge crowdsec-console' (Enrollment-Key noetig)."
+  info "Hinweis: SSH bleibt bewusst DOPPELT geschuetzt (Fail2ban sshd-Jail + CrowdSec sshd-Collection) - nichts wird automatisch deaktiviert."
+  info "Empfehlung: 'sudo homeedge crowdsec-selftest' zur End-to-End-Pruefung."
   crowdsec_status
 }
 
@@ -1461,6 +1667,72 @@ crowdsec_status() {
   [[ -f "$log" ]] && ok "Caddy-Log vorhanden: ${log}" || warn "Caddy-Log fehlt: ${log}"
   echo; info "Registrierte Bouncer:"; cscli bouncers list 2>/dev/null || true
   echo; info "Console-Status:"; cscli console status 2>/dev/null || true
+}
+
+# Prueft, ob eine IP in der Dataplane (nftables-Ruleset oder ipset) auftaucht.
+_crowdsec_ip_in_dataplane() {
+  local ip="$1"
+  if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -qF "$ip"; then return 0; fi
+  if command -v ipset >/dev/null 2>&1 && ipset list 2>/dev/null | grep -qF "$ip"; then return 0; fi
+  return 1
+}
+
+# End-to-End-Selbsttest. Exitcode: 0 = alles OK, 1 = Warnungen, 2 = kritisch.
+# Nutzt die reservierte Doku-IP 203.0.113.10 (RFC 5737 TEST-NET-3) und loescht
+# die Test-Decision IMMER wieder. Aendert UFW nicht.
+crowdsec_selftest() {
+  need_root; load_env
+  section "CrowdSec Selbsttest"
+  crowdsec_installed || { err "CrowdSec ist nicht installiert. Zuerst: sudo homeedge crowdsec-install"; return 2; }
+  local rc=0 testip="203.0.113.10"
+  local log="${CROWDSEC_CADDY_LOG:-/opt/caddy-edge/logs/access.log}"
+  local ufw_before ufw_after
+  ufw_before="$(ufw status 2>/dev/null | grep -c . || true)"
+
+  # 1) crowdsec-Dienst aktiv
+  if systemctl is-active --quiet crowdsec 2>/dev/null; then ok "crowdsec Dienst aktiv"; else err "crowdsec Dienst NICHT aktiv"; rc=2; fi
+  # 2) LAPI erreichbar
+  if cscli lapi status >/dev/null 2>&1; then ok "LAPI erreichbar"; else err "LAPI NICHT erreichbar (cscli lapi status)"; rc=2; fi
+  # 3) Bouncer registriert + Dienst aktiv
+  if cscli bouncers list -o raw 2>/dev/null | grep -q .; then ok "Bouncer registriert (cscli bouncers list)"; else warn "Kein Bouncer registriert"; rc=$(( rc<1?1:rc )); fi
+  if systemctl is-active --quiet "$CROWDSEC_BOUNCER_SVC" 2>/dev/null; then ok "Firewall-Bouncer Dienst aktiv"; else warn "Firewall-Bouncer NICHT aktiv (Durchsetzung evtl. inaktiv)"; rc=$(( rc<1?1:rc )); fi
+  # 4) Acquisition vorhanden
+  if [[ -f "$CROWDSEC_ACQUIS_FILE" ]]; then ok "Caddy-Acquisition vorhanden"; else err "Acquisition fehlt: ${CROWDSEC_ACQUIS_FILE}"; rc=2; fi
+  # 5) Caddy-Log wird gelesen/geparst (Acquisition-Metriken zeigen die Logdatei)
+  if cscli metrics 2>/dev/null | grep -qF "$log"; then ok "Caddy-Log wird gelesen (in Acquisition-Metriken sichtbar)"; else warn "Caddy-Log noch nicht in Metriken (evtl. keine Zeilen gelesen/geparst)"; rc=$(( rc<1?1:rc )); fi
+  # 6) Collections linux/sshd/caddy installiert
+  local col; for col in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/caddy; do
+    if cscli collections list 2>/dev/null | grep -q "$col"; then ok "Collection ${col}"; else warn "Collection ${col} fehlt"; rc=$(( rc<1?1:rc )); fi
+  done
+
+  # 7) Test-Decision mit reservierter IP hinzufuegen
+  local added=0
+  if cscli decisions add --ip "$testip" --duration 2m --type ban --reason "homeedge-selftest" >/dev/null 2>&1; then
+    added=1; ok "Test-Decision gesetzt (${testip}, 2m, ban)"
+  else
+    warn "Test-Decision konnte nicht gesetzt werden (cscli decisions add)"; rc=$(( rc<1?1:rc ))
+  fi
+  if (( added )); then
+    if cscli decisions list -o raw 2>/dev/null | grep -qF "$testip"; then ok "Test-Decision in LAPI aktiv"; else warn "Test-Decision nicht in 'decisions list'"; rc=$(( rc<1?1:rc )); fi
+    # 8) Uebernahme in nftables/ipset (Bouncer-Pull-Intervall abwarten)
+    sleep 3
+    if _crowdsec_ip_in_dataplane "$testip"; then ok "Test-Decision in nftables/ipset uebernommen"; else warn "Test-Decision (noch) nicht in nftables/ipset - Bouncer-Pull-Intervall abwarten und erneut pruefen"; rc=$(( rc<1?1:rc )); fi
+    # 9) Test-Decision sicher wieder loeschen (IMMER)
+    if cscli decisions delete --ip "$testip" >/dev/null 2>&1; then ok "Test-Decision wieder geloescht"; else err "Test-Decision konnte NICHT geloescht werden - manuell: sudo cscli decisions delete --ip ${testip}"; rc=2; fi
+  fi
+
+  # 10) UFW unveraendert + aktiv
+  ufw_after="$(ufw status 2>/dev/null | grep -c . || true)"
+  if ufw status 2>/dev/null | grep -qiE '^Status: (active|aktiv)'; then ok "UFW weiterhin aktiv"; else warn "UFW ist nicht aktiv"; rc=$(( rc<1?1:rc )); fi
+  if [[ "$ufw_before" == "$ufw_after" ]]; then ok "UFW unveraendert (Statuszeilen: ${ufw_after})"; else warn "UFW-Statuszeilen geaendert (${ufw_before} -> ${ufw_after}) - bitte pruefen"; rc=$(( rc<1?1:rc )); fi
+
+  echo
+  case "$rc" in
+    0) ok  "Selbsttest bestanden - alle Checks OK." ;;
+    1) warn "Selbsttest mit Warnungen abgeschlossen (Details oben)." ;;
+    *) err "Selbsttest FEHLGESCHLAGEN - kritische Punkte (Details oben)." ;;
+  esac
+  return "$rc"
 }
 
 crowdsec_alerts()          { load_env; crowdsec_installed || { warn "CrowdSec nicht installiert."; return 0; }; section "CrowdSec Alerts";      cscli alerts list 2>/dev/null || true; }
@@ -1541,29 +1813,33 @@ sm_crowdsec() {
     line
     menu_item 1 "CrowdSec installieren / aktivieren"
     menu_item 2 "Status anzeigen"
-    menu_item 3 "Alerts anzeigen"
-    menu_item 4 "Decisions anzeigen"
-    menu_item 5 "Metrics anzeigen"
-    menu_item 6 "Collections anzeigen"
-    menu_item 7 "IP entbannen (Decision loeschen)"
-    menu_item 8 "Collections / Hub aktualisieren"
-    menu_item 9 "CrowdSec Console verbinden"
-    menu_item 10 "CrowdSec Console Status"
-    menu_item 11 "CrowdSec deaktivieren"
+    menu_item 3 "Selbsttest ausfuehren"
+    menu_item 4 "Whitelist (eigene IPs) verwalten"
+    menu_item 5 "Alerts anzeigen"
+    menu_item 6 "Decisions anzeigen"
+    menu_item 7 "Metrics anzeigen"
+    menu_item 8 "Collections anzeigen"
+    menu_item 9 "IP entbannen (Decision loeschen)"
+    menu_item 10 "Collections / Hub aktualisieren"
+    menu_item 11 "CrowdSec Console verbinden"
+    menu_item 12 "CrowdSec Console Status"
+    menu_item 13 "CrowdSec deaktivieren"
     menu_back
     read -rp "Auswahl: " c
     case "$c" in
       1) crowdsec_install; pause ;;
       2) crowdsec_status; pause ;;
-      3) crowdsec_alerts; pause ;;
-      4) crowdsec_decisions; pause ;;
-      5) crowdsec_metrics; pause ;;
-      6) crowdsec_collections; pause ;;
-      7) crowdsec_unban; pause ;;
-      8) crowdsec_update; pause ;;
-      9) crowdsec_console_enroll; pause ;;
-      10) crowdsec_console_status; pause ;;
-      11) crowdsec_disable; pause ;;
+      3) crowdsec_selftest; pause ;;
+      4) crowdsec_whitelist_menu ;;
+      5) crowdsec_alerts; pause ;;
+      6) crowdsec_decisions; pause ;;
+      7) crowdsec_metrics; pause ;;
+      8) crowdsec_collections; pause ;;
+      9) crowdsec_unban; pause ;;
+      10) crowdsec_update; pause ;;
+      11) crowdsec_console_enroll; pause ;;
+      12) crowdsec_console_status; pause ;;
+      13) crowdsec_disable; pause ;;
       b|B) return ;; 0) exit 0 ;;
       *) err "Ungueltige Auswahl."; sleep 1 ;;
     esac
@@ -5333,6 +5609,9 @@ case "${1:-menu}" in
   crowdsec|cs) sm_crowdsec ;;
   crowdsec-install) need_root; crowdsec_install ;;
   crowdsec-status) need_root; crowdsec_status ;;
+  crowdsec-selftest) need_root; crowdsec_selftest ;;
+  crowdsec-whitelist) need_root; crowdsec_whitelist_show ;;
+  crowdsec-whitelist-edit) need_root; crowdsec_whitelist_menu ;;
   crowdsec-alerts) need_root; crowdsec_alerts ;;
   crowdsec-decisions) need_root; crowdsec_decisions ;;
   crowdsec-metrics) need_root; crowdsec_metrics ;;
@@ -5347,5 +5626,5 @@ case "${1:-menu}" in
   firewall) apply_firewall ;;
   settings) edit_settings ;;
   apply-all) apply_all ;;
-  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|caddy-update|monitoring|beszel-install|beszel-reconfigure|beszel-status|beszel-logs|beszel-restart|beszel-update|beszel-uninstall|beszel-check-firewall|crowdsec|crowdsec-install|crowdsec-status|crowdsec-alerts|crowdsec-decisions|crowdsec-metrics|crowdsec-collections|crowdsec-unban|crowdsec-update|crowdsec-console|crowdsec-console-status|crowdsec-disable|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
+  *) echo "Nutzung: sudo homeedge menu|health|certs|status|values|domains|test-domain|wg-menu|fail2ban|usage|network|backup|restore-config|repair-services|validate-services|verify-setup|migration-mode|wg-values|add-service|reload|restart|caddy-rebuild|caddy-logs|caddy-update|monitoring|beszel-install|beszel-reconfigure|beszel-status|beszel-logs|beszel-restart|beszel-update|beszel-uninstall|beszel-check-firewall|crowdsec|crowdsec-install|crowdsec-status|crowdsec-selftest|crowdsec-whitelist|crowdsec-whitelist-edit|crowdsec-alerts|crowdsec-decisions|crowdsec-metrics|crowdsec-collections|crowdsec-unban|crowdsec-update|crowdsec-console|crowdsec-console-status|crowdsec-disable|set-token|self-update|check-update|rollback|set-repo"; exit 1 ;;
 esac
