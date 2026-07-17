@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.23-homeedge"
+APP_VERSION="0.9.24-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -1581,8 +1581,16 @@ vps_ipv6() {
 }
 vps_has_global_ipv6() { [[ -n "$(vps_ipv6)" ]]; }
 ufw_ipv6_enabled() { [[ -f /etc/default/ufw ]] && grep -qiE '^IPV6=yes' /etc/default/ufw; }
-# Lauscht Caddy lokal auf IPv6 :443?
-caddy_listens_ipv6_443() { command -v ss >/dev/null 2>&1 || return 1; ss -H -ltn 'sport = :443' 2>/dev/null | grep -qE '\[?::'; }
+# Lauscht Caddy lokal auf IPv6 :443 (TCP oder UDP/HTTP3)?
+# Robust: ss-Portfilter + -6, TCP und UDP getrennt abgefragt. Meldet nur OK, wenn
+# eine Zeile ZUGLEICH einen v6-/Wildcard-Listener auf :443 UND den Prozess caddy
+# zeigt. Unterstuetzte Adressformen: *:443, [::]:443/[<v6>]:443 und :::443
+# (frueher wurde *:443 faelschlich nicht erkannt, und UDP/HTTP3 gar nicht geprueft).
+caddy_listens_ipv6_443() {
+  command -v ss >/dev/null 2>&1 || return 1
+  { ss -H -6 -ltnp 'sport = :443' 2>/dev/null; ss -H -6 -lunp 'sport = :443' 2>/dev/null; } \
+    | grep -E '\*:443|\]:443|:::443' | grep -q 'caddy'
+}
 # Stellt sicher, dass UFW IPv6 verwaltet (IPV6=yes), damit v6 kontrolliert (default deny) ist.
 ensure_ufw_ipv6_yes() {
   [[ -f /etc/default/ufw ]] || return 0
