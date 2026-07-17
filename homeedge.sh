@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="HomeEdge"
 APP_CMD="homeedge"
-APP_VERSION="0.9.23-homeedge"
+APP_VERSION="0.9.25-homeedge"
 
 CFG_DIR="/etc/homeedge"
 EDGE_DIR="/root/homeedge"
@@ -1581,8 +1581,16 @@ vps_ipv6() {
 }
 vps_has_global_ipv6() { [[ -n "$(vps_ipv6)" ]]; }
 ufw_ipv6_enabled() { [[ -f /etc/default/ufw ]] && grep -qiE '^IPV6=yes' /etc/default/ufw; }
-# Lauscht Caddy lokal auf IPv6 :443?
-caddy_listens_ipv6_443() { command -v ss >/dev/null 2>&1 || return 1; ss -H -ltn 'sport = :443' 2>/dev/null | grep -qE '\[?::'; }
+# Lauscht Caddy lokal auf IPv6 :443 (TCP oder UDP/HTTP3)?
+# Robust: ss-Portfilter + -6, TCP und UDP getrennt abgefragt. Meldet nur OK, wenn
+# eine Zeile ZUGLEICH einen v6-/Wildcard-Listener auf :443 UND den Prozess caddy
+# zeigt. Unterstuetzte Adressformen: *:443, [::]:443/[<v6>]:443 und :::443
+# (frueher wurde *:443 faelschlich nicht erkannt, und UDP/HTTP3 gar nicht geprueft).
+caddy_listens_ipv6_443() {
+  command -v ss >/dev/null 2>&1 || return 1
+  { ss -H -6 -ltnp 'sport = :443' 2>/dev/null; ss -H -6 -lunp 'sport = :443' 2>/dev/null; } \
+    | grep -E '\*:443|\]:443|:::443' | grep -q 'caddy'
+}
 # Stellt sicher, dass UFW IPv6 verwaltet (IPV6=yes), damit v6 kontrolliert (default deny) ist.
 ensure_ufw_ipv6_yes() {
   [[ -f /etc/default/ufw ]] || return 0
@@ -1596,24 +1604,33 @@ ensure_ufw_ipv6_yes() {
 # Setzt die Service-Regeln (kein reset). SSH/WG dual-stack (Lockout-Schutz),
 # 443 familienspezifisch: v4 immer, v6 nur bei ENABLE_IPV6=1; 443/udp nur bei HTTP/3.
 _ufw_rules_apply() {
+  # rc != 0, sobald ein RELEVANTES "ufw allow" fehlschlaegt. Fehler werden NICHT
+  # mehr verschluckt (frueher: alle Kommandos mit "|| true"), damit der Aufrufer
+  # bei einer nicht angelegten 443-Regel wirklich einen Fehler sieht.
+  local rc=0
   local cur; cur="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}")"
-  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || true
-  [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]] && ufw allow "${cur}/tcp" >/dev/null 2>&1 || true
-  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
-  # alte dual-stack 443-Regeln entfernen, dann familienspezifisch setzen
-  ufw delete allow "443/tcp" >/dev/null 2>&1 || true
-  ufw delete allow "443/udp" >/dev/null 2>&1 || true
-  ufw allow proto tcp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
-  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto tcp to ::/0 port 443 >/dev/null 2>&1 || true
-  else ufw delete allow proto tcp to ::/0 port 443 >/dev/null 2>&1 || true; fi
-  if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then
-    ufw allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
-    if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then ufw allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true
-    else ufw delete allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true; fi
+  ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1 || rc=1
+  if [[ -n "$cur" && "$cur" != "${SSH_PORT}" ]]; then ufw allow "${cur}/tcp" >/dev/null 2>&1 || rc=1; fi
+  ufw allow "${WG_PORT}/udp" >/dev/null 2>&1 || rc=1
+  # Alte 443-Regeln IMMER sauber entfernen - dual-stack (443/tcp, 443/udp) UND
+  # familienspezifisch (0.0.0.0/0 bzw. ::/0). Deletes sind best-effort (die Regel
+  # existiert evtl. nicht) und duerfen kein rc setzen.
+  ufw delete allow "443/tcp"                       >/dev/null 2>&1 || true
+  ufw delete allow "443/udp"                       >/dev/null 2>&1 || true
+  ufw delete allow proto tcp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+  ufw delete allow proto tcp to ::/0 port 443      >/dev/null 2>&1 || true
+  ufw delete allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
+  ufw delete allow proto udp to ::/0 port 443      >/dev/null 2>&1 || true
+  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
+    # Mit IPV6=yes erzeugt die EINFACHE Form "ufw allow 443/tcp" v4 UND v6.
+    ufw allow 443/tcp >/dev/null 2>&1 || rc=1
+    if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow 443/udp >/dev/null 2>&1 || rc=1; fi
   else
-    ufw delete allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || true
-    ufw delete allow proto udp to ::/0 port 443 >/dev/null 2>&1 || true
+    # Nur IPv4: 0.0.0.0/0-spezifisch - erzeugt KEINE v6-Regel (v6 bleibt zu).
+    ufw allow proto tcp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || rc=1
+    if [[ "${ENABLE_HTTP3:-0}" == "1" ]]; then ufw allow proto udp to 0.0.0.0/0 port 443 >/dev/null 2>&1 || rc=1; fi
   fi
+  return "$rc"
 }
 
 # Statusausgabe der UFW-Service-Lage. Liest die ECHTE "ufw status" (nicht nur die
@@ -1622,9 +1639,10 @@ _ufw_rules_apply() {
 _ufw_status_report() {
   local st v6tcp=0 v6udp=0 wgv6=0
   st="$(ufw status 2>/dev/null || true)"
-  grep -qE '443.*\(v6\)' <<<"$st" && v6tcp=1
-  # grobe Unterscheidung tcp/udp v6 anhand der Zeile
-  grep -qiE '443/udp.*\(v6\)|443/udp \(v6\)' <<<"$st" && v6udp=1
+  # WICHTIG: protokoll-genau matchen. Frueher matchte '443.*\(v6\)' AUCH die
+  # Zeile "443/udp (v6)" und meldete dann faelschlich 443/tcp (v6) als offen.
+  grep -qE '443/tcp \(v6\)' <<<"$st" && v6tcp=1
+  grep -qE '443/udp \(v6\)' <<<"$st" && v6udp=1
   grep -qiE "${WG_PORT}/udp.*\(v6\)" <<<"$st" && wgv6=1
   # Klarstellung: ENABLE_IPV6 betrifft NUR externen HTTPS-Zugriff (443/tcp v6).
   info "ENABLE_IPV6 steuert nur externen HTTPS-Zugriff (443/tcp v6), nicht WireGuard."
@@ -1648,6 +1666,34 @@ _ufw_status_report() {
   fi
 }
 
+# Verifiziert die TATSAECHLICHE 443-Lage in "ufw status" gegen die erwartete
+# Konfig (ENABLE_IPV6 / ENABLE_HTTP3). 0 = alles wie erwartet, 1 = Abweichung
+# (mit err-Meldung je Punkt). $1 = optionaler vorab erfasster "ufw status"-Text
+# (fuer Tests); sonst wird er selbst gelesen.
+#   - 443/tcp IPv4:  immer erwartet
+#   - 443/tcp (v6):  genau bei ENABLE_IPV6=1
+#   - 443/udp IPv4:  genau bei ENABLE_HTTP3=1
+#   - 443/udp (v6):  genau bei ENABLE_HTTP3=1 UND ENABLE_IPV6=1
+_ufw_verify_443() {
+  local st="${1:-}"
+  [[ -z "$st" ]] && st="$(ufw status 2>/dev/null || true)"
+  local tcp_v4=0 tcp_v6=0 udp_v4=0 udp_v6=0
+  grep -E '(^|[[:space:]])443/tcp([[:space:]]|$)' <<<"$st" | grep -qv '(v6)' && tcp_v4=1
+  grep -qE '443/tcp \(v6\)' <<<"$st" && tcp_v6=1
+  grep -E '(^|[[:space:]])443/udp([[:space:]]|$)' <<<"$st" | grep -qv '(v6)' && udp_v4=1
+  grep -qE '443/udp \(v6\)' <<<"$st" && udp_v6=1
+  local want_tcp_v6=0 want_udp_v4=0 want_udp_v6=0
+  [[ "${ENABLE_IPV6:-0}" == "1" ]] && want_tcp_v6=1
+  [[ "${ENABLE_HTTP3:-0}" == "1" ]] && want_udp_v4=1
+  [[ "${ENABLE_HTTP3:-0}" == "1" && "${ENABLE_IPV6:-0}" == "1" ]] && want_udp_v6=1
+  local rc=0
+  (( tcp_v4 == 1 ))            || { err "443/tcp (IPv4) fehlt in 'ufw status'."; rc=1; }
+  (( tcp_v6 == want_tcp_v6 ))  || { err "443/tcp (v6): erwartet=${want_tcp_v6}, gefunden=${tcp_v6} (ENABLE_IPV6=${ENABLE_IPV6:-0})."; rc=1; }
+  (( udp_v4 == want_udp_v4 ))  || { err "443/udp (IPv4): erwartet=${want_udp_v4}, gefunden=${udp_v4} (ENABLE_HTTP3=${ENABLE_HTTP3:-0})."; rc=1; }
+  (( udp_v6 == want_udp_v6 ))  || { err "443/udp (v6): erwartet=${want_udp_v6}, gefunden=${udp_v6}."; rc=1; }
+  return "$rc"
+}
+
 apply_firewall() {
   load_env
   section "Firewall neu anwenden"
@@ -1662,7 +1708,10 @@ apply_firewall() {
   maybe_backup_before_change
   ensure_ufw_ipv6_yes
   ufw --force reset; ufw default deny incoming; ufw default allow outgoing
-  _ufw_rules_apply
+  if ! _ufw_rules_apply; then
+    err "UFW-Regeln konnten nicht vollstaendig gesetzt werden - Firewall wird NICHT aktiviert."
+    return 1
+  fi
   # Lockout-Schutz: NUR aktivieren, wenn der SSH-Port (und der aktive Sitzungsport)
   # nach _ufw_rules_apply wirklich als ALLOW-Regel vorhanden ist. Sonst wuerde
   # "ufw --force enable" bei default-deny die laufende SSH-Sitzung aussperren.
@@ -1690,9 +1739,24 @@ ufw_apply_auto() {
   load_env
   command -v ufw >/dev/null 2>&1 || return 0
   ensure_ufw_ipv6_yes
-  _ufw_rules_apply
-  ufw reload >/dev/null 2>&1 || true
-  ok "UFW angeglichen (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
+  if ! _ufw_rules_apply; then
+    err "UFW-Regeln konnten nicht vollstaendig gesetzt werden (mind. ein 'ufw allow' schlug fehl)."
+    return 1
+  fi
+  # Verifikation braucht AKTIVE UFW - "ufw status" listet bei inaktiver Firewall
+  # keine Regeln. Ist UFW inaktiv, sind die Regeln gestaged (user.rules), aber
+  # nicht ueberpruefbar -> ehrliche Warnung statt falschem "OK".
+  if ! ufw status 2>/dev/null | grep -qiE '^Status: (active|aktiv)'; then
+    warn "UFW ist INAKTIV - 443-Regeln wurden gestaged, aber nicht verifiziert. Aktivieren: sudo homeedge firewall"
+    return 0
+  fi
+  if ! ufw reload >/dev/null 2>&1; then err "ufw reload fehlgeschlagen."; return 1; fi
+  if ! _ufw_verify_443; then
+    err "UFW 443-Regeln stimmen nach reload NICHT mit der Konfig ueberein (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
+    return 1
+  fi
+  ok "UFW angeglichen und verifiziert (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
+  return 0
 }
 
 # Stellt sicher, dass UFW AKTIV ist (mit SSH-Lockout-Schutz): erst SSH/443/WG
@@ -4571,6 +4635,24 @@ ipv6_status() {
   [[ -n "$v6" ]] && ok "VPS hat globale IPv6: ${v6}" || warn "Keine globale IPv6-Adresse am VPS gefunden."
   if ufw_ipv6_enabled; then ok "UFW IPv6 aktiv (/etc/default/ufw: IPV6=yes)"; else warn "UFW IPv6 nicht aktiv (IPV6=yes fehlt)"; fi
   if caddy_listens_ipv6_443; then ok "Caddy lauscht auf IPv6 :443"; else info "Caddy lauscht (noch) nicht sichtbar auf IPv6 :443"; fi
+  # Tatsaechliche UFW-443-Lage aus "ufw status" (nicht nur die ENV-Flags).
+  local st; st="$(ufw status 2>/dev/null || true)"
+  if grep -qiE '^Status: (active|aktiv)' <<<"$st"; then
+    local t4=nein t6=nein u4=nein u6=nein
+    grep -E '(^|[[:space:]])443/tcp([[:space:]]|$)' <<<"$st" | grep -qv '(v6)' && t4=ja
+    grep -qE '443/tcp \(v6\)' <<<"$st" && t6=ja
+    grep -E '(^|[[:space:]])443/udp([[:space:]]|$)' <<<"$st" | grep -qv '(v6)' && u4=ja
+    grep -qE '443/udp \(v6\)' <<<"$st" && u6=ja
+    echo "UFW 443-Regeln: tcp(v4)=${t4}  tcp(v6)=${t6}  udp(v4)=${u4}  udp(v6)=${u6}"
+    if _ufw_verify_443 "$st" >/dev/null 2>&1; then
+      ok "UFW 443-Regeln stimmen mit der Konfig ueberein (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0})."
+    else
+      warn "UFW 443-Regeln weichen von der Konfig ab (IPv6=${ENABLE_IPV6:-0}, HTTP/3=${ENABLE_HTTP3:-0}):"
+      _ufw_verify_443 "$st" || true
+    fi
+  else
+    warn "UFW ist inaktiv - 443-Regeln koennen nicht via 'ufw status' verifiziert werden (sudo homeedge firewall)."
+  fi
   echo "Lauschende :443 Sockets:"
   ss -tulpnH 2>/dev/null | grep ':443' | sed 's/^/  /' | mask_secrets || true
   echo
@@ -4585,19 +4667,31 @@ ipv6_toggle() {
   echo "Der Backend-Zugriff ins Heimnetz bleibt IPv4 ueber WireGuard."
   echo "Aktuell: ENABLE_IPV6=${ENABLE_IPV6:-0}"
   echo
-  if [[ "${ENABLE_IPV6:-0}" == "1" ]]; then
+  # Alten Wert merken, um bei fehlgeschlagener Verifikation sauber zurueckzurollen.
+  local old_ipv6="${ENABLE_IPV6:-0}"
+  if [[ "$old_ipv6" == "1" ]]; then
     if yesno "IPv6 extern deaktivieren?" "y"; then
       maybe_backup_before_change
-      ENABLE_IPV6=0; save_env; ufw_apply_auto
-      ok "IPv6 extern deaktiviert (443/tcp v6 geschlossen)."
+      ENABLE_IPV6=0; save_env
+      if ufw_apply_auto; then
+        ok "IPv6 extern deaktiviert (443/tcp v6 geschlossen)."
+      else
+        ENABLE_IPV6="$old_ipv6"; save_env; ufw_apply_auto >/dev/null 2>&1 || true
+        err "Umschaltung fehlgeschlagen - alter Zustand (ENABLE_IPV6=${old_ipv6}) wiederhergestellt."
+      fi
     fi
   else
     if ! vps_has_global_ipv6; then warn "Dieser VPS hat keine globale IPv6-Adresse - IPv6 extern bringt aktuell nichts."; fi
     if yesno "IPv6 extern aktivieren?" "n"; then
       maybe_backup_before_change
-      ENABLE_IPV6=1; save_env; ufw_apply_auto
-      ok "IPv6 extern aktiviert (443/tcp v6 offen)."
-      warn "Fuer Erreichbarkeit AAAA-Records auf die VPS-IPv6 setzen: $(vps_ipv6)"
+      ENABLE_IPV6=1; save_env
+      if ufw_apply_auto; then
+        ok "IPv6 extern aktiviert (443/tcp v6 offen)."
+        warn "Fuer Erreichbarkeit AAAA-Records auf die VPS-IPv6 setzen: $(vps_ipv6)"
+      else
+        ENABLE_IPV6="$old_ipv6"; save_env; ufw_apply_auto >/dev/null 2>&1 || true
+        err "Umschaltung fehlgeschlagen - alter Zustand (ENABLE_IPV6=${old_ipv6}) wiederhergestellt."
+      fi
     fi
   fi
   echo
